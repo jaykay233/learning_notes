@@ -24,6 +24,36 @@ DeepSeek-V4 在 SGLang 里是一个 **带 mHC（流形约束超连接）的 MoE 
 
 Instruct 权重常见混合精度：**FP4 routed experts + FP8 attention/dense**。
 
+### 1.1 各版本主干结构参数
+
+下面参数来自各 checkpoint 的 `config.json`。`layers` 指主干 `DeepseekV4DecoderLayer` 数量；每层 `hidden_size` 固定不变。因为 V4 使用 `hc_mult=4`，层间 mHC residual 的形状是 `[T, 4, hidden_size]`，等价扁平宽度是 `4 * hidden_size`。
+
+| Variant / HF repo | 总参 | 激活参数 | layers | 每层 `hidden_size` | mHC residual 扁平宽度 | routed experts / 层 | 每 token 激活专家 | shared experts | expert hidden (`moe_intermediate_size`) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `DeepSeek-V4-Flash` | 284B | 13B | 43 | 4096 | 16384 | 256 | 6 | 1 | 2048 |
+| `DeepSeek-V4-Flash-0731` | 304B | 13B | 43 | 4096 | 16384 | 256 | 6 | 1 | 2048 |
+| `DeepSeek-V4-Flash-Vision-Exp` | 305B | 13B | 43 | 4096 | 16384 | 256 | 6 | 1 | 2048 |
+| `DeepSeek-V4-Pro` | 1.6T | 49B | 61 | 7168 | 28672 | 384 | 6 | 1 | 3072 |
+| `DeepSeek-V4-Pro-0813` | 1.65T | 49B | 61 | 7168 | 28672 | 384 | 6 | 1 | 3072 |
+
+读表要点：
+
+1. **Flash 系列主干相同**：43 层、`hidden_size=4096`、每层 256 个 routed experts，token 级 top-6。
+2. **Pro 系列主干更宽更深**：61 层、`hidden_size=7168`、每层 384 个 routed experts，token 级仍然 top-6。
+3. **0731 / 0813 Official**：主干结构分别沿用 Flash / Pro，但 checkpoint 带 DSpark draft head，因此总参略高。
+4. **Flash Vision Exp**：语言主干沿用 Flash-0731 形态，额外加 vision encoder / aligner，所以总参到约 305B；SGLang support 走 preview 路径。
+
+### 1.2 Attention 与压缩层分布差异
+
+| Variant | attention heads | KV heads | head dim | Q LoRA rank | C4 index top-k | `compress_ratio` 分布 |
+|---|---:|---:|---:|---:|---:|---|
+| Flash | 64 | 1 | 512 | 1024 | 512 | `0×3, 4×21, 128×20` |
+| Flash-0731 / Flash-Vision | 64 | 1 | 512 | 1024 | 512 | `0×5, 4×21, 128×20` |
+| Pro | 128 | 1 | 512 | 1536 | 1024 | `0×1, 4×30, 128×31` |
+| Pro-0813 | 128 | 1 | 512 | 1536 | 1024 | `0×3, 4×30, 128×31` |
+
+这里的 `compress_ratio` 统计来自 HF config。`0/4/128` 分别对应 SWA / CSA / HCA；`*-0731`、`*-0813` 多出来的 `0` 主要和 official checkpoint 里的 draft/附加头配置有关，主干 decoder layer 数仍看 `num_hidden_layers`。
+
 ---
 
 ## 2. SGLang 模块层级
@@ -105,7 +135,7 @@ hidden [T, H] 或 [T, hc_mult, H]
 
 ### 4.1 投影形状（相对 MLA/标准 MHA）
 
-配置默认（Flash 量级）：
+配置默认（Flash 量级；Pro 见 §1.1 / §1.2）：
 
 | 字段 | 默认 | 说明 |
 |---|---:|---|
@@ -151,7 +181,7 @@ ratio == 128 (HCA):
 RoPE 策略（代码注释）：
 
 - 纯 SWA 层：主 RoPE（未缩放）
-- C4 / C128 层：压缩 YaRN RoPE（`compress_rope_theta`，默认 40000）用于 Q、SWA 分支与压缩 KV
+- C4 / C128 层：压缩 YaRN RoPE（HF checkpoint 常见 `compress_rope_theta=160000`；SGLang dataclass 默认 40000）用于 Q、SWA 分支与压缩 KV
 
 ### 4.3 `Compressor`
 
@@ -181,7 +211,7 @@ RoPE 策略（代码注释）：
 
 V4 **复用** `DeepseekV2MoE`，构造时 `is_deepseek_v4=True`。
 
-默认 MoE 配置：
+Flash 量级 MoE 配置（Pro 对照见 §1.1）：
 
 | 字段 | 默认 | 说明 |
 |---|---:|---|
@@ -208,21 +238,33 @@ Dense 前缀：`first_k_dense_replace`（默认 0）——若 >0，前几层可�
 
 ## 6. 整网默认超参速查（`DeepSeekV4Config`）
 
-```
-model_type              = deepseek_v4
-vocab_size              = 129280
-num_hidden_layers       = 43          # Flash 量级；Pro 更大，以 HF 为准
-hidden_size             = 4096
-intermediate_size       = 2048        # dense/共享侧
-max_position_embeddings = 65536       # 训练/缩放基；服务宣称可达 1M context
-rope_theta              = 10000
-compress_rope_theta     = 40000
-hc_mult                 = 4
-hc_sinkhorn_iters       = 20
-hc_eps                  = 1e-6
-```
+SGLang dataclass 默认值基本对应 Flash 量级 schema；真实部署以 checkpoint `config.json` 为准。
 
-**注意**：上表是 SGLang dataclass 默认值；真实 Flash/Pro 的层数、hidden、专家数以 checkpoint `config.json` 为准，代码只提供 schema。
+| 字段 | Flash 系列 | Pro 系列 | 说明 |
+|---|---:|---:|---|
+| `model_type` | `deepseek_v4` | `deepseek_v4` | HF / SGLang 识别名 |
+| `vocab_size` | 129280 | 129280 | tokenizer 词表 |
+| `num_hidden_layers` | 43 | 61 | 主干 decoder block 数 |
+| `hidden_size` | 4096 | 7168 | 每层 residual / hidden 维度 |
+| `hc_mult` | 4 | 4 | mHC residual 路数 |
+| `hc_mult * hidden_size` | 16384 | 28672 | mHC 内部扁平 residual 宽度 |
+| `num_attention_heads` | 64 | 128 | Q heads |
+| `num_key_value_heads` | 1 | 1 | MQA 单 KV head |
+| `head_dim` | 512 | 512 | attention head dim |
+| `q_lora_rank` | 1024 | 1536 | Q 低秩中间维 |
+| `o_lora_rank` | 1024 | 1024 | O 低秩中间维 |
+| `n_routed_experts` | 256 | 384 | 每个 MoE 层的 routed expert 总数 |
+| `num_experts_per_tok` | 6 | 6 | 每 token 激活 routed experts |
+| `n_shared_experts` | 1 | 1 | 共享专家数 |
+| `moe_intermediate_size` | 2048 | 3072 | 单个 expert 的中间维 |
+| `num_hash_layers` | 3 | 3 | 前几层 gate 走 HashTopK |
+| `index_topk` | 512 | 1024 | CSA indexer top-k |
+| `max_position_embeddings` | 65536 | 65536 | 配置基准；服务目标可到 1M context |
+| `compress_rope_theta` | 160000 | 160000 | HF checkpoint 值；SGLang dataclass 默认是 40000 |
+| `hc_sinkhorn_iters` | 20 | 20 | mHC Sinkhorn 迭代数 |
+| `hc_eps` | 1e-6 | 1e-6 | mHC 数值稳定项 |
+
+**注意**：`intermediate_size` 在 HF checkpoint 里通常不用作普通 dense FFN 主路径；MoE 重点看 `moe_intermediate_size`、`n_routed_experts`、`n_shared_experts` 和 `num_experts_per_tok`。
 
 ---
 

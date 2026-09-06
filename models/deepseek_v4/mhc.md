@@ -208,7 +208,122 @@ z = Σ_j α_j · R_j
 
 ---
 
-## 5. Sinkhorn：把 `comb` 约束到流形上
+## 5. 源码函数速查
+
+这一节按源码里的函数名解释作用。可以先看这里建立索引，再去读后面的数学和伪代码。
+
+### 5.1 参数与后端选择
+
+| 函数 / 类 | 位置 | 作用 |
+|---|---|---|
+| `MhcOps` | `srt/models/deepseek_v4.py` | 把当前平台可用的 mHC kernel 打包成一个 NamedTuple，后面 Decoder 只通过这个对象调用。 |
+| `_get_mhc_ops()` | `srt/models/deepseek_v4.py` | 根据 CUDA/NPU/可用扩展选择具体实现：TileLang / Triton / FlashInfer / NPU / torch fallback。 |
+| `make_hc_mixing_params()` | `srt/models/deepseek_v4.py` | 为每层 attn 或 ffn 创建一套 mHC mixing 参数：`hc_fn`、`hc_base`、`hc_scale`。 |
+| `make_hc_head_params()` | `srt/models/deepseek_v4.py` | 为模型末端 `hc_head` 创建收束多路 residual 的参数。 |
+| `_is_fused_mhc_post_pre_enabled_xpu()` | `srt/models/deepseek_v4.py` | 判断 XPU 后端是否启用跨层 `hc_post + hc_pre` 融合。 |
+| `_flashinfer_mhc_pre_num_splits()` | `srt/models/deepseek_v4.py` | 给 FlashInfer 的 fused pre kernel 选择 split-K 数量，用于适配 token 数和 `hc*H` 大小。 |
+| `_flashinfer_hc_pre()` | `srt/models/deepseek_v4.py` | FlashInfer 路径的 `hc_pre` 包装：做 pre 的大融合计算，并返回子模块输入、`post`、`comb`。 |
+
+### 5.2 核心语义函数
+
+| 函数 | 位置 | 输入 → 输出 | 作用 |
+|---|---|---|---|
+| `hc_expand(x, n)` | `kernels/ops/layernorm/mhc.py` | `[T,H] → [T,n,H]` | 模型第一层前，把普通 hidden 复制/扩成 `hc_mult` 路 residual。 |
+| `hc_contract(x, n)` | `kernels/ops/layernorm/mhc.py` | `[T,n,H] → [T,H]` | 把多路 residual 临时压回一路，主要用于兼容路径或调试。 |
+| `hc_split_sinkhorn()` | `kernels/ops/layernorm/mhc.py` | `mixes → pre, post, comb` | 把线性层产生的 logits 切成 `pre/post/comb`，并对 `comb` 做 Sinkhorn 约束。 |
+| `hc_combine()` | `kernels/ops/layernorm/mhc.py` | `pre + residual → y` | 执行 `y = Σ pre[k] * R[k]`，也就是 `hc_pre` 的“多路读成一路”最后一步。 |
+| `hc_pre()` | `kernels/ops/layernorm/mhc.py` | `R + hc_fn/base/scale → y, comb, post` | 非 fused 的 pre 语义入口：从多路 residual 预测 mixing，并产出子模块输入。 |
+| `hc_post()` | `kernels/ops/layernorm/mhc.py` | `o + R + post + comb → R'` | 非 fused 的 post 语义入口：把 Attention/MoE 输出写回多路 residual。 |
+| `hc_head_torch()` | `srt/models/deepseek_v4.py` | `R + head params → z` | torch fallback 版本的末端收束，把最后的多路 residual 合成 `[T,H]`。 |
+| `fused_hc_head()` | `kernels/ops/layernorm/mhc_head.py` | `R + head params → z` | Triton fused 版本的 `hc_head`，语义与 `hc_head_torch()` 一致但更快。 |
+
+### 5.3 `hc_split_sinkhorn` 相关实现
+
+| 函数 | 位置 | 作用 |
+|---|---|---|
+| `hc_split_sinkhorn_kernel()` | `kernels/ops/layernorm/mhc.py` | TileLang kernel 版本：在 GPU 上完成 split、sigmoid、Sinkhorn。 |
+| `_hc_split_sinkhorn_torch()` | `kernels/ops/layernorm/mhc.py` | PyTorch 参考实现，最容易对照数学公式阅读。 |
+| `_hc_split_sinkhorn_triton_kernel()` | `kernels/ops/layernorm/mhc.py` | Triton kernel 版本，处理小维度 `hc×hc` 的 Sinkhorn。 |
+| `_hc_split_sinkhorn_triton()` | `kernels/ops/layernorm/mhc.py` | Triton kernel 的 Python 包装，负责分配输出和调 kernel。 |
+| `hc_split_sinkhorn()` | `kernels/ops/layernorm/mhc.py` | 对外统一入口：优先走可用高性能 kernel，不合适时回退。 |
+
+#### 常见误解：`hc_split_sinkhorn` 不是注意力系数
+
+笔记伪代码里的 `split_sinkhorn` = 源码 `hc_split_sinkhorn`。它产出的确实是一组**归一化混合权重**，所以容易联想到「分配注意力」；但**不宜直接理解成 Transformer Attention**。
+
+**像的地方**
+
+- `pre`：各条残差流合成子模块输入时的比重 → 有点像对 `hc` 路做 soft 加权 / pooling
+- `comb`：流与流之间的混合矩阵 → 有点像「路与路」的转移权重
+
+**不像的地方**
+
+| | Attention | `hc_split_sinkhorn` |
+|---|---|---|
+| 作用对象 | token / 位置之间（Q·K） | **残差流（stream）** 之间 |
+| 输入 | Q、K 相似度 | `mixes`（由 `flatten(R)` 线性投影得到） |
+| 输出 | 通常一套权重去乘 V | 同时产出 **`pre` / `post` / `comb` 三套**，用途不同 |
+| `post` | 没有对应物 | 写回强度门控，且是 `2σ`，**不是**对旧残差的注意力 |
+| `comb` | 一般一次 softmax | Sinkhorn → **近双随机**（行和、列和都 ≈ 1） |
+
+更准确的说法：
+
+> `hc_split_sinkhorn` = **残差流上的混合系数生成器**：把 `mixes` 切成三份，并对 `comb` 做流形投影。  
+> - `pre`：进子模块的聚合权重  
+> - `post`：出子模块的注入门控  
+> - `comb`：旧残差的流间重分配矩阵  
+
+一句话：它是 **mHC 边界上的系数拆分 + Sinkhorn**，不是 Transformer 里那种注意力。
+
+调用关系（非融合 fallback）：只在 `DeepseekV4DecoderLayer.hc_pre` 里，先算 `mixes`，再调 `hc_split_sinkhorn`，最后 `hc_combine`；TileLang / FlashInfer / HIP 等 fused `mhc_pre` 则把同等逻辑内联进 kernel，不一定单独调这个函数。
+
+### 5.4 `hc_pre` / prenorm 融合实现
+
+| 函数 | 位置 | 作用 |
+|---|---|---|
+| `mhc_pre_big_fuse_tilelang()` | `kernels/ops/layernorm/mhc.py` | 大融合 pre kernel：把 RMS、GEMM、split/Sinkhorn、combine、可选 norm 尽量合在一起。 |
+| `mhc_pre_gemm_sqrsum_tilelang()` | `kernels/ops/layernorm/mhc.py` | 同时算 `hc_fn @ R_flat` 和 `sum(R_flat²)`，为 pre 的 RMS + 线性准备中间量。 |
+| `_mhc_pre_gemm_sqrsum_dispatch()` | `kernels/ops/layernorm/mhc.py` | 选择并缓存上面的 TileLang dispatch。 |
+| `mhc_pre_gemm_sqrsum_splitk_kernel()` | `kernels/ops/layernorm/mhc.py` | split-K 版本的 prenorm GEMM，适合更大的 `hc*H` 或 token 数。 |
+| `_compute_num_split_for_mhc_pre()` | `kernels/ops/layernorm/mhc.py` | 根据 token 数和 hidden 大小估算 split-K 分片数。 |
+| `get_mhc_pre_token_count_representatives()` | `kernels/ops/layernorm/mhc.py` | 给预热/编译缓存准备代表性的 token 数。 |
+| `prewarm_mhc_pre()` | `kernels/ops/layernorm/mhc.py` | 预热 mHC pre kernels，减少首次请求编译开销。 |
+| `mhc_pre_big_fuse_with_norm_tilelang()` | `kernels/ops/layernorm/mhc.py` | 在 big fuse 基础上把 RMSNorm 也融合进去，用于 `hc_pre + input_layernorm/post_attention_layernorm`。 |
+| `mhc_pre()` | `kernels/ops/layernorm/mhc.py` | fused pre 的统一入口，产出 norm 后的子模块输入、`post`、`comb` 等。 |
+| `npu_hc_pre()` | `kernels/ops/layernorm/mhc.py` | NPU 自定义算子版本的 `hc_pre`，语义相同，但调用 `torch.ops.custom.npu_hc_pre`。 |
+
+### 5.5 `hc_post` 与跨层融合
+
+| 函数 | 位置 | 作用 |
+|---|---|---|
+| `mhc_post_tilelang()` | `kernels/ops/layernorm/mhc.py` | TileLang 版本的 post kernel，实现 `R' = post⊙o + comb·R`。 |
+| `mhc_post()` | `kernels/ops/layernorm/mhc.py` | fused post 的统一入口，用于可直接写回多路 residual 的路径。 |
+| `mhc_fused_post_pre_fma_tilelang()` | `kernels/ops/layernorm/mhc.py` | 跨层融合核心 kernel：把上一子层 `hc_post` 和下一子层 `hc_pre` 合并，避免把中间 `R'` 完整写回再读出。 |
+| `mhc_fused_post_pre()` | `kernels/ops/layernorm/mhc.py` | 跨层融合 Python 入口：输入上一段的 `post/comb/o/R` 和下一段的 `hc_fn`，直接得到下一子模块输入。 |
+| `_mhc_post_torch()` | `kernels/ops/layernorm/mhc.py` | PyTorch 参考 post，实现最接近公式，便于验证 kernel 数值。 |
+| `_mhc_post_dispatch()` | `kernels/ops/layernorm/mhc.py` | 根据设备、dtype、shape 选择 post 实现。 |
+
+### 5.6 fallback / dispatch 函数
+
+| 函数 | 位置 | 作用 |
+|---|---|---|
+| `_mhc_pre_torch()` | `kernels/ops/layernorm/mhc.py` | PyTorch 参考 pre：线性预测 mixing，split/Sinkhorn，再 combine。 |
+| `_mhc_pre_dispatch()` | `kernels/ops/layernorm/mhc.py` | 为 `hc_pre()` 选择 TileLang / torch 等实现。 |
+| `_mhc_post_dispatch()` | `kernels/ops/layernorm/mhc.py` | 为 `hc_post()` 选择 TileLang / torch 等实现。 |
+| `_hc_combine_kernel()` | `kernels/ops/layernorm/mhc.py` | Triton kernel，专门执行 `pre` 加权求和。 |
+| `_hc_head_kernel()` | `kernels/ops/layernorm/mhc_head.py` | Triton kernel，专门执行末端 `hc_head` 的 RMS、线性、sigmoid 和 combine。 |
+
+### 5.7 Decoder 里怎么用这些函数
+
+| 位置 | 作用 |
+|---|---|
+| `DeepseekV4DecoderLayer` | 持有 attn/ffn 两套 mHC 参数，并在每个子层前后调用 `hc_pre` / `hc_post` 或融合版本。 |
+| `DeepseekV4Model` | 在第一层前调用 `hc_expand` 建立多路 residual，在最后一层后调用 `hc_head` 收束。 |
+| `DeepseekV4ForCausalLM` | 接上最终 `lm_head`，mHC 本身已经在 `DeepseekV4Model` 内部完成。 |
+
+---
+
+## 6. Sinkhorn：把 `comb` 约束到流形上
 
 这是 **m** 的来源（manifold-constrained）。
 
@@ -226,145 +341,246 @@ z = Σ_j α_j · R_j
 
 ---
 
-## 6. 伪代码（教学版，对齐 SGLang 数值）
+## 7. 伪代码（教学版，对齐 SGLang 数值）
 
-### 6.1 工具函数
+约定：`T` = token 数，`hc = hc_mult`（默认 4），`H = hidden_size`。  
+Flash 量级常见：`hc=4` 时 `(2+hc)*hc = 24`，`hc*H = 4H`。
+
+### 7.1 工具函数
 
 ```python
-# hc = hc_mult, 默认 4
 # POST_MULT = 2.0   # _MHC_POST_MULT_VALUE
 
 def rms_rsqrt(x_flat, eps):
-    # x_flat: [T, hc*H]
+    """
+    作用：计算 RMSNorm 里的倒数 RMS 系数。
+    它只返回缩放因子 r，不直接改写输入；后面用 `linear(x) * r` 等价于先 RMS 再线性。
+    """
+    # x_flat : [T, hc*H]
+    # return : [T, 1]
     return rsqrt(mean(x_flat ** 2, dim=-1, keepdim=True) + eps)
 
 
 def split_sinkhorn(mixes, scale, base, hc, iters, eps):
     """
-    mixes: [T, (2+hc)*hc]
-    scale: [3]
-    base : [(2+hc)*hc]
-    returns pre[T,hc], post[T,hc], comb[T,hc,hc]
-    """
-    pre  = sigmoid(mixes[:, :hc]            * scale[0] + base[:hc]) + eps
-    post = POST_MULT * sigmoid(mixes[:, hc:2*hc] * scale[1] + base[hc:2*hc])
+    对应源码 hc_split_sinkhorn。把 `hc_fn` 预测出的 mixing logits 拆成三类权重。
+    `pre` 负责读多路 residual，`post` 负责写回子模块输出，`comb` 负责旧 residual 的跨路重组；
+    其中 `comb` 会经过 Sinkhorn，变成近似双随机矩阵。
 
-    comb = mixes[:, 2*hc:] * scale[2] + base[2*hc:]
-    comb = comb.reshape(T, hc, hc)
+    注意：这是残差「流」上的混合系数，不是 token 维 Attention。
+    详见上文「常见误解：hc_split_sinkhorn 不是注意力系数」。
+
+    mixes : [T, (2+hc)*hc]     # 例如 hc=4 → [T, 24]
+    scale : [3]                # s0=pre, s1=post, s2=comb
+    base  : [(2+hc)*hc]        # 例如 [24]
+    → pre : [T, hc]
+      post: [T, hc]
+      comb: [T, hc, hc]
+    """
+    # mixes 布局: [ pre_logits | post_logits | comb_logits ]
+    #              [0, hc)       [hc, 2hc)     [2hc, (2+hc)*hc)
+
+    pre  = sigmoid(mixes[:, :hc]            * scale[0] + base[:hc]) + eps
+    # pre : [T, hc]
+
+    post = POST_MULT * sigmoid(mixes[:, hc:2*hc] * scale[1] + base[hc:2*hc])
+    # post: [T, hc]
+
+    comb = mixes[:, 2*hc:] * scale[2] + base[2*hc:]   # [T, hc*hc]
+    comb = comb.reshape(T, hc, hc)                    # [T, hc, hc]
 
     # init: row softmax + eps, then col normalize
-    comb = exp(comb - comb.amax(dim=-1, keepdim=True))
-    comb = comb / comb.sum(dim=-1, keepdim=True) + eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)
+    comb = exp(comb - comb.amax(dim=-1, keepdim=True))          # [T, hc, hc]
+    comb = comb / comb.sum(dim=-1, keepdim=True) + eps          # 行归一
+    comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)        # 列归一
 
     for _ in range(iters - 1):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)  # row
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)  # col
+        comb = comb / (comb.sum(dim=-1, keepdim=True) + eps)    # row  → [T, hc, hc]
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + eps)    # col  → [T, hc, hc]
 
-    return pre, post, comb
+    return pre, post, comb   # [T,hc], [T,hc], [T,hc,hc]
 
 
 def hc_combine(R, pre):
-    # R: [T, hc, H], pre: [T, hc] → y: [T, H]
+    """
+    作用：执行 `hc_pre` 的最后一步，把多路 residual 加权合成一路子模块输入。
+    Attention / MoE 只看这一条 `[T,H]` 输入，不直接处理 `[T,hc,H]`。
+    """
+    # R   : [T, hc, H]
+    # pre : [T, hc]
+    # → y : [T, H]
+    #
+    # pre.unsqueeze(-1) * R  →  [T, hc, 1] * [T, hc, H] = [T, hc, H]
+    # .sum(dim=1)            →  [T, H]
     return (pre.unsqueeze(-1) * R).sum(dim=1)
 
 
 def hc_post(o, R, post, comb):
-    # o: [T,H], R:[T,hc,H], post:[T,hc], comb:[T,hc,hc] → R_new:[T,hc,H]
-    return post.unsqueeze(-1) * o.unsqueeze(1) + einsum("tjk,tkh->tjh", comb, R)
+    """
+    作用：把子模块输出 `o` 写回多路 residual，并同时重组旧 residual。
+    这是 mHC 里对应普通 Transformer `x = x + sublayer(x)` 的写回阶段。
+    """
+    # o    : [T, H]
+    # R    : [T, hc, H]
+    # post : [T, hc]
+    # comb : [T, hc, hc]
+    # → R' : [T, hc, H]
+    #
+    # term1 = post.unsqueeze(-1) * o.unsqueeze(1)
+    #       = [T, hc, 1] * [T, 1, H]  →  [T, hc, H]
+    # term2 = einsum("tjk,tkh->tjh", comb, R)
+    #       = [T, hc, hc] @ [T, hc, H]（对 k 求和）→ [T, hc, H]
+    return (
+        post.unsqueeze(-1) * o.unsqueeze(1)
+        + einsum("tjk,tkh->tjh", comb, R)
+    )
 ```
 
-### 6.2 `hc_pre`
+### 7.2 `hc_pre`
 
 ```python
 def hc_pre(R, hc_fn, hc_scale, hc_base, rms_eps, hc_eps, sinkhorn_iters, hc):
     """
-    R: [T, hc, H]  (第一层前可能从 [T,H] unsqueeze/repeat 而来)
-    """
-    T, hc, H = R.shape
-    x_flat = R.reshape(T, hc * H).float()
+    作用：一个子层入口的 mHC 读阶段。
+    它从当前多路 residual 预测 `pre/post/comb`，返回单路 `y` 给 Attention / MoE，
+    同时把 `post/comb` 留给该子层输出后的 `hc_post` 使用。
 
-    r = rms_rsqrt(x_flat, rms_eps)
-    mixes = linear(x_flat, hc_fn) * r          # [T, (2+hc)*hc]
+    入参 / 权重:
+      R        : [T, hc, H]                 # 多路 residual
+      hc_fn    : [(2+hc)*hc, hc*H]          # 例如 [24, 4H]
+      hc_scale : [3]
+      hc_base  : [(2+hc)*hc]                # 例如 [24]
+    返回:
+      y        : [T, H]                     # 子模块输入
+      post     : [T, hc]                    # 留给 hc_post
+      comb     : [T, hc, hc]                # 留给 hc_post
+    """
+    T, hc, H = R.shape                      # R: [T, hc, H]
+    x_flat = R.reshape(T, hc * H).float()   # [T, hc*H]
+
+    r = rms_rsqrt(x_flat, rms_eps)          # [T, 1]
+    mixes = linear(x_flat, hc_fn) * r       # [T, hc*H] @ [(2+hc)*hc, hc*H]^T
+                                            # → [T, (2+hc)*hc]
 
     pre, post, comb = split_sinkhorn(
         mixes, hc_scale, hc_base, hc, sinkhorn_iters, hc_eps
     )
+    # pre: [T, hc],  post: [T, hc],  comb: [T, hc, hc]
 
-    y = hc_combine(R, pre).to(R.dtype)         # [T, H]
+    y = hc_combine(R, pre).to(R.dtype)      # [T, H]
     return y, post, comb
-    # 调用方再可选: y = RMSNorm(y)
+    # 调用方再可选: y = RMSNorm(y)          # 仍为 [T, H]
 ```
 
-### 6.3 `hc_head`
+### 7.3 `hc_head`
 
 ```python
 def hc_head(R, hc_fn, hc_scale, hc_base, rms_eps, hc_eps):
-    # R: [T, hc, H] → z: [T, H]
-    T, hc, H = R.shape
-    x_flat = R.reshape(T, hc * H).float()
-    r = rms_rsqrt(x_flat, rms_eps)
-    mixes = linear(x_flat, hc_fn) * r          # [T, hc]
+    """
+    作用：模型末端的 mHC 收束阶段。
+    它不再产生 `post/comb`，只预测每一路 residual 的最终权重，把 `[T,hc,H]` 合成 `[T,H]`，
+    再交给最后的 RMSNorm 和 `lm_head`。
+
+    入参 / 权重:
+      R        : [T, hc, H]
+      hc_fn    : [hc, hc*H]                 # 注意比层内 hc_fn 窄：只出 hc 维
+      hc_scale : [1] 或 scalar
+      hc_base  : [hc]
+    返回:
+      z        : [T, H]
+    """
+    T, hc, H = R.shape                      # [T, hc, H]
+    x_flat = R.reshape(T, hc * H).float()   # [T, hc*H]
+    r = rms_rsqrt(x_flat, rms_eps)          # [T, 1]
+    mixes = linear(x_flat, hc_fn) * r       # [T, hc]
     alpha = sigmoid(mixes * hc_scale + hc_base) + hc_eps
+    # alpha: [T, hc]
+
+    # alpha.unsqueeze(-1) * R → [T, hc, 1] * [T, hc, H] = [T, hc, H]
+    # .sum(dim=1)             → [T, H]
     return (alpha.unsqueeze(-1) * R).sum(dim=1).to(R.dtype)
 ```
 
-### 6.4 完整 Decoder Layer（非融合版）
+### 7.4 完整 Decoder Layer（非融合版）
 
 ```python
 def decoder_layer(R, positions, batch, layer):
     """
-    R: [T, hc, H]
-    返回 R_out: [T, hc, H]
+    作用：展示一个 DeepSeek-V4 DecoderLayer 的非融合语义。
+    一层里有两次 mHC：Attention 前后一次，MoE 前后一次；真实实现可把相邻 post/pre 融合，
+    但数学结果等价于这里的顺序写法。
+
+    R_in / R_out : [T, hc, H]
+
+    层内权重形状（Attn / FFN 各一套）:
+      hc_*_fn    : [(2+hc)*hc, hc*H]
+      hc_*_scale : [3]
+      hc_*_base  : [(2+hc)*hc]
     """
 
     # ---- Attention branch ----
     y, post_a, comb_a = hc_pre(
-        R,
+        R,                                              # [T, hc, H]
         layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
         rms_eps, hc_eps, sinkhorn_iters, hc,
     )
-    y = RMSNorm(y, layer.input_layernorm)      # 可与 hc_pre 融合
-    o = layer.self_attn(y, positions, batch)   # [T, H]
-    R = hc_post(o, R, post_a, comb_a)          # [T, hc, H]
+    # y: [T, H],  post_a: [T, hc],  comb_a: [T, hc, hc]
+
+    y = RMSNorm(y, layer.input_layernorm)               # [T, H]（可与 hc_pre 融合）
+    o = layer.self_attn(y, positions, batch)            # [T, H]
+    R = hc_post(o, R, post_a, comb_a)                   # [T, hc, H]
 
     # ---- FFN / MoE branch ----
     y, post_f, comb_f = hc_pre(
-        R,
+        R,                                              # [T, hc, H]
         layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
         rms_eps, hc_eps, sinkhorn_iters, hc,
     )
-    y = RMSNorm(y, layer.post_attention_layernorm)
-    o = layer.mlp(y, batch)                    # DeepseekV2MoE
-    R = hc_post(o, R, post_f, comb_f)
+    # y: [T, H],  post_f: [T, hc],  comb_f: [T, hc, hc]
 
-    return R
+    y = RMSNorm(y, layer.post_attention_layernorm)      # [T, H]
+    o = layer.mlp(y, batch)                             # [T, H]  DeepseekV2MoE
+    R = hc_post(o, R, post_f, comb_f)                   # [T, hc, H]
+
+    return R                                            # [T, hc, H]
 ```
 
-### 6.5 整网骨架
+### 7.5 整网骨架
 
 ```python
 def deepseek_v4_forward(input_ids):
-    h = embed(input_ids)                       # [T, H]
+    """
+    作用：展示整网里 mHC 的生命周期。
+    普通 embedding 先扩成多路 residual；中间每层保持 `[T,hc,H]`；最后 `hc_head` 收回一路。
+    """
+    # input_ids : [T] 或 [B, S]（此处按展平后的 token 维 T 叙述）
 
-    # 进入 mHC：复制到 hc 路（具体初始化以权重/实现为准；
-    # 之后每层维护 [T, hc, H]）
-    R = expand_to_hc_streams(h, hc)            # [T, hc, H]
+    h = embed(input_ids)                        # [T, H]
 
-    for layer in layers:
-        R = decoder_layer(R, ...)
+    # 进入 mHC：把单路 hidden 扩成 hc 路
+    # （具体是 repeat / 学到的投影，以 checkpoint 为准）
+    R = expand_to_hc_streams(h, hc)             # [T, H] → [T, hc, H]
 
-    z = hc_head(R, hc_head_fn, hc_head_scale, hc_head_base, ...)
-    z = RMSNorm(z)
-    logits = lm_head(z)
+    for layer in layers:                        # num_hidden_layers 次
+        R = decoder_layer(R, ...)               # [T, hc, H] → [T, hc, H]
+
+    z = hc_head(
+        R,                                      # [T, hc, H]
+        hc_head_fn,                             # [hc, hc*H]
+        hc_head_scale,                          # [1]
+        hc_head_base,                           # [hc]
+        ...
+    )                                           # → [T, H]
+    z = RMSNorm(z)                              # [T, H]
+    logits = lm_head(z)                         # [T, vocab]
     return logits
 ```
 
-> 实现细节：SGLang 在 fused 路径下，层与层之间可能 **延迟** 执行 `hc_post(ffn)`，把 `(residual, post, comb)` 传给下一层，与下一层 `hc_pre(attn)` 合成 `mhc_post_pre` 一次算完。语义仍等价于上面的非融合伪代码。
+> 实现细节：SGLang 在 fused 路径下，层与层之间可能 **延迟** 执行 `hc_post(ffn)`，把 `(residual [T,hc,H], post [T,hc], comb [T,hc,hc])` 传给下一层，与下一层 `hc_pre(attn)` 合成 `mhc_post_pre` 一次算完。语义仍等价于上面的非融合伪代码。
 
 ---
 
-## 7. 和「普通 residual / 朴素 HC」对比
+## 8. 和「普通 residual / 朴素 HC」对比
 
 | | 标准 Residual | 朴素 HC（无约束） | **mHC（V4）** |
 |---|---|---|---|
@@ -377,7 +593,7 @@ def deepseek_v4_forward(input_ids):
 
 ---
 
-## 8. SGLang 实现要点（读代码时）
+## 9. SGLang 实现要点（读代码时）
 
 1. **参考数值路径**就看：
    - `DeepseekV4DecoderLayer.hc_pre` / `hc_post` 里的 torch fallback
@@ -389,7 +605,7 @@ def deepseek_v4_forward(input_ids):
 
 ---
 
-## 9. 最小数值例子（`hc=2` 示意）
+## 10. 最小数值例子（`hc=2` 示意）
 
 假设某 token 上：
 
@@ -420,7 +636,156 @@ R'_1 = 0.8*o + 0.2*R0 + 0.8*R1 = ...
 
 ---
 
-## 10. 阅读顺序建议
+## 11. 问答与理解补充
+
+这一节整理实际阅读代码时最容易卡住的几个问题。
+
+### 11.1 `hc_post` 是什么意思？
+
+`hc_post` 不是 post-attention norm 里的 “post”，而是 **mHC 的写回阶段**。
+
+在普通 Transformer 里，一个子层大致是：
+
+```text
+x = x + SubLayer(norm(x))
+```
+
+DeepSeek-V4 把单路 residual `x` 换成多路 residual `R ∈ [T,hc,H]` 后，就不能直接 `x + o` 了。子模块 Attention / MoE 仍然只输出一路 `o ∈ [T,H]`，所以需要 `hc_post` 把它写回多路：
+
+```text
+R'_j = post_j · o + Σ_k comb_jk · R_k
+```
+
+可以把它理解成两件事同时发生：
+
+- `post_j · o`：把当前子模块输出灌进第 `j` 路 residual。
+- `Σ_k comb_jk · R_k`：把旧的多路 residual 重新混合后保留下来。
+
+所以 `hc_pre` 是“从多路读出一路给子模块”，`hc_post` 是“把子模块输出写回多路”。
+
+### 11.2 `hc_head` 在哪里被调用？
+
+`hc_head` 不在单个 Decoder Layer 内部调用，而是在 **所有 layers 跑完之后**，在整网末端调用。
+
+伪代码里对应 §7.5：
+
+```python
+for layer in layers:
+    R = decoder_layer(R, ...)               # [T, hc, H] → [T, hc, H]
+
+z = hc_head(
+    R,                                      # [T, hc, H]
+    hc_head_fn,                             # [hc, hc*H]
+    hc_head_scale,                          # [1]
+    hc_head_base,                           # [hc]
+    ...
+)                                           # → [T, H]
+z = RMSNorm(z)
+logits = lm_head(z)
+```
+
+它的作用是 **最后收束**：中间所有层都保持 `[T,hc,H]` 的多路 residual，直到模型末端才通过 `hc_head` 合成普通 hidden `[T,H]`，再接最终 RMSNorm 和 `lm_head`。
+
+因此：
+
+- `hc_pre` / `hc_post`：每个 Decoder Layer 内反复使用。
+- `hc_head`：整网最后只用一次，用来从 mHC 世界回到普通 hidden。
+
+### 11.3 为什么一个 Decoder Layer 里要做两次 `hc_pre`？
+
+因为一个 Decoder Layer 本来就有两个子模块：
+
+```text
+Attention
+FFN / MoE
+```
+
+标准 Transformer 一层也有两次 residual 更新：
+
+```text
+x = x + Attention(norm(x))
+x = x + FFN(norm(x))
+```
+
+DeepSeek-V4 只是把普通 residual `x` 换成多路 residual `R`，所以对应变成：
+
+```text
+R = hc_post(Attention(hc_pre(R)), R)
+R = hc_post(MoE(hc_pre(R)), R)
+```
+
+也就是一层内的实际语义：
+
+```text
+R
+│
+├─ hc_pre(attn)  → y_attn
+│                 ↓
+│              Attention
+│                 ↓
+├─ hc_post(attn) → R_after_attn
+│
+├─ hc_pre(ffn)   → y_ffn
+│                 ↓
+│              MoE / FFN
+│                 ↓
+└─ hc_post(ffn)  → R_after_ffn
+```
+
+第一段 `hc_pre`：
+
+```python
+y, post_a, comb_a = hc_pre(
+    R,
+    layer.hc_attn_fn, layer.hc_attn_scale, layer.hc_attn_base,
+    rms_eps, hc_eps, sinkhorn_iters, hc,
+)
+```
+
+意思是：从当前多路 residual `R` 里混出一路 `y`，给 Attention 用。这里用 `layer.hc_attn_*`，因为 Attention 有自己的一套 mixing 参数。
+
+第二段 `hc_pre`：
+
+```python
+y, post_f, comb_f = hc_pre(
+    R,
+    layer.hc_ffn_fn, layer.hc_ffn_scale, layer.hc_ffn_base,
+    rms_eps, hc_eps, sinkhorn_iters, hc,
+)
+```
+
+意思是：Attention 已经更新过 `R` 之后，再从新的 `R` 混出一路 `y`，给 FFN / MoE 用。这里用 `layer.hc_ffn_*`，因为 FFN / MoE 也有自己的一套 mixing 参数。
+
+这两次不是重复，而是 **Attention 和 MoE 各自都有独立的 mHC 读写门控**：
+
+- Attention 前的 `hc_pre`：决定哪些 residual 流的信息送去做注意力。
+- Attention 后的 `hc_post`：决定注意力结果怎么写回多路流。
+- MoE 前的 `hc_pre`：基于更新后的 residual，再决定哪些信息送去专家网络。
+- MoE 后的 `hc_post`：把专家输出写回多路流。
+
+### 11.4 `post_a/comb_a` 和 `post_f/comb_f` 为什么跟着 `hc_pre` 返回？
+
+`hc_pre` 不只是生成子模块输入 `y`，它还一次性生成后面写回要用的 `post` 和 `comb`。
+
+这是因为 `pre/post/comb` 都来自同一个 `mixes`：
+
+```text
+mixes = RMSNormLinear(flatten(R))
+
+mixes → pre, post, comb
+```
+
+所以一次 `hc_pre` 会同时决定：
+
+- 这次子模块要从多路 residual 里读什么：`pre`
+- 子模块输出之后怎么灌回每一路：`post`
+- 旧 residual 怎么跨路重组：`comb`
+
+Attention 分支返回的是 `post_a/comb_a`，只给这次 Attention 的 `hc_post` 用；FFN 分支返回的是 `post_f/comb_f`，只给这次 MoE 的 `hc_post` 用。它们不能混用，因为参数不同、输入 residual 也不同。
+
+---
+
+## 12. 阅读顺序建议
 
 1. 本文 §4–§6（先建立公式与伪代码）
 2. `deepseek_v4.py` → `DeepseekV4DecoderLayer.forward`（非 fused 分支）
