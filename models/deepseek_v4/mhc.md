@@ -123,45 +123,41 @@ SGLang cookbook 一句话：DeepSeek-V4 使用 **manifold-constrained hyper-conn
 
 ## 4. 数学形式
 
+> 下面公式用**纯文本代码块**书写，GitHub / Cursor 预览都能直接看，不依赖 LaTeX 渲染。
+
 ### 4.1 `hc_pre`：多路 → 单路输入
 
-对 token 维省略，记残差 \( R \in \mathbb{R}^{hc \times H} \)，`flatten(R) ∈ ℝ^{hc·H}`。
+对 token 维省略，记残差 `R ∈ R^{hc × H}`，以及 `flatten(R) ∈ R^{hc·H}`。
 
 **Step A — RMS + 线性得到 mixes**
 
-\[
-r = \mathrm{rsqrt}\Big(\mathrm{mean}(R_{\mathrm{flat}}^2) + \varepsilon_{\mathrm{rms}}\Big)
-\]
+```text
+r = rsqrt( mean(R_flat²) + ε_rms )
 
-\[
-m = W_{\mathrm{fn}}\, R_{\mathrm{flat}} \cdot r
-\in \mathbb{R}^{(2+hc)\,hc}
-\]
+m = W_fn · R_flat · r
+  ∈ R^{(2+hc)·hc}
+```
 
 （实现里是 `F.linear(x_flat, hc_fn) * rsqrt`，等价于对 flatten 后做 RMS 再投影。）
 
 **Step B — 切成 pre / post / comb，并约束**
 
-\[
-\mathrm{pre}_j = \sigma(m_j \cdot s_0 + b_j) + \varepsilon_{\mathrm{hc}}
-\]
+```text
+pre_j  = σ(m_j · s0 + b_j) + ε_hc
 
-\[
-\mathrm{post}_j = 2 \cdot \sigma(m_{hc+j} \cdot s_1 + b_{hc+j})
-\]
+post_j = 2 · σ(m_{hc+j} · s1 + b_{hc+j})
 
-\[
-\widetilde{C}_{jk} = m_{2hc + j\cdot hc + k} \cdot s_2 + b_{2hc + j\cdot hc + k}
-\]
+C̃_jk  = m_{2hc + j·hc + k} · s2 + b_{2hc + j·hc + k}
+```
 
-然后对 \(\widetilde{C}\) 做 **Sinkhorn**（见 §5）得 \( C = \mathrm{comb} \)。
+然后对 `C̃` 做 **Sinkhorn**（见 §5）得 `C = comb`。
 
 **Step C — 合成子模块输入**
 
-\[
-y = \sum_{k=0}^{hc-1} \mathrm{pre}_k \, R_k
-\in \mathbb{R}^{H}
-\]
+```text
+y = Σ_{k=0}^{hc-1}  pre_k · R_k
+  ∈ R^{H}
+```
 
 代码里叫 `hc_combine`：`y[h] = Σ_k pre[k] * R[k, h]`。
 
@@ -169,21 +165,23 @@ y = \sum_{k=0}^{hc-1} \mathrm{pre}_k \, R_k
 
 ### 4.2 子模块
 
-\[
-o = \mathrm{Attn}(y) \quad \text{或} \quad o = \mathrm{MoE}(y)
-\]
+```text
+o = Attn(y)    或    o = MoE(y)
+```
 
 ### 4.3 `hc_post`：单路输出 → 写回多路
 
-\[
-R'_j = \mathrm{post}_j \cdot o + \sum_{k=0}^{hc-1} C_{jk}\, R_k
-\]
+```text
+R'_j = post_j · o + Σ_{k=0}^{hc-1} C_jk · R_k
+```
 
 向量形式：
 
-\[
-R' = \underbrace{\mathrm{post} \odot o}_{\text{广播到各路}} + C\, R
-\]
+```text
+R' = (post ⊙ o) + C R
+```
+
+其中 `post ⊙ o` 表示把子模块输出按 `post` 门控广播到各路。
 
 Torch 参考实现（与 kernel 一致）：
 
@@ -200,13 +198,13 @@ R_new = post.unsqueeze(-1) * o.unsqueeze(1) + (comb.unsqueeze(-1) * R.unsqueeze(
 
 ### 4.4 `hc_head`：多路 → 最终 hidden
 
-\[
-m = W_{\mathrm{head}}\, R_{\mathrm{flat}} \cdot r_{\mathrm{rms}}
-,\quad
-\alpha_j = \sigma(m_j \cdot s + b_j) + \varepsilon
-,\quad
-z = \sum_j \alpha_j R_j
-\]
+```text
+m = W_head · R_flat · r_rms
+
+α_j = σ(m_j · s + b_j) + ε
+
+z = Σ_j α_j · R_j
+```
 
 ---
 
@@ -214,14 +212,14 @@ z = \sum_j \alpha_j R_j
 
 这是 **m** 的来源（manifold-constrained）。
 
-对每个 token 的 `comb` 矩阵 \(C \in \mathbb{R}^{hc\times hc}\)：
+对每个 token 的 `comb` 矩阵 `C ∈ R^{hc × hc}`：
 
-1. **初始化**：对行做稳定 softmax，再加 `eps`，再按列归一化  
-2. **迭代 `sinkhorn_iters-1` 次**（默认总共约 20 轮量级）：交替  
-   - 行归一：\( C_{jk} \leftarrow C_{jk} / (\sum_{k'} C_{jk'} + \varepsilon) \)  
-   - 列归一：\( C_{jk} \leftarrow C_{jk} / (\sum_{j'} C_{j'k} + \varepsilon) \)
+1. **初始化**：对行做稳定 softmax，再加 `eps`，再按列归一化
+2. **迭代 `sinkhorn_iters-1` 次**（默认总共约 20 轮量级）：交替
+   - 行归一：`C_jk ← C_jk / (Σ_{k'} C_jk' + ε)`
+   - 列归一：`C_jk ← C_jk / (Σ_{j'} C_j'k + ε)`
 
-效果：\(C\) 接近 **双随机矩阵**（行和、列和都 ≈ 1）。  
+效果：`C` 接近 **双随机矩阵**（行和、列和都 ≈ 1）。  
 跨流混合因此是一种「质量守恒」式的重分配，而不是任意爆炸的线性层——这就是 manifold 约束的工程落地。
 
 对比：Hunyuan 的 iHC 等变体「有门控但无 combination + Sinkhorn」，与 DSV4 mHC **不可互换**（SGLang docs 也强调这一点）。
