@@ -1,8 +1,17 @@
 # learning_notes
 
-AI 相关学习笔记，主要按 **模型架构** 整理（SGLang / HF config / 公开博客与论文）。随读随记，伪代码偏教学向。
+AI 相关学习笔记：`models/` 偏模型架构；`ascend-ai-compiler/` 偏 **昇腾版 AI 编译器 / 部署** 讲义。
 
 ## 目录
+
+```
+ascend-ai-compiler/          # 原「AI 编译器」课 → 昇腾 CANN 全量改写（大纲逐条覆盖）
+├── 00-syllabus-checklist.md # 校对清单
+├── 01 … 18                  # 讲义（C++/概论/MLIR/硬件/CANN/量化/CV/LLM/求职）
+└── labs/lab1…lab6           # 六个实验验收单
+```
+
+完整目录与学习顺序见 [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)。
 
 ```
 models/
@@ -26,6 +35,22 @@ models/
     ├── qsa.md            # Qwen Sparse Attention（c4 indexer → 稀疏 GQA）
     └── ple.md            # N-gram / PLE（hash 查表、门控注入 HC）
 ```
+
+## 昇腾 AI 编译器讲义
+
+原课大纲 **全部条目** 均有对应课件（算能工具名 → ATC/GE/om）。入口与校对表：
+
+- [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)
+- [00-syllabus-checklist.md](ascend-ai-compiler/00-syllabus-checklist.md)
+
+| 阶段 | 内容 |
+|---|---|
+| 基础 | C++ 基石、编译器概论、MLIR Dialect/Pass、Lab1 |
+| 硬件环境 | 昇腾存储层次、CANN 环境、Lab2 ResNet50 |
+| CANN | 工作流、Parser、GE、AOE/内存调度、Lab3 ONNX→om |
+| 量化性能 | INT8、校准、Lab4、Profiling |
+| CV / LLM | YOLO+Stream、Attention、KV、Qwen、Lab5/6 |
+| 求职 | 岗位与面试题方向 |
 
 ## 模型对照（速查）
 
