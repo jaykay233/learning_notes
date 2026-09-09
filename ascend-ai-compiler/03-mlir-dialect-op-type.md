@@ -224,8 +224,63 @@ Lab1：写 input.mlir → opt → diff output。
 
 ## 9. 练习
 
-1. 为什么不建议「一个大扁平 IR 打天下」？  
-2. Op 的 operands 与 attributes 差别？  
-3. `tensor<1x3xf32>` 是 Type 还是 Attribute？`{dilations = [1,1]}` 呢？  
-4. 读三行陌生 `.mlir`，口头标注 Dialect/Op/Type。  
+1. 为什么不建议「一个大扁平 IR 打天下」？
+2. Op 的 operands 与 attributes 差别？
+3. `tensor<1x3xf32>` 是 Type 还是 Attribute？`{dilations = [1,1]}` 呢？
+4. 读三行陌生 `.mlir`，口头标注 Dialect/Op/Type。
 5. 用类比解释：TopDialect→TpuDialect 与 Parser→GE 后端。
+
+### 参考答案
+
+**1. 为什么不建议一个大扁平 IR**
+
+一步从框架直接落到最底层（或所有算子挤在同一无命名空间）会有：
+
+- **优化难分层**：融合该在张量层做，循环变换该在更下层做；糊成一层机会乱、也难复用  
+- **硬件细节过早泄漏**：换 NPU/GPU 要推倒重来  
+- **名字冲突、生态难共享**：谁的 `add`？社区无法只依赖稳定的中层方言（如 `tosa`/`linalg`）  
+
+MLIR 用 **多 Dialect + 渐进 lowering** 就是为了避免「一张胖 IR 通吃」。
+
+**2. operands vs attributes**
+
+| | operands | attributes |
+|---|---|---|
+| 是什么 | **运行期 SSA 值**（边上的数据依赖） | **编译期已知**的标注/常量元数据 |
+| 例子 | `%a`、`%b` 作为 `addi` 的输入 | `{dilations = [1,1]}`、融合标记、整数 attr |
+| 何时变 | 随数据流、可被 replaceAllUses | 优化 Pass 可读写下，不参与「运行时算一遍」那种边 |
+
+一句话：operands =「算的时候用哪些值」；attributes =「描述这条 op 的静态配置」。
+
+**3. Type 还是 Attribute**
+
+- `tensor<1x3xf32>` → **Type**（值的类型：形状 + 元素类型）  
+- `{dilations = [1,1]}` → **Attribute**（挂在 op 上的编译期属性字典；这里 dilations 是 attr）
+
+**4. 口头标注示例**
+
+给定：
+
+```mlir
+%sum = arith.addi %a, %b : i32
+%t = tensor.empty() : tensor<2x3xf32>
+return %out : tensor<1x1000xf32>
+```
+
+| 行 | Dialect | Op | Type（相关） |
+|---|---|---|---|
+| 1 | `arith` | `addi` | 结果/操作数 `i32` |
+| 2 | `tensor` | `empty` | 结果 `tensor<2x3xf32>` |
+| 3 | `func`（常见） | `return` | 返回值 `tensor<1x1000xf32>` |
+
+读陌生 IR 时口诀：**点号前 = Dialect，点号后 = Op 名，冒号后 = Type。**
+
+**5. Top→Tpu 与 Parser→GE 类比**
+
+| 原课（tpu-mlir） | 昇腾课 | 在干什么 |
+|---|---|---|
+| **TopDialect** | Parser 之后的 **高阶 GE 中间图** | 靠近框架：「算什么」，硬件弱相关 |
+| **TopToTpu / lowering** | GE：**准备→拆分→优化→编译** | 往硬件语义降 |
+| **TpuDialect** | 硬件侧算子 + kernel / 最终 **om** 规划 | 靠近芯片：「怎么算、存在哪」 |
+
+类比：Top→Tpu 是「高阶图方言降到硬件方言」；Parser→GE 后端是同一趟旅程在昇腾工具链上的名字，不一定以公开 `.mlir` 文本给你改，但 **分层意图相同**。
