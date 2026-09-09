@@ -743,12 +743,87 @@ TableGen 生成 `classof` → `isa/dyn_cast` 才认识你的 Op；Pass 登记也
 
 ## 10. 练习（逼自己连起来）
 
-1. 用自己的话画 `SmallVector<T,4>` 在 size=3 与 size=10 时内存在哪。  
-2. 为什么 `StringRef` 作函数**返回值**容易翻车？如何改成安全？  
-3. Bump 分配的对象为什么常常不调用析构？这限制你往池里放什么？  
-4. 给出 `cast` 用错会怎样、`dyn_cast` 用错会怎样。  
-5. 用一张流程图描述：CRTP Pass + walk + dyn_cast + SmallVector 在一次消除 Pass 里的调用顺序。  
+1. 用自己的话画 `SmallVector<T,4>` 在 size=3 与 size=10 时内存在哪。
+2. 为什么 `StringRef` 作函数**返回值**容易翻车？如何改成安全？
+3. Bump 分配的对象为什么常常不调用析构？这限制你往池里放什么？
+4. 给出 `cast` 用错会怎样、`dyn_cast` 用错会怎样。
+5. 用一张流程图描述：CRTP Pass + walk + dyn_cast + SmallVector 在一次消除 Pass 里的调用顺序。
 6. TableGen 若漏生成 `classof`，你会在运行期看到什么症状？
+
+### 参考答案
+
+**1. SmallVector\<T,4\> 内存位置**
+
+```text
+size=3（≤ N=4）：
+  对象本身（多半在栈上 / 嵌在别的对象里）
+  └─ 内联缓冲 inline[4] 里放了 3 个 T
+  └─ 不向堆 malloc
+
+size=10（> 4）：
+  对象里只剩指针/size/capacity 等元数据
+  └─ 堆上另有一块缓冲，里面 10 个 T
+  └─ 行为近似 std::vector（多了一段「曾经尝试内联」的逻辑）
+```
+
+**2. StringRef 作返回值为何翻车；怎么改安全**
+
+`StringRef` **不拥有**字符内存，只保存 `{指针, 长度}`。若返回值指向的是函数里的局部 `std::string` / 栈数组，函数返回后局部对象销毁 → 指针悬垂 → UAF。
+
+安全做法（任选）：
+
+- 返回 `std::string`（拥有拷贝）  
+- 返回指向 **更长生命周期** 缓冲的 Ref（如 bump 池、Context 里 uniqued 的字符串、调用方传入的 buffer）  
+- 调用方传入输出参数 `SmallVectorImpl<char> &` / `std::string &`，由调用方拥有  
+
+**3. Bump 为何常不调析构；限制放什么**
+
+Arena 销毁时往往 **整 slab 一次性 free**，不为每个对象调析构，图省事、求速度。
+
+因此池里适合：
+
+- 平凡析构 / POD  
+- 或资源由外部统一管、对象本身不依赖析构释放  
+
+不适合随便放：内含 `std::vector`/`std::string`/文件句柄、且指望析构回收的复杂 C++ 对象（会泄漏或更糟）。
+
+**4. cast 用错 vs dyn_cast 用错**
+
+| | 用错时（类型其实不是 T） |
+|---|---|
+| `cast<T>` | **断言失败直接崩**（debug 下抓逻辑错误；你「赌错了」） |
+| `dyn_cast<T>` | 得到空/失败结果，`if` 不进分支；若你没检查就解引用 → 仍可能崩，但是「空指针用法错」，不是 cast 本身断言 |
+
+口诀：不确定 → `dyn_cast` 并检查；确定到可以赌命 → 才 `cast`。
+
+**5. 消除 Pass 调用顺序（流程图）**
+
+```text
+PassManager 调度到你的 Pass
+  → CRTP/PassWrapper::run()
+      → YourPass::runOnOperation()          // 静态绑定到你的实现
+          → root->walk(visitOp)
+              → 每个 Operation *op
+                  → dyn_cast<IdentityOp>(op)  // RTTI 分派
+                  → 失败：看下一个 op
+                  → 成功：
+                       SmallVector 可选：收集 users / 额外 operand
+                       replaceAllUsesWith(结果, 输入)
+                       eraseOp(identity)
+          → walk 结束，Pass 返回成功
+```
+
+要点串联：CRTP 负责「框架如何调到你」；walk 负责遍历；dyn_cast 负责「是不是 identity」；SmallVector 负责热路径上暂存小列表（简单消除也可能用不上）。
+
+**6. TableGen 漏了 classof 的运行期症状**
+
+`isa` / `dyn_cast` / `cast` 依赖 `classof` 判断「这个 Operation 是不是 MyAddOp」。漏了或写错会导致：
+
+- `dyn_cast<MyAddOp>(op)` **总是失败**（明明 IR 里是 my.add）→ Pattern/Pass 像没匹配到  
+- 或错误地 `classof` 对别的 op 返回 true → **误匹配**、改错节点、更难查的静默坏结果  
+- `cast` 路径上则可能在「你以为是、其实 classof 说不是」或反过来时触发断言  
+
+表现常常是：「IR 打印看着对，但 Pass 就是不进分支 / 乱改图」。
 
 ---
 
