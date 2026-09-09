@@ -1,19 +1,20 @@
 # 04 · MLIR Pass 管理与模式匹配
 
 > 原课：Pass Manager、GreedyPatternRewrite。  
-> 前置：[01](./01-cpp-foundations.md)、[03](./03-mlir-dialect-op-type.md)。实践：[Lab1](./labs/lab1-redundant-op-pass.md)。
+> 前置：[01](./01-cpp-foundations.md)、[03](./03-mlir-dialect-op-type.md)。实践：[Lab1](./labs/lab1-redundant-op-pass.md)。  
+> 缩写对照：[glossary.md](./glossary.md)。
 
 ---
 
 ## 0. 为什么有了 IR 还要 Pass
 
-IR 只是「照片」；**Pass** 才是「修图滤镜」。  
-Frontend 里的融合、DCE、canonicalize，后端 lowering，全是一条条 Pass（或等价黑盒步骤）串起来。
+IR（Intermediate Representation，中间表示）只是「照片」；**Pass**（编译器的一遍变换/分析）才是「修图滤镜」。  
+Frontend 里的融合、DCE（Dead Code Elimination，死码消除）、canonicalize（规范化），后端 lowering（降级），全是一条条 Pass（或等价黑盒步骤）串起来。
 
 ```text
 mlir-opt 输入.mlir -pass-pipeline='...'
         ≈
-ATC/GE 内部一长串你看不见名字的图优化
+ATC（昇腾张量编译器）/ GE（图引擎）内部一长串你看不见名字的图优化
 ```
 
 本讲把白盒版讲清楚，你才能理解昇腾黑盒在干什么。
@@ -27,7 +28,7 @@ ATC/GE 内部一长串你看不见名字的图优化
 若把所有优化写进一个巨型函数：
 
 - 无法单独开关「只跑融合」  
-- 无法复用社区 CSE  
+- 无法复用社区 CSE（公共子表达式消除）
 - 测试极难  
 
 → 每个变换做成 Pass，由 **Pass Manager（PM）** 编排。

@@ -1,7 +1,7 @@
 # 昇腾版 AI 编译器课程讲义
 
-> 按原「AI 编译器」大纲 **逐条覆盖**，硬件/工具链从算能 tpu-mlir 改为 **昇腾 CANN（ATC / GE / om）**。
-> 校对表见 [00-syllabus-checklist.md](./00-syllabus-checklist.md)。
+> 按原「AI 编译器」大纲 **逐条覆盖**，硬件/工具链从算能 tpu-mlir 改为 **昇腾 CANN（Compute Architecture for Neural Networks，昇腾异构计算架构；含 ATC / GE / om）**。
+> 校对表见 [00-syllabus-checklist.md](./00-syllabus-checklist.md)；**缩写英中对照**见 [glossary.md](./glossary.md)。
 >
 > **讲义深度约定**：各章按「为什么 → 怎样工作/实现（概念）→ 效果 → 用在哪 → 与前后章怎么连」展开（[01](./01-cpp-foundations.md) 为范例；**02–18 与 labs 已按同一标准加厚**）。
 
@@ -22,6 +22,7 @@
 ```
 ascend-ai-compiler/
 ├── 00-syllabus-checklist.md
+├── glossary.md              # 缩写英中对照
 ├── 01-cpp-foundations.md
 ├── 02-compiler-overview.md
 ├── 03-mlir-dialect-op-type.md

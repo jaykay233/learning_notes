@@ -1,7 +1,8 @@
 # 02 · AI 编译器概论（Graph vs Kernel）
 
 > 原课：「AI 编译器概论」+ 大纲「1.1 框架图」。  
-> 读法与 [01](./01-cpp-foundations.md) 相同：每个块按 **为什么 → 怎样工作 → 效果 → 用在哪 / 怎么连**。
+> 读法与 [01](./01-cpp-foundations.md) 相同：每个块按 **为什么 → 怎样工作 → 效果 → 用在哪 / 怎么连**。  
+> 缩写对照：[glossary.md](./glossary.md)。
 
 ---
 
@@ -11,12 +12,12 @@
 
 ```text
 框架模型（算什么）
-    → Frontend：统一 IR + 与硬件无关的图优化
+    → Frontend：统一 IR（Intermediate Representation，中间表示）+ 与硬件无关的图优化
     → Backend：绑硬件的调度 / 内存 / kernel / codegen
     → 目标芯片上可执行
 ```
 
-昇腾把后半段收成 **ATC/GE →** `.om` **→ AscendCL**；道理与 TensorRT、tpu-mlir 同一张骨架。
+昇腾把后半段收成 **ATC（Ascend Tensor Compiler，昇腾张量编译器）/ GE（Graph Engine，图引擎） → `.om`（离线模型）→ AscendCL（运行时 API）**；道理与 TensorRT、tpu-mlir 同一张骨架。
 
 ---
 
@@ -37,9 +38,9 @@
 ### 1.2 编译器实际在做的四件事
 
 1. **统一**：多前端 → 一种（或少数）中间图
-2. **图优化**：融合、DCE、代数化简…（少算、少搬）
-3. **硬件映射**：选 kernel、切分、分配内存与流
-4. **产出**：AOT 文件或 JIT 缓存码
+2. **图优化**：融合、DCE（Dead Code Elimination，死码消除）、代数化简…（少算、少搬）  
+3. **硬件映射**：选 kernel、切分、分配内存与流  
+4. **产出**：AOT（Ahead-Of-Time，提前/离线编译）文件或 JIT（Just-In-Time，即时编译）缓存码  
 
 
 
@@ -106,8 +107,8 @@
 | DCE（死码消除 / 无效计算剔除）       | 删没有使用者的计算             | 少算          |
 
 
-**效果：** 输出 Optimized Graph，仍偏「算什么」，尚未钉死「在哪个 Core 的哪块 UB」。  
-**用在哪：** MLIR 的 canonicalize/CSE；GE 的图准备/原图优化。
+**效果：** 输出 Optimized Graph，仍偏「算什么」，尚未钉死「在哪个 Core 的哪块 UB（Unified Buffer，片上统一缓冲）」。  
+**用在哪：** MLIR 的 canonicalize（规范化）/ CSE（Common Subexpression Elimination，公共子表达式消除）；GE 的图准备/原图优化。
 
 ### 2.4 Backend 各子项（逐项四问缩写）
 
@@ -125,7 +126,7 @@
 
 **Auto-tuning**  
 为什么：手工搜 tile/切分组合爆炸。  
-效果：用搜索+实测找较优策略。昇腾 **AOE**。
+效果：用搜索+实测找较优策略。昇腾 **AOE**（自动调优；含 SGAT 子图调优 / OPAT 算子调优，以官方文档名为准）。
 
 **Kernel libraries**  
 为什么：成熟算子（Conv/GEMM）有手写极致实现。  

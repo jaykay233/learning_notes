@@ -1,21 +1,22 @@
 # 03 · MLIR 基础：Dialect / Op / Type
 
 > 原课：Dialect/Op/Type、语法、Builtin Dialect。  
-> 昇腾推理日常用 ATC；本讲解决「Frontend 的 IR 到底长什么样」，并为 Lab1/[04](./04-mlir-pass-patterns.md) 打底。
+> 昇腾推理日常用 ATC（Ascend Tensor Compiler，昇腾张量编译器）；本讲解决「Frontend 的 IR（中间表示）到底长什么样」，并为 Lab1/[04](./04-mlir-pass-patterns.md) 打底。  
+> 缩写对照：[glossary.md](./glossary.md)。
 
 ---
 
 ## 0. 和上一讲怎么接
 
 [02](./02-compiler-overview.md) 说 Frontend 要有 **High-level Graph IR**。  
-MLIR 就是工业界把「多层 IR + 可扩展方言」做成 **可复用基础设施** 的一种答案。
+**MLIR（Multi-Level Intermediate Representation，多层级中间表示）** 就是工业界把「多层 IR + 可扩展方言」做成 **可复用基础设施** 的一种答案。
 
 ```text
 你在 MLIR 里看到的：
-  Dialect = 谁家的算子包
-  Op      = 一条具体运算
-  Type    = 值的形状与元素类型
-  Attribute = 编译期常量标注
+  Dialect   = 方言（谁家的算子包）
+  Op        = Operation，一条具体运算
+  Type      = 类型（值的形状与元素类型）
+  Attribute = 属性（编译期常量标注）
 ```
 
 ---
@@ -193,8 +194,8 @@ Lab1：写 input.mlir → opt → diff output。
 | 模块函数 | `module`、`func.func`、`return` | 永远 |
 | 算术 | `arith.addi`、`arith.cmpf` | 标量/索引 |
 | 张量 | `tensor.extract` / `insert` | 造型 |
-| 控制流 | `scf.for` / `if` | lowering 后常见 |
-| TOSA | `tosa.*` | 框架→中层中转 |
+| 控制流 | `scf.for` / `scf.if`（**SCF** = Structured Control Flow，结构化控制流） | lowering 后常见 |
+| TOSA | `tosa.*`（**TOSA** = Tensor Operator Set Architecture，张量算子集架构） | 框架→中层中转 |
 
 练习：打印一份 IR，逐行填「Dialect / Op / Type」。
 
