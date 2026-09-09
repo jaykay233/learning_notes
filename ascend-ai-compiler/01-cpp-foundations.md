@@ -402,43 +402,247 @@ Visitor 经典意图：
 - **遍历结构**的人只负责走到每个节点  
 - **处理节点**的人按类型 overload `visit`  
 
-两者可独立扩展（在经典 GoF 里通过 accept/visit 双分派；MLIR 里常简化成 walk + 分发）。
+两者可独立扩展（在经典 GoF 里通过 `accept`/`visit` 双分派；MLIR 里常简化成 walk + 分发）。
 
-### 6.2 在 MLIR 里长什么样（比教科书更实用）
+---
 
-**（1）walk：遍历**
+### 6.2 完整例子：迷你表达式 IR + 两种 Visitor
+
+下面是一份 **可单独理解的完整 C++ 例子**（教学向，不依赖 MLIR）。  
+场景：表达式树只有三种节点——常量、加法、取负。我们要做两件完全不同的事：
+
+1. **打印**成字符串  
+2. **求值**成 `int`  
+
+若不做 Visitor，每种新操作都要改所有节点类（加虚函数）。Visitor 把「新操作」收成一个新 Visitor 类。
+
+#### （1）节点与 Visitor 接口
 
 ```cpp
-getOperation()->walk([](Operation *op) {
-  // 每个嵌套 op 都会进来
-});
+#include <iostream>
+#include <memory>
+#include <string>
+
+// ---- 前置声明 ----
+struct ConstExpr;
+struct AddExpr;
+struct NegExpr;
+
+// Visitor：每种具体节点一个 visit 重载
+struct ExprVisitor {
+  virtual ~ExprVisitor() = default;
+  virtual void visit(ConstExpr &e) = 0;
+  virtual void visit(AddExpr &e) = 0;
+  virtual void visit(NegExpr &e) = 0;
+};
+
+// 表达式基类：只负责 accept（把「我是谁」交给 visitor）
+struct Expr {
+  virtual ~Expr() = default;
+  virtual void accept(ExprVisitor &v) = 0;
+};
+
+struct ConstExpr : Expr {
+  int value;
+  explicit ConstExpr(int v) : value(v) {}
+  void accept(ExprVisitor &v) override { v.visit(*this); }  // 双分派第 2 下
+};
+
+struct AddExpr : Expr {
+  std::unique_ptr<Expr> lhs, rhs;
+  AddExpr(std::unique_ptr<Expr> l, std::unique_ptr<Expr> r)
+      : lhs(std::move(l)), rhs(std::move(r)) {}
+  void accept(ExprVisitor &v) override { v.visit(*this); }
+};
+
+struct NegExpr : Expr {
+  std::unique_ptr<Expr> inner;
+  explicit NegExpr(std::unique_ptr<Expr> e) : inner(std::move(e)) {}
+  void accept(ExprVisitor &v) override { v.visit(*this); }
+};
 ```
 
-**（2）按类型处理：TypeSwitch / dyn_cast**
+**双分派在干什么（读代码时跟一眼）：**
+
+```text
+expr->accept(visitor)
+  → 虚调用进 ConstExpr::accept / AddExpr::accept / …
+  → 里面写 v.visit(*this)
+  → 此时 *this 已是静态类型 ConstExpr&，于是命中 visit(ConstExpr&)
+```
+
+第一下靠「节点虚表」选中正确的 `accept`；第二下靠「visit 重载」选中正确的处理函数。
+
+#### （2）PrintVisitor：只负责「怎么打印」
 
 ```cpp
-TypeSwitch<Operation *>(op)
-  .Case<AddOp>([](AddOp add) { /* ... */ })
-  .Case<MulOp>([](MulOp mul) { /* ... */ })
-  .Default([](Operation *) {});
+struct PrintVisitor : ExprVisitor {
+  std::string out;
+
+  void visit(ConstExpr &e) override {
+    out += std::to_string(e.value);
+  }
+
+  void visit(AddExpr &e) override {
+    out += "(";
+    e.lhs->accept(*this);   // 递归：遍历交给 accept，处理仍是本 visitor
+    out += " + ";
+    e.rhs->accept(*this);
+    out += ")";
+  }
+
+  void visit(NegExpr &e) override {
+    out += "-(";
+    e.inner->accept(*this);
+    out += ")";
+  }
+};
 ```
+
+#### （3）EvalVisitor：只负责「怎么求值」
+
+```cpp
+struct EvalVisitor : ExprVisitor {
+  int result = 0;
+
+  void visit(ConstExpr &e) override {
+    result = e.value;
+  }
+
+  void visit(AddExpr &e) override {
+    e.lhs->accept(*this);
+    int a = result;
+    e.rhs->accept(*this);
+    int b = result;
+    result = a + b;
+  }
+
+  void visit(NegExpr &e) override {
+    e.inner->accept(*this);
+    result = -result;
+  }
+};
+```
+
+#### （4）拼一棵树跑起来
+
+```cpp
+int main() {
+  // 树： -(1 + 2)    即 -3
+  auto expr = std::make_unique<NegExpr>(
+      std::make_unique<AddExpr>(
+          std::make_unique<ConstExpr>(1),
+          std::make_unique<ConstExpr>(2)));
+
+  PrintVisitor printer;
+  expr->accept(printer);
+  std::cout << printer.out << "\n";   // 期望：-(1 + 2)
+
+  EvalVisitor eval;
+  expr->accept(eval);
+  std::cout << eval.result << "\n";   // 期望：-3
+}
+```
+
+#### （5）这个例子说明了什么
+
+| 角色 | 谁扮演 | 改它当什么变了 |
+|---|---|---|
+| 结构 / 遍历 | `Expr` 树 + `accept` 递归 | 新增节点类型时要改 Visitor 接口（经典 Visitor 的代价） |
+| 操作 A | `PrintVisitor` | **只加一个类**，不用改 Const/Add/Neg |
+| 操作 B | `EvalVisitor` | 同上 |
+
+对照编译器：`Const/Add/Neg` ≈ 各种 `Op`；`PrintVisitor` ≈ dump；`EvalVisitor` ≈ 常量折叠/解释执行。
+
+---
+
+### 6.3 同一问题的 MLIR 风格写法（walk + 分发）
+
+真实 MLIR 很少手写整套 GoF `accept`，因为 `Operation` 已经能 **walk**，类型分发用 `dyn_cast` / `TypeSwitch`。
+
+> 排版说明：Markdown 会把「方括号 + 圆括号」当成链接，所以不要把 lambda 直接粘在 `walk(` 后面写成一行；下面改成先定义 `visitOp`，再 `root->walk(visitOp)`。
+>
+> C++ 里等价写法仍是：`root->walk( 带捕获的 lambda )`。
+
+```cpp
+// 教学示意：统计模块里 AddOp 个数，并打印 ConstOp 的值
+// （类型名按你的 Dialect 替换；逻辑完整）
+
+struct CountAndDump {
+  int addCount = 0;
+
+  void run(Operation *root) {
+    // 捕获列表与参数分行写：避免 Markdown 把 ]( 当成链接；C++ 完全合法
+    auto visitOp = [&]
+    (Operation *op) {
+      // —— 遍历：walk 已经帮你走到每个 op ——
+      // —— 处理：按类型分发（Visitor 的 visit 重载）——
+      if (auto add = dyn_cast<AddOp>(op)) {
+        (void)add;
+        ++addCount;
+        return;  // 只结束本次 lambda，不结束 run()；walk 继续下一个 op
+      }
+      if (auto c = dyn_cast<ConstOp>(op)) {
+        llvm::errs() << "const=" << c.getValue() << "\n";
+        return;
+      }
+      // 其它类型：默认忽略
+    };
+    root->walk(visitOp);
+  }
+};
+```
+
+仍可能被部分预览器误伤的两行，用文字描述捕获即可：lambda 捕获列表为「仅 `&`」，参数为 `Operation *op`。
+
+```cpp
+// 等价的 TypeSwitch 写法（更像「一组 visit 重载」）：
+void dumpOne(Operation *op) {
+  llvm::TypeSwitch<Operation *>(op)
+      .Case<AddOp>([](AddOp add) {
+        llvm::errs() << "saw add\n";
+      })
+      .Case<ConstOp>([](ConstOp c) {
+        llvm::errs() << "const=" << c.getValue() << "\n";
+      })
+      .Default([](Operation *) {});
+}
+```
+
+调用关系：
+
+```text
+定义 visitOp = lambda(捕获 &, 参数 Operation*)
+然后 root->walk(visitOp)
+```
+
+和 GoF 例子的对应：
+
+| GoF | MLIR 日常 |
+|---|---|
+| `expr->accept(v)` 递归遍历 | `root->walk(visitOp)` |
+| `v.visit(AddExpr&)` | `dyn_cast<AddOp>` / `.Case<AddOp>` |
+| 新加一种「操作」= 新 Visitor 类 | 新加一个 Pass / 一个 lambda 管道 |
+| 节点上写 `accept` | 一般 **不用** 你手写；框架已有 |
 
 **（3）PatternRewrite**  
-「匹配到某种局部形状 → 改写」——可以看成 **声明式的、可组合的局部 Visitor**（见 [04](./04-mlir-pass-patterns.md)）。
+「匹配到某种局部形状 → 改写」——可以看成 **声明式的、可组合的局部 Visitor**（见 [04](./04-mlir-pass-patterns.md)）。Lab1 的消除 identity 就是这种。
 
-### 6.3 效果是什么
+---
+
+### 6.4 效果是什么
 
 - 结构清晰：先想「怎么走完图」，再想「碰到 Add 干什么」  
-- 新加 Op 类型时，处理逻辑有固定挂载点  
+- 新加一种 **分析/打印/变换** 时，处理逻辑有固定挂载点  
 - 和 Greedy Pattern 结合后，优化可插拔  
 
-### 6.4 一般哪里会使用
+### 6.5 一般哪里会使用
 
 - 整模块统计、校验  
 - Canonicalize / 自定义消除 Pass（Lab1）  
 - 调试打印「所有 ConvOp」  
 
-**和 RTTI 的连接：** Visitor 的每个分支仍然靠 `isa`/`dyn_cast`/`Case<T>`。
+**和 RTTI 的连接：** Visitor 的每个分支仍然靠虚表（GoF）或 `isa`/`dyn_cast`/`Case<T>`（MLIR）。
 
 ---
 
