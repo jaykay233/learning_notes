@@ -1,17 +1,27 @@
 # learning_notes
 
-AI 相关学习笔记：`models/` 偏模型架构；`ascend-ai-compiler/` 偏 **昇腾版 AI 编译器 / 部署** 讲义。
+AI 相关学习笔记：`models/` 偏模型架构；`ascend-ai-compiler/` 偏 **昇腾版 AI 编译器 / 部署** 讲义；`cuda-graph/` 偏推理侧 CUDA Graph / SGLang。
 
 ## 目录
 
 ```
 ascend-ai-compiler/          # 原「AI 编译器」课 → 昇腾 CANN 全量改写（大纲逐条覆盖）
 ├── 00-syllabus-checklist.md # 校对清单
-├── 01 … 18                  # 讲义（C++/概论/MLIR/硬件/CANN/量化/CV/LLM/求职）
-└── labs/lab1…lab6           # 六个实验验收单
+├── glossary.md              # 缩写英中对照
+├── 01 … 18                  # 讲义
+└── labs/lab1…lab6
+codes/lab1/                  # Lab1：inputs / expected / Pass 骨架
+cuda-graph/                  # CUDA Graph、memory-saver、SGLang vs Inductor Trees
 ```
 
 完整目录与学习顺序见 [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)。
+
+```
+cuda-graph/
+├── 01-basics-and-memory-saver.md              # Graph 是什么；region / pause / resume
+├── 02-sglang-cudagraph-vs-inductor-trees.md   # 录图粒度；CudaGraphRunner vs CUDAGraph Trees
+└── 03-flavors-vmm-and-hijack.md               # 几种外壳对照；VMM；劫持换分配器
+```
 
 ```
 models/
@@ -42,6 +52,7 @@ models/
 
 - [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)
 - [00-syllabus-checklist.md](ascend-ai-compiler/00-syllabus-checklist.md)
+- [glossary.md](ascend-ai-compiler/glossary.md)（缩写英中对照）
 
 | 阶段 | 内容 |
 |---|---|
@@ -75,6 +86,7 @@ models/
 
 | 主题 | 文档 |
 |---|---|
+| CUDA Graph / memory-saver / SGLang Runner | [01](cuda-graph/01-basics-and-memory-saver.md)、[02](cuda-graph/02-sglang-cudagraph-vs-inductor-trees.md)、[03 · 几种外壳与 VMM](cuda-graph/03-flavors-vmm-and-hijack.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |
 | QSA（block 粗选 → token 展开） | [qwen3.8-flash-next/qsa.md](models/qwen3.8-flash-next/qsa.md) |
