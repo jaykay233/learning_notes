@@ -1,6 +1,6 @@
 # learning_notes
 
-AI 相关学习笔记：`models/` 偏模型架构；`ascend-ai-compiler/` 偏 **昇腾版 AI 编译器 / 部署** 讲义；`cuda-graph/` 偏推理侧 CUDA Graph / SGLang。
+AI 相关学习笔记：`models/` 偏模型架构；`ascend-ai-compiler/` 偏 **昇腾版 AI 编译器 / 部署**；`cuda-graph/` 偏推理 CUDA Graph；`speculative-decoding/` 偏投机解码；`torch_compile/` 偏 `torch.compile` / Dynamo / FX。
 
 ## 目录
 
@@ -12,6 +12,8 @@ ascend-ai-compiler/          # 原「AI 编译器」课 → 昇腾 CANN 全量�
 └── labs/lab1…lab6
 codes/lab1/                  # Lab1：inputs / expected / Pass 骨架
 cuda-graph/                  # CUDA Graph、memory-saver、SGLang vs Inductor Trees
+speculative-decoding/        # 投机解码收益（GPU vs LPU 等）
+torch_compile/               # Dynamo 调用过程、与 FX 的关系
 ```
 
 完整目录与学习顺序见 [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)。
@@ -21,6 +23,18 @@ cuda-graph/
 ├── 01-basics-and-memory-saver.md              # Graph 是什么；region / pause / resume
 ├── 02-sglang-cudagraph-vs-inductor-trees.md   # 录图粒度；CudaGraphRunner vs CUDAGraph Trees
 └── 03-flavors-vmm-and-hijack.md               # 几种外壳对照；VMM；劫持换分配器
+```
+
+```
+speculative-decoding/
+└── 01-gpu-vs-lpu-sram.md   # verify(K)≪K×decode(1)；大 SRAM/低算力为何吃不满收益
+```
+
+```
+torch_compile/
+├── 01-dynamo-and-fx.md           # Dynamo 调用过程；FX；Script/LazyTensor 对照
+├── 02-aot-autograd.md            # AOTAutograd：joint 图、functionalize、partition
+└── 03-dispatcher-and-modes.md    # DispatchKey / vtable / Mode / TLS / AOT 衔接
 ```
 
 ```
@@ -87,6 +101,8 @@ models/
 | 主题 | 文档 |
 |---|---|
 | CUDA Graph / memory-saver / SGLang Runner | [01](cuda-graph/01-basics-and-memory-saver.md)、[02](cuda-graph/02-sglang-cudagraph-vs-inductor-trees.md)、[03 · 几种外壳与 VMM](cuda-graph/03-flavors-vmm-and-hijack.md) |
+| 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
+| torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |
 | QSA（block 粗选 → token 展开） | [qwen3.8-flash-next/qsa.md](models/qwen3.8-flash-next/qsa.md) |

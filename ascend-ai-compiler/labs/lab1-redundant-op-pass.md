@@ -10,7 +10,7 @@
 
 - 为何用 `dyn_cast` 而不是乱 `cast`  
 - 为何用 **Greedy Pattern** 而不是单次 walk  
-- Pass 如何挂进 Pass Manager  
+- Pass 如何挂进 Pass Manager
 
 没有这步，后面读「图优化」会一直飘。
 
@@ -24,25 +24,34 @@
 
 ## 3. 怎样做（步骤 + 每步为什么）
 
-| 步骤 | 做什么 | 为什么 |
-|---|---|---|
-| 1 | 装 LLVM/MLIR 或能跑的 `mlir-opt` | 要白盒工具链 |
-| 2 | 准备含 identity（或等价）的 `input.mlir` | 小输入可 diff |
-| 3 | 写 `RewritePattern`：`dyn_cast`→`replaceAllUsesWith`→`eraseOp` | 标准安全改写 |
-| 4 | 挂进 Greedy / canonicalize 管道 | 保证收敛、可组合 |
-| 5 | `mlir-opt` 跑通并保存输出 | 可验收 |
 
-伪代码见 [04](../04-mlir-pass-patterns.md)；C++ 设施见 [01](../01-cpp-foundations.md)。
+| 步骤  | 做什么                                                          | 为什么       |
+| --- | ------------------------------------------------------------ | --------- |
+| 1   | 装 LLVM/MLIR 或能跑的 `mlir-opt`                                  | 要白盒工具链    |
+| 2   | 使用仓库已备材料：[`codes/lab1/inputs/`](../../codes/lab1/)                              | 小输入可 diff |
+| 3   | 在 `codes/lab1/lib/EliminateIdentityPass.cpp` 补全 `matchAndRewrite` | 标准安全改写    |
+| 4   | 挂进 Greedy / canonicalize 管道（骨架已用 Greedy）                                  | 保证收敛、可组合  |
+| 5   | 编出 `lab1-opt`，对照 `expected/` 验收                                           | 可验收       |
+
+
+材料说明与构建见 [`codes/lab1/README.md`](../../codes/lab1/README.md)。伪代码见 [04](../04-mlir-pass-patterns.md)；C++ 设施见 [01](../01-cpp-foundations.md)。
 
 ---
+
+
 
 ## 4. 验收
 
-- [ ] 至少一份输入被正确消除  
+- [x] 至少一份输入被正确消除（`01`–`04` 已用 `scripts/check_diff.sh` 跑通）  
 - [ ] 报告里写明：为何不用单次 walk；`cast`/`dyn_cast` 如何选  
 - [ ] 边界：有副作用的 op **不能**删——你如何判断  
 
+填写位置：`codes/lab1/lib/EliminateIdentityPass.cpp` 中  
+`BEGIN/END: Lab1 填写` 注释块（`rewriter.replaceOp(op, op.getInput())`）。
+
 ---
+
+
 
 ## 5. 和后面的连接
 

@@ -1,0 +1,14 @@
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/intrinsics_gen.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/omp_gen.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/acc_gen.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/ARMTargetParserTableGen.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/AArch64TargetParserTableGen.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/RISCVTargetParserTableGen.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/mlir-tablegen-targets.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/mlir-headers.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/mlir-generic-headers.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/mlir-doc.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/Lab1Dialect.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/lab1-opt.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/edit_cache.dir
+/Users/saboxu/Downloads/learning_notes/ascend-ai-compiler/codes/lab1/build/CMakeFiles/rebuild_cache.dir

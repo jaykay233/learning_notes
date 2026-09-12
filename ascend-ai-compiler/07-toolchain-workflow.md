@@ -90,3 +90,35 @@ om 不会自动读摄像头、不会做 letterbox、不会做 NMS 或 tokenizer�
 1. Transform 与 Deploy 的产物交接物是什么？  
 2. 为何调试时常用 msame 而不是直接改大服务？  
 3. AOE 属于 Transform 还是 Deploy？为什么？
+
+### 参考答案
+
+**1. Transform 与 Deploy 的产物交接物**
+
+交接物是 **`*.om`（离线模型）**。
+
+- Transform（ATC / 可选 AOE）：框架模型（如 ONNX）→ 编译、调度、绑 kernel → 产出 om  
+- Deploy（AscendCL / msame / 业务服务）：**加载这份 om** → 分配 Device 缓冲 → 喂数 → Execute → 取回结果  
+
+一句话：Transform 交付「能上板的模型文件」；Deploy 消费它，不再重做图编译（除非你再跑一轮 ATC）。
+
+**2. 为何调试常用 msame，而不是直接改大服务**
+
+msame 是 **最小 Deploy**：只验证「这份 om + 这份输入能否跑通、输出是否合理」。
+
+大服务里还有预处理、后处理、多线程、业务逻辑、配置/鉴权等；出问题很难分清是：
+
+- om / ATC 编错了，还是  
+- letterbox、归一化、NMS、batch 拼装写错了  
+
+先用 msame 冒烟，把变量收束到「模型本身」；确认 om 正确后再嵌进 AscendCL 服务，排错成本低一个数量级。Lab2 的路径也是这个习惯。
+
+**3. AOE 属于 Transform，还是 Deploy？为什么？**
+
+**属于 Transform（转换/调优侧），不是线上 Deploy 的主路径。**
+
+AOE 做的是：自动搜索更好的切分、算子实现、融合等策略，**再产出（或改写）更优的 om**。这仍是「上线前把模型编译好」的工作。
+
+Deploy 侧只应：**加载已调优的 om → 执行**。AOE 本身不负责读摄像头、做业务后处理；若把它塞进每次请求路径，会把「慢且重的搜索」拖到线上，违背 AOT「编译留在上线前」的分工。
+
+（可选闭环：Profiling 发现问题 → AOE → 再 ATC → 新 om → 再 Deploy 验证。）

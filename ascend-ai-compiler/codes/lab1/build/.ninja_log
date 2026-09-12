@@ -1,0 +1,6 @@
+# ninja log v7
+1	735	1788963388877143750	CMakeFiles/Lab1Dialect.dir/lib/LabDialect.cpp.o	70f9434db9e6973e
+1	928	1788963388877443248	CMakeFiles/Lab1Dialect.dir/lib/EliminateIdentityPass.cpp.o	2b5401614ddaa339
+1	972	1788963388877585372	CMakeFiles/lab1-opt.dir/tools/lab1-opt/lab1-opt.cpp.o	45866cfcf68261c7
+928	1379	1788963389803755669	libLab1Dialect.a	7a2c5d9711fa1a40
+1379	1456	1788963390255436232	bin/lab1-opt	5dd3b6c06889515c
