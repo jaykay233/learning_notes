@@ -33,10 +33,10 @@ speculative-decoding/
 
 ```
 ascendc/
-├── README.md                    # macOS 约束；Linux CPU 孪生安装与编译
+├── README.md                    # macOS/Colima；CANN 9.x CPU 孪生；Docker
 ├── scripts/setup_linux_cpu.sh
-├── docker/Dockerfile
-└── examples/add_custom/         # 最小 vector add
+├── docker/Dockerfile            # Ubuntu + 可选装 Toolkit
+└── examples/add_custom/         # vector add；run.sh -r cpu -v Ascend910B1
 ```
 
 ```
