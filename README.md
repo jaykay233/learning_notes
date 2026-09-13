@@ -1,23 +1,37 @@
 # learning_notes
 
-AI 相关学习笔记：`models/` 偏模型架构；`ascend-ai-compiler/` 偏 **昇腾版 AI 编译器 / 部署**；`cuda-graph/` 偏推理 CUDA Graph；`speculative-decoding/` 偏投机解码；`torch_compile/` 偏 `torch.compile` / Dynamo / FX；`ascendc/` 偏 AscendC CPU 孪生开发。
+AI 相关学习笔记，按主题分目录：
 
-## 目录
+| 目录 | 侧重 |
+|---|---|
+| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen …） |
+| [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
+| [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
+| [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
+| [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
+| [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
+
+## 目录总览
 
 ```
-ascend-ai-compiler/          # 原「AI 编译器」课 → 昇腾 CANN 全量改写（大纲逐条覆盖）
-├── 00-syllabus-checklist.md # 校对清单
-├── glossary.md              # 缩写英中对照
-├── 01 … 18                  # 讲义
-└── labs/lab1…lab6
-codes/lab1/                  # Lab1：inputs / expected / Pass 骨架
-cuda-graph/                  # CUDA Graph、memory-saver、SGLang vs Inductor Trees
-speculative-decoding/        # 投机解码收益（GPU vs LPU 等）
-torch_compile/               # Dynamo 调用过程、与 FX 的关系
-ascendc/                     # AscendC：CPU 孪生环境说明 + add_custom 示例
+ascend-ai-compiler/          # 原「AI 编译器」课 → 昇腾 CANN 全量改写
+├── 00-syllabus-checklist.md
+├── glossary.md
+├── 01 … 18
+├── labs/lab1…lab6
+└── codes/lab1/              # Lab1：inputs / expected / Pass 骨架
+ascendc/                     # AscendC CPU 孪生（Colima + CANN 9.x）
+├── README.md
+├── scripts/setup_linux_cpu.sh
+├── docker/Dockerfile
+└── examples/add_custom/     # vector add；run.sh -r cpu -v Ascend910B1
+cuda-graph/
+speculative-decoding/
+torch_compile/
+models/
 ```
 
-完整目录与学习顺序见 [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)。
+完整昇腾讲义目录与学习顺序见 [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)。
 
 ```
 cuda-graph/
@@ -29,14 +43,6 @@ cuda-graph/
 ```
 speculative-decoding/
 └── 01-gpu-vs-lpu-sram.md   # verify(K)≪K×decode(1)；大 SRAM/低算力为何吃不满收益
-```
-
-```
-ascendc/
-├── README.md                    # macOS/Colima；CANN 9.x CPU 孪生；Docker
-├── scripts/setup_linux_cpu.sh
-├── docker/Dockerfile            # Ubuntu + 可选装 Toolkit
-└── examples/add_custom/         # vector add；run.sh -r cpu -v Ascend910B1
 ```
 
 ```
@@ -86,6 +92,20 @@ models/
 | CV / LLM | YOLO+Stream、Attention、KV、Qwen、Lab5/6 |
 | 求职 | 岗位与面试题方向 |
 
+## AscendC（CPU 孪生）
+
+与讲义里的 CANN 部署互补：这里练 **自定义算子** 的 CPU 域调试（无 NPU 也可）。macOS 走 **Colima headless Docker**，容器内装 CANN Toolkit。
+
+入口：[ascendc/README.md](ascendc/README.md)
+
+| 项 | 说明 |
+|---|---|
+| 环境 | Colima + `ascendc-cpu-dev`；`source /usr/local/Ascend/cann/set_env.sh`（CANN 9.x） |
+| 示例 | [`examples/add_custom`](ascendc/examples/add_custom/)：`bash run.sh -r cpu -v Ascend910B1` |
+| 已验证 | aarch64 **9.2.0-beta.1** Toolkit + 910b-ops；CPU twin `max_abs_diff=0.0` |
+
+注意：Toolkit **不能**在 macOS 原生安装；`.run` 放 `ascendc/docker/cann-packages/`（不入库）。
+
 ## 模型对照（速查）
 
 | 目录 | 模型 | 主干注意力 | 残差 / 额外容量 | 备注 |
@@ -111,7 +131,7 @@ models/
 |---|---|
 | CUDA Graph / memory-saver / SGLang Runner | [01](cuda-graph/01-basics-and-memory-saver.md)、[02](cuda-graph/02-sglang-cudagraph-vs-inductor-trees.md)、[03 · 几种外壳与 VMM](cuda-graph/03-flavors-vmm-and-hijack.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
-| AscendC CPU 孪生 | [ascendc/README.md](ascendc/README.md) |
+| AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |
