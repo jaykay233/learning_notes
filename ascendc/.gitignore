@@ -2,6 +2,9 @@
 examples/**/build/
 examples/**/input/
 examples/**/output/
+examples/**/cceprint/
+examples/**/npuchk/
+examples/**/stub_reg.log
 *.o
 *.so
 *.a
@@ -10,3 +13,6 @@ examples/**/output/
 # Official CANN installers (large)
 docker/cann-packages/*.run
 docker/cann-packages/*.partial
+examples/**/cceprint/
+examples/**/npuchk/
+**/stub_reg.log
