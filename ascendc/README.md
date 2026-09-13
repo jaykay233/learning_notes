@@ -128,26 +128,44 @@ gdb --args ./build/add_custom_cpu
 
 ---
 
-## 4. Docker（本机 macOS + Colima）
+## 4. Docker（本机 macOS + Colima，按需启停）
 
-已验证流程：镜像 `ascendc-cpu-dev`，容器名 `ascendc-dev`，Toolkit/ops 装在容器层。
+**推荐：不要长期挂着容器。** Toolkit 已打进镜像 `ascendc-cpu-dev:cann92`（~15GB，本机已 commit）；每次用完 `--rm` 退出，`docker ps` 为空。Colima 也可一起关掉省电。
 
 ```bash
-# 构建基础镜像（不含 Toolkit；也可 --build-arg CANN_RUN=...）
 cd ascendc
-docker build -t ascendc-cpu-dev -f docker/Dockerfile .
+# 一键跑示例（临时起容器 → 编跑 → 自动删容器）
+bash scripts/with_docker.sh make
 
-docker run -d --name ascendc-dev -v "$PWD":/workspace -w /workspace ascendc-cpu-dev sleep infinity
+# 交互调试完 exit 即销毁容器
+bash scripts/with_docker.sh
 
-# 把 .run 放到 docker/cann-packages/ 后，在容器内安装（见 §2.2）
-docker exec -it ascendc-dev bash
-source /usr/local/Ascend/cann/set_env.sh
-cd examples/add_custom && bash run.sh -r cpu -v Ascend910B1
+# 任意命令
+bash scripts/with_docker.sh -- 'cd examples/add_custom && bash run.sh -r cpu -v Ascend910B1'
+
+# 跑完连 Colima VM 也停掉（下次脚本会自动 colima start）
+bash scripts/with_docker.sh --stop-colima -- make
 ```
 
-离线包目录：`docker/cann-packages/`（`*.run` 已 gitignore，勿提交）。
+手动等价写法：
 
-若 Docker Hub 拉不动，给 Colima 内 `dockerd` 配上与宿主机一致的 HTTP(S)_PROXY。
+```bash
+colima start --vm-type=vz   # 若未起
+docker run --rm -it \
+  -v "$PWD":/workspace -w /workspace \
+  ascendc-cpu-dev:cann92 bash
+# exit 后容器消失；不用 Docker 时：colima stop
+```
+
+首次从零构建（无 `cann92` 时）：
+
+```bash
+docker build -t ascendc-cpu-dev -f docker/Dockerfile .
+# 装 Toolkit/ops 进一次性容器后：
+# docker commit <id> ascendc-cpu-dev:cann92
+```
+
+离线包：`docker/cann-packages/`（`*.run` 已 gitignore）。Docker Hub 不通时给 Colima 内 `dockerd` 配 HTTP(S)_PROXY。
 
 ---
 
@@ -158,6 +176,7 @@ ascendc/
 ├── README.md
 ├── .gitignore                # build / cceprint / *.run 等
 ├── scripts/setup_linux_cpu.sh
+├── scripts/with_docker.sh    # 按需启停：--rm 一键跑 / 交互
 ├── docker/
 │   ├── Dockerfile
 │   └── cann-packages/        # 放官方 .run（不入库）

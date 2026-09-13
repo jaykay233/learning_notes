@@ -13,7 +13,15 @@ bash run.sh -r cpu -v Ascend910B1
 | `-v Ascend910B1` | `SOC_VERSION`（Atlas A2 / 910B 一代示例） |
 | `-a dav-2201` | 兼容旧写法，映射为 `Ascend910B1` |
 
-期望：`CPU twin run done`，`max_abs_diff=0.0`。
+期望：`CPU twin run done`，打印 `timing: kernel_wall_ms_avg=...`，`max_abs_diff=0.0`。
+
+计时可调（默认 warmup=1、iters=5）：
+
+```bash
+ASCENDC_BENCH_WARMUP=2 ASCENDC_BENCH_ITERS=20 bash run.sh -r cpu -v Ascend910B1
+```
+
+注意：这是 **CPU 孪生墙钟时间**（含 twin runtime），只能作相对对比，**不是** NPU 真实性能。
 
 ## 文件
 
