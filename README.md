@@ -19,7 +19,8 @@ ascend-ai-compiler/          # 原「AI 编译器」课 → 昇腾 CANN 全量�
 ├── glossary.md
 ├── 01 … 18
 ├── labs/lab1…lab6
-└── codes/lab1/              # Lab1：inputs / expected / Pass 骨架
+└── codes/lab1…              # 讲义配套代码
+codes/lab1/                  # 仓库根下 Lab1 骨架（inputs / expected / Pass）
 ascendc/                     # AscendC CPU 孪生（Colima + CANN 9.x）
 ├── README.md
 ├── scripts/setup_linux_cpu.sh
