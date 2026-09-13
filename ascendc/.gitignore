@@ -13,6 +13,3 @@ examples/**/stub_reg.log
 # Official CANN installers (large)
 docker/cann-packages/*.run
 docker/cann-packages/*.partial
-examples/**/cceprint/
-examples/**/npuchk/
-**/stub_reg.log
