@@ -1,0 +1,5 @@
+# Large official installer blobs — do not commit
+*.run
+*.partial
+*.tar.gz
+!*.gitkeep

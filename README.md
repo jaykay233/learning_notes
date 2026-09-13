@@ -1,6 +1,6 @@
 # learning_notes
 
-AI 相关学习笔记：`models/` 偏模型架构；`ascend-ai-compiler/` 偏 **昇腾版 AI 编译器 / 部署**；`cuda-graph/` 偏推理 CUDA Graph；`speculative-decoding/` 偏投机解码；`torch_compile/` 偏 `torch.compile` / Dynamo / FX。
+AI 相关学习笔记：`models/` 偏模型架构；`ascend-ai-compiler/` 偏 **昇腾版 AI 编译器 / 部署**；`cuda-graph/` 偏推理 CUDA Graph；`speculative-decoding/` 偏投机解码；`torch_compile/` 偏 `torch.compile` / Dynamo / FX；`ascendc/` 偏 AscendC CPU 孪生开发。
 
 ## 目录
 
@@ -14,6 +14,7 @@ codes/lab1/                  # Lab1：inputs / expected / Pass 骨架
 cuda-graph/                  # CUDA Graph、memory-saver、SGLang vs Inductor Trees
 speculative-decoding/        # 投机解码收益（GPU vs LPU 等）
 torch_compile/               # Dynamo 调用过程、与 FX 的关系
+ascendc/                     # AscendC：CPU 孪生环境说明 + add_custom 示例
 ```
 
 完整目录与学习顺序见 [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)。
@@ -28,6 +29,14 @@ cuda-graph/
 ```
 speculative-decoding/
 └── 01-gpu-vs-lpu-sram.md   # verify(K)≪K×decode(1)；大 SRAM/低算力为何吃不满收益
+```
+
+```
+ascendc/
+├── README.md                    # macOS 约束；Linux CPU 孪生安装与编译
+├── scripts/setup_linux_cpu.sh
+├── docker/Dockerfile
+└── examples/add_custom/         # 最小 vector add
 ```
 
 ```
@@ -102,6 +111,7 @@ models/
 |---|---|
 | CUDA Graph / memory-saver / SGLang Runner | [01](cuda-graph/01-basics-and-memory-saver.md)、[02](cuda-graph/02-sglang-cudagraph-vs-inductor-trees.md)、[03 · 几种外壳与 VMM](cuda-graph/03-flavors-vmm-and-hijack.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
+| AscendC CPU 孪生 | [ascendc/README.md](ascendc/README.md) |
 | torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |

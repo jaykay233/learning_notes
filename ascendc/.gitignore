@@ -1,0 +1,12 @@
+# Build / run artifacts
+examples/**/build/
+examples/**/input/
+examples/**/output/
+*.o
+*.so
+*.a
+*.bin
+
+# Official CANN installers (large)
+docker/cann-packages/*.run
+docker/cann-packages/*.partial
