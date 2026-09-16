@@ -8,7 +8,7 @@ AI 相关学习笔记，按主题分目录：
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
-| [`communication/`](communication/) | GPU 通信提交、Proxy / GDAKI / GPI、MoK 调度与环形 buffer |
+| [`communication/`](communication/) | GPU 通信提交、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
 
@@ -46,7 +46,8 @@ cuda-graph/
 ```
 communication/
 ├── 01-proxy-gdaki-gpi.md                    # CPU Proxy / GDAKI / GPI；QP、WQE、提交路径
-└── 02-mok-scheduling-and-buffers.md          # MoK：device schedule、pull/push、ring token buffer
+├── 02-mok-scheduling-and-buffers.md          # MoK：device schedule、pull/push、ring token buffer
+└── 03-low-latency-collectives-and-synchronization.md  # Sentinel / credit / Multicast / LL128 / multimem
 ```
 
 ```
@@ -141,6 +142,7 @@ models/
 | CUDA Graph / memory-saver / SGLang Runner | [01](cuda-graph/01-basics-and-memory-saver.md)、[02](cuda-graph/02-sglang-cudagraph-vs-inductor-trees.md)、[03 · 几种外壳与 VMM](cuda-graph/03-flavors-vmm-and-hijack.md) |
 | GPU 通信提交 / Proxy / GDAKI / GPI | [communication/01](communication/01-proxy-gdaki-gpi.md) |
 | MoE 训练 / MoK / pull-push / buffer | [communication/02](communication/02-mok-scheduling-and-buffers.md) |
+| 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
@@ -161,6 +163,7 @@ models/
 |---|---|
 | [01-proxy-gdaki-gpi.md](communication/01-proxy-gdaki-gpi.md) | 传统 CPU Proxy、QP 爆炸、GDAKI 提交模式；BlueFlame 与 GPI 的队列所有权差异 |
 | [02-mok-scheduling-and-buffers.md](communication/02-mok-scheduling-and-buffers.md) | MoK 的设备端 schedule、dispatch pull / combine push、minibatch overlap、macrobatch ring buffer，以及与 DeepEP Buffer 的对照 |
+| [03-low-latency-collectives-and-synchronization.md](communication/03-low-latency-collectives-and-synchronization.md) | 小消息 collective 的 memory ordering、Sentinel、双缓冲 credit、fabric / SHARP、LL128 atomic，以及 `multimem.ld_reduce` 与 AllReduce 的关系 |
 
 ## DeepSeek-V4
 
