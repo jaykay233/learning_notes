@@ -214,7 +214,74 @@ Tensor/TLS 上的 key bits（可多位）
 
 ---
 
-## 9. 相关文档
+## 9. `__torch_dispatch__` 的拦截边界
+
+“只要有算子，`torch dispatch` 就会拦截”这个说法需要加限定：
+
+```text
+当前存在激活的 TorchDispatchMode
+且这次调用经过 dispatcher
+且算子的 DispatchKey 命中该 Mode
+```
+
+三个条件同时满足，才会进入对应的 `__torch_dispatch__`。没有打开 Mode 的普通 eager 执行，不会有这个 Python 钩子。
+
+AOT tracing 期间基本满足这些条件：
+
+```python
+with ProxyTorchDispatchMode(...):
+    with FakeTensorMode():
+        outs = forward(primals)
+        grads = torch.autograd.grad(outs, primals, ...)
+```
+
+所以前向 Aten op，以及 `autograd.grad` 产生的反向 Aten op，都会经过同一套 Mode 路径。但下面这些不保证被这个 Mode 当成“一个算子节点”捕获：
+
+| 内容 | 为什么不保证 |
+|---|---|
+| Python `if` / `for` / `while` | 它们是字节码控制流，不是 ATen 算子 |
+| 普通 Python 对象运算 | 不经过 PyTorch dispatcher |
+| Tensor 部分元数据访问 | 可能是属性读取或由 Fake/Proxy 元数据直接回答 |
+| `no_dispatch` / `DisableTorchDispatch` 区间 | 明确绕开 dispatcher 或 Mode |
+| 不经过 dispatcher 的 C++ / 扩展内部逻辑 | dispatcher 看不到 |
+| Dynamo 已在字节码层处理的控制流 | 可能成为 guard、动态 shape 或 graph break |
+
+另外，“命中 `__torch_dispatch__`”不必然等于“新增一个 FX node”：
+
+```text
+可能被 decomposition 拆成多个底层 op
+可能走常量传播，直接算出结果
+可能走 data-dependent 特例
+可能复用已有 Proxy
+可能报错或回退，而不是正常记一个 node
+```
+
+层级对照：
+
+```text
+__torch_function__ / TorchFunctionMode
+  PyTorch Python API 层，例如 torch.add(x, y)、x.add(y)
+
+__torch_dispatch__ / TorchDispatchMode
+  dispatcher 层，更接近 ATen operator
+
+FakeTensorMode
+  推导 shape / dtype / device / stride，不跑真实大计算
+
+ProxyTorchDispatchMode / make_fx
+  把经过 dispatcher 的 Aten op 变成 FX node
+```
+
+最后要区分编译期和运行期：
+
+```text
+编译追踪期：Mode 打开，forward/backward Aten op 被逐条捕获进 joint 图
+训练运行期：执行已切分、已编译的 fw/bw 图，正常不再逐 op 建 FX 图
+```
+
+所以更准确的结论是：**AOT tracing 时，命中的 Aten 算子会经 `__torch_dispatch__` 被追踪；但 `__torch_dispatch__` 不是全局算子监听器，也不是所有 Python 操作都会走到这一层。**
+
+## 10. 相关文档
 
 - [01-dynamo-and-fx.md](./01-dynamo-and-fx.md) — Dynamo / FX  
 - [02-aot-autograd.md](./02-aot-autograd.md) — joint 图、FakeTensor、partition  

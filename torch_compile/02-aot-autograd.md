@@ -284,7 +284,150 @@ tracer.finalize()    → 航线飞完，地图（joint FX）才交到你手里
 
 ---
 
-### 3.6 Partition：从 joint 切回 fw / bw
+### 3.6 Proxy 是什么：`make_fx` 的四步追踪
+
+`make_fx` 是经 `__torch_dispatch__` 拦截 Aten 算子，但内部仍会用 **FX Proxy** 表示“图里某个结果的符号句柄”。这里的 Proxy 不是网络代理，也不保存 Tensor 的数值。
+
+```text
+Tensor/FakeTensor：值或元数据平面，带 shape / dtype / device / stride
+Proxy：            符号图平面，指向一个 FX node 的输出
+Node：             图中的一条记录，包含 op / target / args
+Graph：            Node 组成的 DAG
+```
+
+因此可以同时看到两条线：
+
+```text
+值世界：x, y, z, out
+图世界：proxy_x, proxy_y, proxy_z, proxy_out
+```
+
+`make_fx` 为被追踪对象维护一张按 tracer 区分的 side table：
+
+```python
+tensor -> {tracer: _ProxyTensor(proxy, constant)}
+```
+
+它不是 Tensor 的普通属性。按 tracer 分开是为了让多个 tracing 同时存在时，不会互相覆盖 Proxy 映射。
+
+以 `z = x + y; out = z.sin()` 为例：
+
+```text
+开始：
+  x -> proxy_x
+  y -> proxy_y
+
+执行 x + y 时，dispatcher 路由到 aten.add.Tensor：
+  1. 从 side table 取回 proxy_x、proxy_y
+  2. 创建 call_function 节点，target 是 aten.add.Tensor
+  3. 用本次 tracing 实际传入的 tensor 执行 add
+  4. 把 add 输出和它的 Proxy 双向绑定
+```
+
+`make_fx/ProxyTorchDispatchMode` 的主干可以压缩成：
+
+```python
+proxy_out = tracer.create_proxy(
+    "call_function",
+    func,                    # 例如 torch.ops.aten.add.Tensor
+    proxy_args,              # 例如 (proxy_x, proxy_y)
+    proxy_kwargs,
+)
+
+with _enable_thunkify(tracer):
+    out = func(*args, **kwargs)  # FakeTensor 路径只推元数据，不跑真 CUDA 数值
+
+track_tensor_tree(
+    out,
+    proxy_out,
+    constant=constant,
+    tracer=tracer,
+)
+```
+
+四步分别是：
+
+| 步骤 | 实际动作 |
+|---|---|
+| 取回 Proxy | 在 side table 中把 `x`、`y` 映射回图句柄 |
+| 建 `call_function` | 创建 `add` node，输入边指向 `proxy_x`、`proxy_y` |
+| 执行一次算子 | 对真实 Tensor 或 FakeTensor 调用 ATen op，得到后续可继续追踪的输出 |
+| 绑定结果 | `out -> proxy_out`，并给 node 写入 `meta["val"]` 等元数据 |
+
+第二步和第三步必须同时做：
+
+```text
+只建节点：后续 reshape / broadcast 不知道输出 shape、stride、dtype
+只执行算子：得到输出 Tensor，但不知道它由哪些符号输入和操作产生
+两边都有：Proxy 记录依赖，Fake 执行推导元数据，再重新绑定给下一步
+```
+
+这和 `torch.fx.symbolic_trace` 的不同点不是“有没有 Proxy”，而是入口不同：
+
+```text
+symbolic_trace：回放 module/函数，主要靠 Python 对象协议产生 Proxy
+make_fx：       执行 Aten 流，靠 dispatcher / __torch_dispatch__ 逐算子记图
+```
+
+AOTAutograd 不走 `symbolic_trace` 那套模块回放，但 `make_fx` 内部仍然使用 Proxy 作为 FX node 的符号句柄。
+
+### 3.7 反向为什么也落进同一张 joint 图
+
+关键不是先分别得到前向图和反向图，而是 AOTAutograd 构造一个可追踪的联合函数，然后在 **同一个 Proxy Mode 作用域** 内让它跑一遍：
+
+```python
+def joint(primals, tangents):
+    outs = forward(primals)
+
+    grads = torch.autograd.grad(
+        outs,
+        primals,
+        grad_outputs=tangents,
+        allow_unused=True,
+    )
+
+    return outs, grads
+
+
+joint_graph = make_fx(joint)(primals, tangents)
+```
+
+执行时间线：
+
+```text
+1. forward 算子走 dispatcher
+   -> ProxyTorchDispatchMode.__torch_dispatch__
+   -> 追加 forward node
+   -> node.meta["partitioner_tag"] = "is_forward"
+
+2. 前向输出保留 autograd 的 grad_fn
+
+3. AOTAutograd 调用 torch.autograd.grad
+   -> autograd engine 根据 grad_fn 生成反向公式
+   -> 反向公式继续调用 ATen op
+
+4. 反向 ATen op 也走同一个 dispatcher
+   -> 同一个 Proxy Mode 继续 append node
+   -> node.meta["partitioner_tag"] = "is_backward"
+
+5. 跑完得到一张同时包含 forward / backward 的 joint 图
+```
+
+例如前向是 `y = sin(x)`，反向公式会产生 `cos(x) * grad_y`。反向的 `cos`、`mul` 不是另一套 `symbolic_trace` 单独抓出来的，而是 autograd engine 生成后，再次经过 `__torch_dispatch__` 被同一轮 tracing 记录进来的。
+
+这也就是前面说的 **执行驱动的追踪**：
+
+```text
+不是：先已有完整 grad 图，再 DFS/BFS 遍历
+而是：执行 joint 函数时，前向和反向 op 边跑边变成 FX node
+```
+
+本机 PyTorch 源码中，`create_joint()` 返回的执行体会先调用 `fn(*primals)`，再在
+`set_partitioner_tag_is_backward()` 上下文中调用 `torch.autograd.grad(...)`。
+AOTAutograd 会把这类整理后的 joint 执行体放到 `make_fx` / Proxy Mode 下执行，
+因此上述前向、反向算子会在同一轮 tracing 中被记录。
+
+### 3.8 Partition：从 joint 切回 fw / bw
 
 Joint 图很大。训练运行时仍要：
 
@@ -308,7 +451,7 @@ Joint 图很大。训练运行时仍要：
 
 ---
 
-### 3.7 编译与 `autograd.Function` 胶水
+### 3.9 编译与 `autograd.Function` 胶水
 
 ```text
 fw_gm → fw_compiler → compiled_fw

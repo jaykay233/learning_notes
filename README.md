@@ -58,8 +58,8 @@ speculative-decoding/
 ```
 torch_compile/
 ├── 01-dynamo-and-fx.md           # Dynamo 调用过程；FX；Script/LazyTensor 对照
-├── 02-aot-autograd.md            # AOTAutograd：joint 图、functionalize、partition
-└── 03-dispatcher-and-modes.md    # DispatchKey / vtable / Mode / TLS / AOT 衔接
+├── 02-aot-autograd.md            # AOTAutograd：joint 图、Proxy 四步追踪、反向捕获、partition
+└── 03-dispatcher-and-modes.md    # DispatchKey / Mode / TLS / 拦截边界 / AOT 衔接
 ```
 
 ```
