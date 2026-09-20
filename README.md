@@ -1,12 +1,14 @@
 # learning_notes
 
-AI 相关学习笔记，按主题分目录：
+AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主题分目录：
 
 | 目录 | 侧重 |
 |---|---|
 | [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen …） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
+| [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
+| [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、WGMMA 与 Blackwell TMEM |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
@@ -20,18 +22,31 @@ ascend-ai-compiler/          # 原「AI 编译器」课 → 昇腾 CANN 全量�
 ├── glossary.md
 ├── 01 … 18
 ├── labs/lab1…lab6
-└── codes/lab1…              # 讲义配套代码
-codes/lab1/                  # 仓库根下 Lab1 骨架（inputs / expected / Pass）
+└── codes/lab1/              # Lab1：inputs / expected / Pass / MLIR 工具
 ascendc/                     # AscendC CPU 孪生（Colima + CANN 9.x）
 ├── README.md
 ├── scripts/setup_linux_cpu.sh
 ├── docker/Dockerfile
 └── examples/add_custom/     # vector add；run.sh -r cpu -v Ascend910B1
-cuda-graph/
-communication/
-speculative-decoding/
-torch_compile/
-models/
+mlc-tvm/                     # MLC / TVM 课程笔记
+├── README.md
+├── 01-tensor-program-abstraction.md
+├── 02-tensorir-case-study.md
+└── 03-end-to-end-model.md
+modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
+├── README.md
+├── 01-data-layout-and-named-axes.md
+├── 02-replication-and-offset.md
+├── 03-practice-and-corrections.md
+├── 04-swizzle-layout.md
+├── 05-ampere-mma-fragments.md
+├── 06-warp-tile-and-k-pipeline.md
+└── 07-hopper-wgmma-and-blackwell-tmem.md
+cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
+communication/               # Proxy、GDAKI/GPI、MoK、collective
+speculative-decoding/        # 投机解码
+torch_compile/               # Dynamo、AOTAutograd、Dispatcher
+models/                      # DeepSeek / GLM / Kimi / Qwen 架构笔记
 ```
 
 完整昇腾讲义目录与学习顺序见 [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)。
@@ -145,6 +160,8 @@ models/
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
+| MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
+| GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
 | torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |
@@ -154,6 +171,36 @@ models/
 | AttnRes | [kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | PLE / N-gram embedding | [qwen3.8-flash-next/ple.md](models/qwen3.8-flash-next/ple.md) |
 | MQA / CSA / HCA | [deepseek_v4/mqa.md](models/deepseek_v4/mqa.md)、[deepseek_v4/architecture.md](models/deepseek_v4/architecture.md) |
+
+---
+
+## MLC / TVM
+
+围绕 MLC 课程 notebook 与 TVMScript / TensorIR 调度展开。当前已落盘：
+
+| 文档 | 内容 |
+|---|---|
+| [01-tensor-program-abstraction.md](mlc-tvm/01-tensor-program-abstraction.md) | Tensor Expression、IRModule、Schedule、build/run |
+| [02-tensorir-case-study.md](mlc-tvm/02-tensorir-case-study.md) | Buffer、循环、sblock、axis、函数属性与变换 |
+| [03-end-to-end-model.md](mlc-tvm/03-end-to-end-model.md) | Relax 计算图、`call_tir`、DPS 与端到端执行 |
+
+完整学习环境、API 差异和后续计划见 [mlc-tvm/README.md](mlc-tvm/README.md)。
+
+## Modern GPU Programming for MLSys
+
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–07：
+
+```text
+layout / named axes / replication / offset
+shared memory swizzle
+Ampere mma.sync / ldmatrix
+warp tile / K pipeline / cp.async
+Hopper WGMMA / Blackwell TMEM
+tcgen05 / SFA/SFB / scale_vec
+```
+
+完整文档索引、当前进度和硬件环境说明见
+[modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md)。
 
 ---
 
