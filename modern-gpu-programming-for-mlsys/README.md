@@ -15,6 +15,7 @@
 | [01-data-layout-and-named-axes.md](01-data-layout-and-named-axes.md) | Shape-Stride、Tile Layout、命名轴、Register Fragment |
 | [02-replication-and-offset.md](02-replication-and-offset.md) | `R[...]` 副本、`O[...]` 偏移、TMEM 广播、GPU Mesh |
 | [03-practice-and-corrections.md](03-practice-and-corrections.md) | 自测题、原始答案、逐题订正 |
+| [04-swizzle-layout.md](04-swizzle-layout.md) | shared memory bank conflict、XOR swizzle、完整地址推导 |
 
 ## 当前进度
 
@@ -27,6 +28,8 @@ Tile Layout
 Register Fragment 映射
 Replication R[...]
 Offset O[...]
+Shared memory bank conflict
+XOR swizzle
 ```
 
 ## 核心主线
