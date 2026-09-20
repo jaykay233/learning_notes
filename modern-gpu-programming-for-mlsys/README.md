@@ -55,6 +55,8 @@ SFA/SFB 的 SMEM -> TMEM 数据路径
 tcgen05.cp 与 .warpx4 四分区广播
 scale_vec::1X / 2X / 4X
 TMEM partition、word byte、K-block reuse 三种复制的区别
+Ampere / Hopper / Blackwell 三种数据路径的对比
+chapter_layout_generations 完成
 ```
 
 ## 核心主线
@@ -89,6 +91,7 @@ TMEM lane / column 不匹配
 ## 后续可继续整理
 
 ```text
+chapter_tma
 WGMMA matrix descriptor
 TMA producer / consumer warp specialization
 ```

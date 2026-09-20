@@ -71,7 +71,7 @@ SFA/SFB 如何通过 tcgen05.cp 从 SMEM 搬到 TMEM
 scale_vec::1X、2X、4X 的 word 内排列有什么区别
 ```
 
-## 三代架构的数据路径
+## 快速总览：三代架构的数据路径
 
 | 架构 | 主要 MMA 指令 | A/B 主要来源 | 长期累加器位置 | shared memory 布局的表达方式 |
 |---|---|---|---|---|
@@ -871,6 +871,114 @@ Blackwell:
 Hopper 主要在“计算结束以后”使用 accumulator register fragment；
 Blackwell 主要在“从 TMEM 搬回 epilogue 时”使用 register fragment。
 
+## 本章小结：三种数据路径的对比
+
+课程位置：
+
+```text
+chapter_layout_generations
+    └── 三种数据路径的对比
+```
+
+三代架构的关键差异不只是换了 MMA 指令，而是逐步改变了数据由软件还是
+硬件来组织，以及累加器长期存放在哪里。
+
+| 架构 | A/B 主要来源 | MMA 指令 | 累加器 | 布局由谁表达 |
+|---|---|---|---|---|
+| Ampere | registers | `mma.sync` | registers | kernel 自己算地址、swizzle、构造 fragment |
+| Hopper | A 可来自 registers 或 SMEM，B 来自 SMEM | `wgmma.mma_async` | registers | matrix descriptor 描述 SMEM stride / swizzle |
+| Blackwell | 主要来自 SMEM，某些 A 模式来自 TMEM | `tcgen05.mma` | TMEM | descriptor 描述 SMEM，TMEM layout 描述 accumulator / scale |
+
+把每一代的数据流完整画出来：
+
+```text
+Ampere:
+    SMEM
+      -> ldmatrix
+      -> A/B register fragments
+      -> mma.sync
+      -> C/D register fragments
+
+Hopper:
+    SMEM
+      -> wgmma matrix descriptor
+      -> wgmma.mma_async
+      -> C/D register fragments
+
+Blackwell:
+    SMEM
+      -> tcgen05.mma descriptor
+      -> tcgen05.mma
+      -> C/D in TMEM
+      -> tcgen05.ld
+      -> register fragment
+      -> epilogue
+```
+
+三代架构承担的布局职责分别是：
+
+```text
+Ampere:
+    软件计算 SMEM 地址
+    软件处理 swizzle
+    软件调用 ldmatrix
+    软件把数据排成 per-lane fragment
+
+Hopper:
+    A/B 可以留在 SMEM
+    Tensor Core 根据 matrix descriptor 自己读取
+    descriptor 表达 stride、swizzle 和 base offset
+    accumulator 仍由 register fragment 保存
+
+Blackwell:
+    输入继续通过 SMEM descriptor 表达
+    accumulator 从 registers 移到 TMEM
+    scale factors 也存放在 TMEM
+    epilogue 通过 tcgen05.ld 把结果搬回 registers
+```
+
+因此，整体演进可以概括为：
+
+```text
+Ampere：
+    先把输入整理成 per-lane fragments
+
+Hopper：
+    让 Tensor Core 通过 descriptor 直接读取 SMEM
+
+Blackwell：
+    把长期存活的 accumulator 和 scale factors 移入 TMEM
+```
+
+检查 kernel 时，要沿着数据流确认每一个边界的布局契约：
+
+```text
+生产者写出的 layout
+        ==
+消费者读取时假设的 layout
+```
+
+对应到三代架构：
+
+```text
+Ampere:
+    SMEM swizzle 必须匹配 ldmatrix
+    register fragment 必须匹配 mma.sync
+
+Hopper:
+    SMEM descriptor 必须匹配实际存放方式
+    accumulator CLayout 必须匹配 epilogue
+
+Blackwell:
+    SMEM descriptor 必须匹配 TMA / GMEM 数据
+    TMEM accumulator layout 必须匹配 tcgen05.ld
+    SFA/SFB 的 partition 广播和 scale_vec 必须匹配 MMA
+```
+
+到这里，`chapter_layout_generations` 的主线已经完整：从 Ampere 的
+软件 fragment 构造，到 Hopper 的 SMEM descriptor，再到 Blackwell
+的 TMEM accumulator 和 block-scaled scale factors。
+
 ## 对推理系统的意义
 
 prefill 阶段的 GEMM、Q/K/V projection、MLP projection 通常有较长的 K
@@ -918,4 +1026,5 @@ SFA/SFB 通过 tcgen05.cp 从 SMEM 搬到 TMEM
 scale_vec 决定 32-bit word 内的 scale 重复和 ID 选择方式
 TMEM partition 复制、word byte 复制、K-block reuse 是三件事
 register fragment 在 Blackwell 主要位于 TMEM 与 epilogue 的边界
+Ampere、Hopper、Blackwell 的差异是数据路径和布局职责的连续演进
 ```
