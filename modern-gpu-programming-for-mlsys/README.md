@@ -4,9 +4,10 @@
 
 - <https://github.com/mlc-ai/modern-gpu-programming-for-mlsys>
 
-本目录整理对话中围绕 GPU 数据布局、命名轴、Replication 和 Offset
-展开的内容，重点关注这些概念如何影响推理系统中的 GEMM、Attention
-以及 KV Cache 数据路径。
+本目录整理对话中围绕 GPU 数据布局、命名轴、Replication、Offset、
+shared memory swizzle、Tensor Core fragment 和 `ldmatrix` 展开的内容，
+重点关注这些概念如何影响推理系统中的 GEMM、Attention 以及 KV Cache
+数据路径。
 
 ## 文档索引
 
@@ -16,6 +17,7 @@
 | [02-replication-and-offset.md](02-replication-and-offset.md) | `R[...]` 副本、`O[...]` 偏移、TMEM 广播、GPU Mesh |
 | [03-practice-and-corrections.md](03-practice-and-corrections.md) | 自测题、原始答案、逐题订正 |
 | [04-swizzle-layout.md](04-swizzle-layout.md) | shared memory bank conflict、XOR swizzle、完整地址推导 |
+| [05-ampere-mma-fragments.md](05-ampere-mma-fragments.md) | `mma.sync`、A/B/C/D fragment、`ldmatrix.x1/x2/x4`、`.trans` |
 
 ## 当前进度
 
@@ -30,6 +32,10 @@ Replication R[...]
 Offset O[...]
 Shared memory bank conflict
 XOR swizzle
+mma.sync.aligned
+m16n8k16 A/B/C/D fragment
+ldmatrix x1 / x2 / x4
+ldmatrix.trans
 ```
 
 ## 核心主线
@@ -64,8 +70,8 @@ TMEM lane / column 不匹配
 ## 后续可继续整理
 
 ```text
-Tensor Core layout 的 Ampere / Hopper / Blackwell 演进
-ldmatrix 与 register fragment
+Tensor Core layout 的 Hopper / Blackwell 演进
+MMA K-loop、double buffering 与 pipeline
 WGMMA matrix descriptor
 TMEM accumulator 与 tcgen05.ld
 Block-scaled MMA 的 scale factor 数据路径
