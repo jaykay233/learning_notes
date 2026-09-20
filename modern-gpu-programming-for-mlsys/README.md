@@ -5,9 +5,9 @@
 - <https://github.com/mlc-ai/modern-gpu-programming-for-mlsys>
 
 本目录整理对话中围绕 GPU 数据布局、命名轴、Replication、Offset、
-shared memory swizzle、Tensor Core fragment 和 `ldmatrix` 展开的内容，
-重点关注这些概念如何影响推理系统中的 GEMM、Attention 以及 KV Cache
-数据路径。
+shared memory swizzle、Tensor Core fragment、`ldmatrix` 和 K 循环
+pipeline 展开的内容，重点关注这些概念如何影响推理系统中的 GEMM、
+Attention 以及 KV Cache 数据路径。
 
 ## 文档索引
 
@@ -18,6 +18,7 @@ shared memory swizzle、Tensor Core fragment 和 `ldmatrix` 展开的内容，
 | [03-practice-and-corrections.md](03-practice-and-corrections.md) | 自测题、原始答案、逐题订正 |
 | [04-swizzle-layout.md](04-swizzle-layout.md) | shared memory bank conflict、XOR swizzle、完整地址推导 |
 | [05-ampere-mma-fragments.md](05-ampere-mma-fragments.md) | `mma.sync`、A/B/C/D fragment、`ldmatrix.x1/x2/x4`、`.trans` |
+| [06-warp-tile-and-k-pipeline.md](06-warp-tile-and-k-pipeline.md) | Warp tile、fragment 复用、K 循环、`cp.async`、double buffering |
 
 ## 当前进度
 
@@ -36,6 +37,11 @@ mma.sync.aligned
 m16n8k16 A/B/C/D fragment
 ldmatrix x1 / x2 / x4
 ldmatrix.trans
+Warp tile M/N 分解
+A/B fragment 复用
+K 循环累加
+Double buffering
+cp.async pipeline
 ```
 
 ## 核心主线
@@ -71,8 +77,8 @@ TMEM lane / column 不匹配
 
 ```text
 Tensor Core layout 的 Hopper / Blackwell 演进
-MMA K-loop、double buffering 与 pipeline
 WGMMA matrix descriptor
+TMA producer / consumer warp specialization
 TMEM accumulator 与 tcgen05.ld
 Block-scaled MMA 的 scale factor 数据路径
 ```
