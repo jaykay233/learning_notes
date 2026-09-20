@@ -979,6 +979,201 @@ Blackwell:
 软件 fragment 构造，到 Hopper 的 SMEM descriptor，再到 Blackwell
 的 TMEM accumulator 和 block-scaled scale factors。
 
+## 如何检查 Producer / Consumer Layout 是否匹配
+
+课程位置：
+
+```text
+chapter_layout_generations
+    └── 三种数据路径的对比
+        └── 布局契约的检查方法
+```
+
+`producer layout == consumer layout` 不要求两边的 layout 表达式写得一样。
+真正的要求是：
+
+```text
+对于同一个逻辑元素，
+生产者实际写入的物理位置
+和
+消费者认为它应该位于的物理位置
+一致。
+```
+
+### 把两侧都转换成物理地址函数
+
+设逻辑坐标为：
+
+```text
+x = (m, n, k, ...)
+```
+
+分别写出：
+
+```text
+P_producer(x)
+    生产者把逻辑坐标 x 写到哪里
+
+P_consumer(x)
+    消费者认为逻辑坐标 x 应该从哪里读取
+```
+
+如果是一对一映射，正确条件是：
+
+```text
+P_producer(x) == P_consumer(x)
+```
+
+如果存在 replication，条件应放宽为：
+
+```text
+P_consumer(x) 属于 P_producer(x) 的合法副本集合
+```
+
+例如生产者使用：
+
+```text
+R[4 : 32@TLane]
+```
+
+那么消费者读取 `TLane=39` 是正确的，只要基础数据确实同时位于：
+
+```text
+TLane 7
+TLane 39
+TLane 71
+TLane 103
+```
+
+检查时可以先只运行地址映射，不需要启动 GPU：
+
+```python
+for m in range(M):
+    for k in range(K):
+        p = producer_offset(m, k)
+        q = consumer_offset(m, k)
+        assert p == q, (m, k, p, q)
+```
+
+如果地址都相同但结果仍然错误，下一步就要检查 byte、word 和 dtype
+打包方式。
+
+### 只检查相邻的 producer / consumer
+
+不要把整条 kernel 一次性比较。按相邻边界拆开：
+
+```text
+GMEM -> TMA -> SMEM
+SMEM -> ldmatrix -> registers
+SMEM -> descriptor -> WGMMA
+SMEM -> tcgen05.mma -> TMEM
+TMEM -> tcgen05.ld -> registers
+SMEM -> tcgen05.cp -> TMEM(SFA/SFB)
+```
+
+每一段只问：
+
+```text
+前一段实际写出的 bytes 是什么排列？
+后一段读取时假设它们是什么排列？
+```
+
+### 检查完整布局属性
+
+只比较一个 base address 不够。至少要检查：
+
+| 属性 | 需要确认的内容 |
+|---|---|
+| 逻辑轴 | `m / n / k` 与物理轴的对应关系 |
+| shape | tile 的 M、N、K 是否一致 |
+| stride | row stride、column stride、tile stride |
+| dtype | fp16、bf16、fp8、fp4 等类型是否一致 |
+| byte packing | 一个 32-bit word 中含几个逻辑元素 |
+| swizzle | XOR 模式、phase、base offset |
+| replication | 是否允许多个副本，消费者读取哪一份 |
+| alignment | descriptor 的 base address 对齐要求 |
+| scope | SMEM、TMEM、register 属于正确的 CTA 或 warp |
+
+### 三代架构分别检查什么
+
+Ampere 的 `SMEM -> ldmatrix`：
+
+```text
+生产者写入 SMEM 时使用了什么 swizzle？
+ldmatrix 每个 lane 的地址是否应用了同一个 swizzle？
+ldmatrix 生成的 fragment 是否匹配 mma.sync？
+```
+
+最常见的错误是：
+
+```text
+数据按 swizzle 写入 SMEM
+但 ldmatrix 使用未 swizzle 的行地址
+```
+
+Hopper 的 `SMEM -> WGMMA descriptor`：
+
+```text
+descriptor.start_address
+descriptor.leading_byte_offset
+descriptor.stride_byte_offset
+descriptor.swizzle_mode
+descriptor.base_offset
+```
+
+这些字段必须和 SMEM 中真实存放的数据一致。不是只要 descriptor
+“能算出一个地址”就正确，而是它算出的 address、stride 和 swizzle
+必须全部匹配。
+
+Blackwell 的 `TMEM -> tcgen05.ld`：
+
+```text
+tcgen05.mma 把 C[m,n] 写到哪个 TLane / TCol？
+执行 tcgen05.ld 的 warp 读取哪个 32-lane window？
+每个 register slot 对应哪个逻辑元素？
+```
+
+多 warp 情况还要检查 warp 与 TMEM partition 的对应关系，以及
+`tcgen05.ld` 输出的 register fragment 是否匹配 epilogue 的假设。
+
+### 把同步问题和布局问题分开
+
+即使地址公式完全正确，也必须满足：
+
+```text
+生产者完成
+    -> 正确的 memory barrier / mbarrier
+    -> 消费者才能读取
+```
+
+排查现象时可以这样区分：
+
+| 现象 | 更可能的原因 |
+|---|---|
+| 每次都在固定位置出错 | layout / axis / stride 问题 |
+| 元素发生稳定排列变化 | fragment、TMEM 或 descriptor 映射错误 |
+| 只有部分 warp 错误 | TMEM partition 或 warp window 错误 |
+| 偶发旧值、垃圾值或竞争结果 | 同步或可见性问题 |
+
+### 用唯一值做最小实验
+
+把 tile 缩到最小，并让每个元素带有唯一标识：
+
+```text
+value(m, n) = m * 1000 + n
+```
+
+然后反推消费者实际读到的值：
+
+```text
+期望读取 C[m, n]
+实际读到 C[m', n']
+```
+
+如果错误位置表现出稳定规律，例如行列互换、每 8 行跳变、半个 word
+错位或固定 partition 错位，就可以直接根据排列规律定位是哪一层 layout
+契约没有对齐。
+
 ## 对推理系统的意义
 
 prefill 阶段的 GEMM、Q/K/V projection、MLP projection 通常有较长的 K
@@ -1027,4 +1222,6 @@ scale_vec 决定 32-bit word 内的 scale 重复和 ID 选择方式
 TMEM partition 复制、word byte 复制、K-block reuse 是三件事
 register fragment 在 Blackwell 主要位于 TMEM 与 epilogue 的边界
 Ampere、Hopper、Blackwell 的差异是数据路径和布局职责的连续演进
+producer / consumer 检查要把两侧统一转换成物理地址映射
+固定排列错误优先查 layout，偶发竞争错误优先查同步
 ```

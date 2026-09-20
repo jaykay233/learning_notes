@@ -56,6 +56,8 @@ tcgen05.cp 与 .warpx4 四分区广播
 scale_vec::1X / 2X / 4X
 TMEM partition、word byte、K-block reuse 三种复制的区别
 Ampere / Hopper / Blackwell 三种数据路径的对比
+Producer / Consumer layout 契约检查
+布局错误与同步错误的区分方法
 chapter_layout_generations 完成
 ```
 
