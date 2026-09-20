@@ -19,6 +19,7 @@ Attention 以及 KV Cache 数据路径。
 | [04-swizzle-layout.md](04-swizzle-layout.md) | shared memory bank conflict、XOR swizzle、完整地址推导 |
 | [05-ampere-mma-fragments.md](05-ampere-mma-fragments.md) | `mma.sync`、A/B/C/D fragment、`ldmatrix.x1/x2/x4`、`.trans` |
 | [06-warp-tile-and-k-pipeline.md](06-warp-tile-and-k-pipeline.md) | Warp tile、fragment 复用、K 循环、`cp.async`、double buffering |
+| [07-hopper-wgmma-and-blackwell-tmem.md](07-hopper-wgmma-and-blackwell-tmem.md) | Hopper WGMMA accumulator fragment、CUTLASS `CLayout`、Blackwell TMEM、`tcgen05` 异步完成 |
 
 ## 当前进度
 
@@ -42,6 +43,13 @@ A/B fragment 复用
 K 循环累加
 Double buffering
 cp.async pipeline
+Hopper WGMMA accumulator fragment
+WGMMA M*N/128 register mapping
+CUTLASS CLayout shape / stride 推导
+Blackwell TMEM accumulator
+TLane / TCol 二维地址
+tcgen05.mma completion
+tcgen05.ld 与 tcgen05.wait::ld
 ```
 
 ## 核心主线
@@ -76,9 +84,7 @@ TMEM lane / column 不匹配
 ## 后续可继续整理
 
 ```text
-Tensor Core layout 的 Hopper / Blackwell 演进
 WGMMA matrix descriptor
 TMA producer / consumer warp specialization
-TMEM accumulator 与 tcgen05.ld
 Block-scaled MMA 的 scale factor 数据路径
 ```
