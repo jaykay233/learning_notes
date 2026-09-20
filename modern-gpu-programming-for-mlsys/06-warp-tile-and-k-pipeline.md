@@ -395,21 +395,239 @@ producer / consumer 的可见性
 软件 pipeline 通常分成三个阶段：
 
 ```text
-Prologue：先把第一批 tile 搬入
-Steady State：搬运和计算持续重叠
-Epilogue：没有下一块可搬，只完成剩余计算
+Prologue：启动流水线，先装入第一批数据
+Steady State：当前计算与未来搬运持续重叠
+Epilogue：停止预取，计算剩余数据
 ```
 
-例如 double buffering：
+这三个阶段描述的是 pipeline 从“没有数据”到“稳定重叠”，再到“没有后续
+数据”的完整生命周期。
+
+### Prologue：填满流水线
+
+刚开始时，shared memory buffer 里没有数据，不能立刻计算。
+
+对于 double buffering，先搬入第一个 tile：
 
 ```text
-Prologue:     copy tile 0
-Steady:       compute k || copy k+1
-Epilogue:     compute 最后一个 tile
+Prologue:
+    copy tile 0 -> buffer 0
 ```
 
-如果 K 很小，prologue 和 epilogue 占比会很高，pipeline 收益可能不明显。
-如果 K 很长，steady state 占比高，收益更明显。
+此时还没有重叠：
+
+```text
+数据正在搬运
+计算单元暂时等待
+```
+
+Prologue 的任务是让 pipeline 进入可运行状态。
+
+对于 `S` 个 stage 的 pipeline，通常先预取：
+
+```text
+S - 1 个 tile
+```
+
+例如：
+
+```text
+2 stage -> 预取 1 个 tile
+3 stage -> 预取 2 个 tile
+4 stage -> 预取 3 个 tile
+```
+
+### Steady State：稳定重叠
+
+Prologue 完成后，pipeline 进入效率最高的阶段：
+
+```text
+一边计算当前 tile
+一边搬运后续 tile
+```
+
+假设有四个 K tile：
+
+```text
+T0, T1, T2, T3
+```
+
+Double buffering 的 steady state 是：
+
+```text
+compute T0 || copy T1
+compute T1 || copy T2
+compute T2 || copy T3
+```
+
+这里的 `||` 表示两件事并行发生。
+
+具体 buffer 轮换是：
+
+```text
+第 1 轮：
+    读取 buffer 0，计算 T0
+    同时向 buffer 1 搬运 T1
+
+第 2 轮：
+    读取 buffer 1，计算 T1
+    同时向 buffer 0 搬运 T2
+
+第 3 轮：
+    读取 buffer 0，计算 T2
+    同时向 buffer 1 搬运 T3
+```
+
+这就是 ping-pong：
+
+```text
+buffer 0 -> buffer 1 -> buffer 0 -> buffer 1
+```
+
+Steady state 的价值是：
+
+```text
+用当前 tile 的 compute 时间覆盖后续 tile 的 memory latency
+```
+
+如果 K 很长，大部分执行时间都位于 steady state，因此 pipeline 更容易
+带来明显收益。
+
+### Epilogue：排空流水线
+
+搬入最后一个 tile 后，已经没有后续数据可以预取：
+
+```text
+Epilogue:
+    compute T3
+```
+
+此时不会再出现：
+
+```text
+compute T3 || copy T4
+```
+
+因为 `T4` 不存在。
+
+Epilogue 的任务是把已经搬入但还没有计算的 tile 全部消费掉。对于
+`S` 个 stage，通常最后还有：
+
+```text
+S - 1 个 tile
+```
+
+需要单独计算。
+
+### 完整时间线
+
+四个 tile、double buffering 的完整结构是：
+
+```text
+Prologue:
+    copy T0
+
+Steady State:
+    compute T0 || copy T1
+    compute T1 || copy T2
+    compute T2 || copy T3
+
+Epilogue:
+    compute T3
+```
+
+可以画成：
+
+```text
+             Prologue     Steady State                  Epilogue
+             ---------    --------------------------    --------
+copy T0      [====]
+compute T0                [===========]
+copy T1                    [====]
+compute T1                              [===========]
+copy T2                                  [====]
+compute T2                                            [===========]
+copy T3                                                [====]
+compute T3                                                            [===========]
+```
+
+两种不可避免的空档是：
+
+```text
+Prologue：计算单元等待第一份数据
+Epilogue：搬运路径已经没有后续工作
+```
+
+只有 steady state 持续满足：
+
+```text
+搬运和计算同时进行
+```
+
+### 多 stage 的推广
+
+```text
+S stage pipeline
+
+Prologue:
+    预取前 S - 1 个 tile
+
+Steady State:
+    compute tile k || prefetch tile k + S - 1
+
+Epilogue:
+    计算最后 S - 1 个 tile
+```
+
+例如 3-stage pipeline 有六个 tile：
+
+```text
+Prologue:
+    copy T0
+    copy T1
+
+Steady State:
+    compute T0 || copy T2
+    compute T1 || copy T3
+    compute T2 || copy T4
+    compute T3 || copy T5
+
+Epilogue:
+    compute T4
+    compute T5
+```
+
+### 对性能的影响
+
+如果 K 很小，例如只有两个 K tile：
+
+```text
+T0, T1
+```
+
+那么：
+
+```text
+Prologue + Epilogue 占比很高
+Steady State 很短
+```
+
+多 stage pipeline 可能收益不明显，同时浪费 shared memory。
+
+如果 K 很长，例如有：
+
+```text
+T0, T1, T2, ..., T63
+```
+
+那么：
+
+```text
+Steady State 占绝大多数时间
+```
+
+Double buffering 或 3/4-stage pipeline 更有机会隐藏 global memory
+latency。
 
 ## 为什么需要 Multi-stage Pipeline
 
