@@ -1,4 +1,4 @@
-# 07 Hopper WGMMA Fragment 与 Blackwell TMEM
+# 07 Hopper WGMMA Fragment、Blackwell TMEM 与 Block-Scaled MMA
 
 ## 课程位置
 
@@ -65,6 +65,10 @@ Blackwell 为什么把长期存活的 accumulator 移入 TMEM
 TMEM 的 TLane / TCol 如何表示二维地址
 cta_group::1、M=128 时 C[m,n] 映射到哪里
 tcgen05.mma 和 tcgen05.ld 的异步完成条件是什么
+Block-Scaled MMA 的 SFA/SFB 为什么进入 TMEM
+SFA/SFB 如何通过 tcgen05.cp 从 SMEM 搬到 TMEM
+.warpx4 为什么要把 scale factors 广播到四个 32-lane windows
+scale_vec::1X、2X、4X 的 word 内排列有什么区别
 ```
 
 ## 三代架构的数据路径
@@ -582,6 +586,263 @@ tcgen05.wait::ld
     确认该 warp 此前发出的 TMEM load 已经写入目标 registers
 ```
 
+## Blackwell Block-Scaled MMA 的 Scale Factor 数据路径
+
+课程位置：
+
+```text
+chapter_layout_generations
+    └── Block-Scaled MMA 的 Scale Factors
+        ├── tcgen05.cp 如何写入 TMEM
+        └── scale_vec 的 Word 内复制
+```
+
+Block-scaled MMA 会为矩阵乘法中的每个 K-scale block 使用一个较小的
+scale factor。它需要两组数据：
+
+```text
+SFA(M, SFK)
+SFB(N, SFK)
+```
+
+其中：
+
+```text
+SFA[m, sfk]
+    缩放 A 的第 m 行、第 sfk 个 K-scale block
+
+SFB[n, sfk]
+    缩放 B 的第 n 列、第 sfk 个 K-scale block
+```
+
+这里沿用课程中的逻辑索引顺序。PTX 对 B 侧矩阵可能写成
+`SFB[sfk, n]`，逻辑数据相同，只是索引顺序不同。
+
+可以把计算理解为：
+
+```text
+SFA 为 A 的每个 row / K-block 提供缩放系数
+SFB 为 B 的每个 column / K-block 提供缩放系数
+Tensor Core 在一个 K-block 内复用相应的 scale factor
+```
+
+这也是 FP4、FP8 等低精度量化推理中常见的“分块缩放”数据路径。
+
+### A/B 与 SFA/SFB 走两条不同的搬运路径
+
+A 和 B 通常先由 TMA 从 global memory 搬到 shared memory，然后由
+`tcgen05.mma` 通过 SMEM descriptor 直接读取：
+
+```text
+A, B:
+    GMEM -> TMA -> SMEM -> tcgen05.mma
+```
+
+SFA/SFB 则不能直接停在 SMEM 中交给当前这条 block-scaled MMA
+指令。它们必须先进入 TMEM：
+
+```text
+SFA, SFB:
+    GMEM -> TMA -> SMEM -> tcgen05.cp -> TMEM -> tcgen05.mma
+```
+
+完整路径是：
+
+```text
+A, B:     GMEM --TMA--> SMEM --tcgen05.mma------> Tensor Core
+
+SFA, SFB: GMEM --TMA--> SMEM --tcgen05.cp--> TMEM
+                                      |
+                                      +--tcgen05.mma--> Tensor Core
+```
+
+因此，block-scaled MMA 的主输入和 scale factor operand 使用了不同
+的硬件数据路径。
+
+### SFA/SFB 为什么不直接从 SMEM 读取
+
+这里不是“SMEM 性能不够，所以人为搬到 TMEM”，而是指令接口的差异：
+
+```text
+A/B：
+    通过 SMEM descriptor 读取
+
+SFA/SFB：
+    是 tcgen05.mma 的独立 TMEM operand
+    scale factor address 指向 TMEM
+```
+
+也就是说，当前 `tcgen05.mma` 的 block-scaled 形式规定了 scale
+factors 在 TMEM 中，并给出了对应的 TMEM 地址。Tensor Core 会从这些
+TMEM 位置读取 scale，而不是再次解释一个 SMEM descriptor。
+
+这与 accumulator 放在 TMEM 是相关但不同的两件事：
+
+```text
+accumulator：
+    MMA 的计算结果写入 TMEM
+
+scale factors：
+    MMA 计算前从 TMEM 读取的输入
+```
+
+因此，SFA/SFB 虽然源数据先经过 TMA 进入 SMEM，但仍需要额外的
+`tcgen05.cp` 把它们从 SMEM 搬到 TMEM。
+
+### `.warpx4` 的复制布局
+
+课程用下面的 layout 描述 scale factors 在 TMEM 中的基础位置和复制：
+
+```text
+S[(4, 32, 4) : (4@TCol, 1@TLane, 1@TCol)]
++ R[4 : 32@TLane]
+```
+
+这里的 `R[4 : 32@TLane]` 表示沿 `TLane` 轴复制四份，四份副本的偏移
+分别是：
+
+```text
+copy 0: TLane + 0
+copy 1: TLane + 32
+copy 2: TLane + 64
+copy 3: TLane + 96
+```
+
+假设基础 tile 中一个 scale 位于 `TLane 7`，复制后它同时出现在：
+
+```text
+TLane 7
+TLane 39
+TLane 71
+TLane 103
+```
+
+对应的 TMEM windows 是：
+
+```text
+partition 0: TLane 0 ... 31
+partition 1: TLane 32 ... 63
+partition 2: TLane 64 ... 95
+partition 3: TLane 96 ... 127
+```
+
+`tcgen05.cp` 的 `.32x128b.warpx4` 形式会把同一个基础 32-lane tile
+multicast 到四个 warp windows，而不是只写入 partition 0。
+
+### 为什么要把 SFA/SFB 广播到四个 32-lane partitions
+
+TMEM 的 128 个 Lane rows 分成四个 32-lane partitions。与之对应的
+MMA / TMEM access 也按这些 32-lane windows 组织。
+
+如果把 scale factors 只放在第一个 32-lane window 中：
+
+```text
+partition 0: 有 scale
+partition 1: 没有 scale
+partition 2: 没有 scale
+partition 3: 没有 scale
+```
+
+其余 partitions 无法从自己对应的 TMEM window 中得到当前 MMA 所需的
+scale factor。`.warpx4` multicast 后：
+
+```text
+partition 0: 有 scale
+partition 1: 有 scale
+partition 2: 有 scale
+partition 3: 有 scale
+```
+
+四个 partition 都能在本地窗口中读取正确的 scale factor。
+
+这里复制的是物理数据，不会改变数学语义。逻辑上仍然只有一个
+`SFA[m, sfk]` 或 `SFB[n, sfk]`，只是它的字节出现在四个 TMEM
+partition 中，供硬件按本地地址读取。
+
+### `tcgen05.cp` 如何把 scale bytes 放进 TMEM
+
+在带数据类型的 TIRx layout 中，scale factor 的逻辑位置先按
+`(Mgroup, lane, sfk)` 组织：
+
+```text
+S[(4, 32, 4) : (4@TCol, 1@TLane, 1@TCol)]
+```
+
+每个 scale factor 占 8 bits。四个连续的 8-bit scale 会被打包进一个
+32-bit hardware TMEM column cell：
+
+```text
+logical_TCol     = 4 * Mgroup + sfk
+hardware_TCol    = logical_TCol // 4
+byte_in_word     = logical_TCol % 4
+```
+
+例如：
+
+```text
+logical_TCol 0, 1, 2, 3
+    -> hardware_TCol 0, byte 0, 1, 2, 3
+
+logical_TCol 4, 5, 6, 7
+    -> hardware_TCol 1, byte 0, 1, 2, 3
+```
+
+可以把 `@TCol` 理解成逻辑 byte 坐标；硬件的 32-bit TMEM cell 则按
+四个 byte 一组打包。
+
+### `scale_vec::1X`、`2X`、`4X`
+
+`scale_vec` 描述一个 32-bit word 内实际容纳多少个逻辑 scale。
+
+```text
+scale_vec::1X:
+    [SF0, SF0, SF0, SF0]
+    一个逻辑 scale，在 4 个 bytes 中重复
+
+scale_vec::2X:
+    [SF0, SF1, SF0, SF1]
+    两个逻辑 scales，组成一对后重复
+
+scale_vec::4X:
+    [SF0, SF1, SF2, SF3]
+    四个逻辑 scales，刚好填满一个 word
+```
+
+`SFA_ID` 或 `SFB_ID` 用来选择从 word 的哪个位置读取：
+
+```text
+1X:
+    可选 byte offset 0、1、2 或 3
+
+2X:
+    可选 offset 0 或 2
+    分别对应低 half-word 或高 half-word
+
+4X:
+    使用全部四个 bytes
+    ID 必须为 0
+```
+
+### 三种“复制 / 复用”不要混淆
+
+这部分最容易把三个不同层级的现象混在一起：
+
+| 现象 | 发生位置 | 解决的问题 |
+|---|---|---|
+| `R[4 : 32@TLane]` | TMEM 四个 32-lane partitions | 每个 partition 都有本地 scale 副本 |
+| `scale_vec::1X / 2X` | 一个 32-bit TMEM word 内部 | 用重复字节填满 word，便于按 ID 选择 |
+| K-block 内复用 | Tensor Core 的计算语义 | 同一个 scale 作用于该 block 内多个 K 元素 |
+
+三者分别是：
+
+```text
+跨 TMEM partitions 的物理复制
+TMEM word 内部的 byte 排列
+一个 scale 在多个 K 元素上的数学复用
+```
+
+前两者改变数据在硬件中的布局，第三者是计算语义中的复用关系。
+
 ## 三代架构中的 register fragment 角色
 
 register fragment 在三代架构中都存在，但承担的角色不同。
@@ -651,5 +912,10 @@ TMEM 是 128 Lane rows 的二维 CTA-scoped memory space
 cta_group::1、M=128 时，C[m,n] 直接映射到 TLane=m、TCol=n
 tcgen05.mma 完成后 epilogue 才能读取 TMEM
 tcgen05.ld 完成后需要 tcgen05.wait::ld 才能使用 registers
+Block-Scaled MMA 的 SFA/SFB 是 TMEM operand
+SFA/SFB 通过 tcgen05.cp 从 SMEM 搬到 TMEM
+.warpx4 把基础 scale tile multicast 到四个 32-lane partitions
+scale_vec 决定 32-bit word 内的 scale 重复和 ID 选择方式
+TMEM partition 复制、word byte 复制、K-block reuse 是三件事
 register fragment 在 Blackwell 主要位于 TMEM 与 epilogue 的边界
 ```

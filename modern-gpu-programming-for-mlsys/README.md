@@ -19,7 +19,7 @@ Attention 以及 KV Cache 数据路径。
 | [04-swizzle-layout.md](04-swizzle-layout.md) | shared memory bank conflict、XOR swizzle、完整地址推导 |
 | [05-ampere-mma-fragments.md](05-ampere-mma-fragments.md) | `mma.sync`、A/B/C/D fragment、`ldmatrix.x1/x2/x4`、`.trans` |
 | [06-warp-tile-and-k-pipeline.md](06-warp-tile-and-k-pipeline.md) | Warp tile、fragment 复用、K 循环、`cp.async`、double buffering |
-| [07-hopper-wgmma-and-blackwell-tmem.md](07-hopper-wgmma-and-blackwell-tmem.md) | Hopper WGMMA accumulator fragment、CUTLASS `CLayout`、Blackwell TMEM、`tcgen05` 异步完成 |
+| [07-hopper-wgmma-and-blackwell-tmem.md](07-hopper-wgmma-and-blackwell-tmem.md) | Hopper WGMMA accumulator fragment、CUTLASS `CLayout`、Blackwell TMEM、`tcgen05`、SFA/SFB 与 `scale_vec` |
 
 ## 当前进度
 
@@ -50,6 +50,11 @@ Blackwell TMEM accumulator
 TLane / TCol 二维地址
 tcgen05.mma completion
 tcgen05.ld 与 tcgen05.wait::ld
+Block-scaled MMA 的 SFA/SFB
+SFA/SFB 的 SMEM -> TMEM 数据路径
+tcgen05.cp 与 .warpx4 四分区广播
+scale_vec::1X / 2X / 4X
+TMEM partition、word byte、K-block reuse 三种复制的区别
 ```
 
 ## 核心主线
@@ -86,5 +91,4 @@ TMEM lane / column 不匹配
 ```text
 WGMMA matrix descriptor
 TMA producer / consumer warp specialization
-Block-scaled MMA 的 scale factor 数据路径
 ```
