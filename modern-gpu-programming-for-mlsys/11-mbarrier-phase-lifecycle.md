@@ -989,5 +989,5 @@ chapter_async_barriers 完成
 
 ```text
 chapter_clc
--> 静态 persistent scheduler 的局限
+-> 一次 CLC 请求：clusterlaunchcontrol.try_cancel.async
 ```

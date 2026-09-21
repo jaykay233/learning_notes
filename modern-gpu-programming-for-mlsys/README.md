@@ -25,6 +25,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [09-tensor-cores-tcgen05.md](09-tensor-cores-tcgen05.md) | Blackwell `tcgen05.mma`、TMEM accumulator、`tcgen05.commit` 与 `cta_group` |
 | [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp Lane 访问窗口、`tcgen05.ld/st`、shape/num、pack/unpack，以及 `wait::ld/st` 的异步完成边界 |
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
+| [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、tile 成本不均衡、CTA launch queue 与 CLC 动态接管 coordinate 的基本模型 |
 
 ## 当前进度
 
@@ -126,6 +127,10 @@ full / empty barrier 的 stage 所有权协议
 empty barrier 初态与 full / empty 独立 phase
 tcgen05.commit 将异步完成事件转换为 mbarrier arrival
 chapter_async_barriers 完成
+静态 persistent scheduler 的 launch tail
+worker 延迟启动与 tile 成本不均衡
+CTA launch queue 与软件工作队列的区别
+CLC 取消 pending launch 并接管 coordinate 的基本模型
 ```
 
 ## 核心主线
@@ -162,5 +167,7 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 TMA producer / consumer warp specialization
-chapter_clc 的静态 persistent scheduler 局限与 CLC 请求
+chapter_clc 的一次 CLC 请求与异步 response
+chapter_clc 的请求与当前 tile 计算重叠
+chapter_clc 的适用场景与动态 tile scheduler 封装
 ```

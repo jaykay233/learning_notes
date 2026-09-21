@@ -47,7 +47,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 08-tma-practice-and-solutions.md
 ├── 09-tensor-cores-tcgen05.md
 ├── 10-tmem-allocation-lifecycle.md
-└── 11-mbarrier-phase-lifecycle.md
+├── 11-mbarrier-phase-lifecycle.md
+└── 12-clc-dynamic-scheduling.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -197,7 +198,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–11：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-12：
 
 ```text
 layout / named axes / replication / offset
@@ -227,6 +228,11 @@ phase 完成后进入下一轮，consumer 等待当前 round 的 parity
 双 stage pipeline 中 stage barrier 与 phase_tma 的关系
 threads 写 SMEM 后通过 fence.proxy.async 交接给 TMA
 generic proxy 与 async proxy 的可见性边界
+chapter_async_barriers 完成
+静态 persistent scheduler 的 launch tail
+worker 延迟启动与 tile 成本不均衡
+CTA launch queue 与软件工作队列的区别
+CLC 取消 pending launch 并接管 coordinate 的基本模型
 ```
 
 完整文档索引、当前进度和硬件环境说明见
