@@ -45,7 +45,9 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 07-hopper-wgmma-and-blackwell-tmem.md
 ├── 08-tma-tile-copy-and-synchronization.md
 ├── 08-tma-practice-and-solutions.md
-└── 09-tensor-cores-tcgen05.md
+├── 09-tensor-cores-tcgen05.md
+├── 10-tmem-allocation-lifecycle.md
+└── 11-mbarrier-phase-lifecycle.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -195,7 +197,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–10：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–11：
 
 ```text
 layout / named axes / replication / offset
@@ -220,6 +222,9 @@ TMEM 地址可见性、allocation size 限制与 cta_group::2 契约
 TMEM warpgroup Lane 访问窗口与 CTA allocation 边界
 TMEM tcgen05.ld/st、shape/num、pack/unpack 与异步等待
 chapter_tmem 完成
+mbarrier 的 arrival、pending count 与 phase parity
+phase 完成后进入下一轮，consumer 等待当前 round 的 parity
+双 stage pipeline 中 stage barrier 与 phase_tma 的关系
 ```
 
 完整文档索引、当前进度和硬件环境说明见

@@ -24,6 +24,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [08-tma-practice-and-solutions.md](08-tma-practice-and-solutions.md) | TMA 10 道自测题、计算推导与答案 |
 | [09-tensor-cores-tcgen05.md](09-tensor-cores-tcgen05.md) | Blackwell `tcgen05.mma`、TMEM accumulator、`tcgen05.commit` 与 `cta_group` |
 | [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp Lane 访问窗口、`tcgen05.ld/st`、shape/num、pack/unpack，以及 `wait::ld/st` 的异步完成边界 |
+| [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转与双 stage pipeline 中的 phase 跟踪 |
 
 ## 当前进度
 
@@ -113,6 +114,11 @@ tcgen05.ld/st 的异步 issue / completion 边界
 tcgen05.wait::ld/st 的 per-thread 完成语义
 tcgen05.wait、tcgen05.fence 与跨线程线程同步的区别
 chapter_tmem 完成
+chapter_async_barriers 的 mbarrier arrival / pending count
+mbarrier phase 完成条件
+phase 完成后 parity 的 0 / 1 翻转
+复用 barrier 时等待当前 round parity
+双 stage pipeline 的 stage barrier 与 phase_tma
 ```
 
 ## 核心主线
@@ -149,5 +155,5 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 TMA producer / consumer warp specialization
-chapter_async_barriers 的 mbarrier phase 与 stage reuse
+chapter_async_barriers 的 common handoffs 与 full/empty barrier stage reuse
 ```
