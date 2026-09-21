@@ -21,7 +21,9 @@ tcgen05.commit 与 mbarrier
 tcgen05.commit + mbarrier 和 TMA load / store 的差异
 cta_group 的基本操作范围
 cta_group::2 的 CTA pair 资源访问边界
+cta_group::1, M=128 的直接 accumulator 映射
 cta_group::1, M=64 的 Layout F
+cta_group::2, M=128 dense A 的 Layout B
 cta_group::2, M=256 的 accumulator 切分
 ```
 
@@ -791,7 +793,183 @@ A/B tile 如何分布到两个 CTA 的 SMEM，不属于 accumulator layout
 `cta_group::2` MMA 通常由 pair 中的一个 elected thread 发起，
 但写入结果会覆盖 pair 中两个 CTA 的 TMEM。
 
-## 八、当前进度
+## 八、cta_group::2, M=128 dense A 的 Layout B
+
+```text
+本次讲解位置
+章节：chapter_tensor_cores
+小节：How cta_group Sets the Operation Scope
+知识点：cta_group::2, M=128 dense A 的 Layout B
+上次：cta_group::2, M=256 的 CTA pair accumulator 切分
+下次：block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
+PTX：9.7.18.10.5.2 Layout B (M = 128 + cta_group::2 + Dense A matrix)
+```
+
+上一节的 `M=256` accumulator 把 M 平均分给 CTA pair：
+
+```text
+even CTA: M rows 0..127
+odd CTA:  M rows 128..255
+```
+
+每个 CTA 仍然使用完整的 N 方向，所以本地 TMEM 形状是
+`128 x N`。
+
+`cta_group::2, M=128` 不同：逻辑 tile 的总 M 只有 128，
+但两个 CTA 仍然共同参与运算。因此每个 CTA 只拿 64 个 M
+rows，同时把 N 方向拆成两半，再映射到自己的四个 32-lane
+region。
+
+### CTA pair 先沿 M 方向切分
+
+对逻辑元素 `C[m, n]`：
+
+```text
+even CTA: m = 0..63
+odd CTA:  m = 64..127
+```
+
+定义 CTA 内的局部行号：
+
+```text
+m_local = m % 64
+```
+
+因此：
+
+| 逻辑 M 行 | CTA | `m_local` |
+|---|---|---:|
+| `0..63` | even | `0..63` |
+| `64..127` | odd | `0..63` |
+
+### 每个 CTA 内再把 N 折进 Lane 轴
+
+设 N 的有效宽度为 `N`。在当前 CTA 内，N 被分成上下两个区间：
+
+```text
+lower half: n = 0 .. N/2-1
+upper half: n = N/2 .. N-1
+```
+
+`m_local` 的 64 行再分成两个 32-row group：
+
+```text
+local group 0: m_local = 0..31
+local group 1: m_local = 32..63
+```
+
+这两组 M 行和两个 N half 组成一个 `2 x 2` 映射，正好占满
+当前 CTA 的四个 32-lane region：
+
+| N 区间 | CTA 内局部 M 行 | TMEM Lane |
+|---|---|---|
+| `0 ... N/2-1` | `0..31` | `0..31` |
+| `0 ... N/2-1` | `32..63` | `32..63` |
+| `N/2 ... N-1` | `0..31` | `64..95` |
+| `N/2 ... N-1` | `32..63` | `96..127` |
+
+所以坐标公式是：
+
+```text
+CTA = even,  if m < 64
+      odd,   if m >= 64
+
+m_local = m % 64
+
+TLane = m_local,       if n < N/2
+        64 + m_local,  if n >= N/2
+
+TCol = n
+```
+
+这里的 `m_local` 和 `TLane` 的关系是连续的：
+
+```text
+lower N half:
+    m_local 0..63 -> TLane 0..63
+
+upper N half:
+    m_local 0..63 -> TLane 64..127
+```
+
+### 具体坐标例子
+
+取 `N=16`，则：
+
+```text
+N/2 = 8
+
+lower half: n = 0..7
+upper half: n = 8..15
+```
+
+| 逻辑元素 | CTA | `m_local` | N half | TLane | TCol |
+|---|---|---:|---|---:|---:|
+| `C[10, 3]` | even | 10 | lower | 10 | 3 |
+| `C[10, 11]` | even | 10 | upper | 74 | 11 |
+| `C[70, 3]` | odd | 6 | lower | 6 | 3 |
+| `C[70, 11]` | odd | 6 | upper | 70 | 11 |
+
+例如 `C[70, 11]`：
+
+```text
+m >= 64                 -> odd CTA
+m_local = 70 % 64 = 6
+n = 11 >= N/2 = 8       -> upper N half
+TLane = 64 + 6 = 70
+TCol  = 11
+```
+
+### 和 M=256 的核心区别
+
+```text
+M=256:
+    每个 CTA 保存 128 个 M rows
+    每个 CTA 使用完整的 N
+    本地 TMEM 形状为 128 x N
+
+M=128, Layout B, dense A:
+    每个 CTA 只保存 64 个 M rows
+    N 的 lower / upper half 折进 Lane 的 lower / upper 64 lanes
+    本地仍然占满 128 个 Lane rows，但每个 Lane row 对应的逻辑 M 不同
+```
+
+因此不能把上一节的 `TLane = m` 或 `TLane = m % 128` 直接套到
+Layout B。必须先根据 M 选择 CTA，再根据 N 选择 Lane half。
+
+### 适用范围和 epilogue 限制
+
+这个映射只适用于：
+
+```text
+cta_group::2
+M = 128
+dense A
+Layout B
+```
+
+PTX 中对应的 Layout B 条目还给出 `2 x 2` placement 和
+lane alignment `0`。如果是 structured-sparse A，
+`cta_group::2, M=128` 改用 Layout C，上面公式不能复用。
+
+另外，Layout B 只描述 MMA 如何把 accumulator 写进 CTA pair。
+CTA pair 中每个 CTA 的 TMEM 仍然是独立的；epilogue 做
+`tcgen05.ld/st` 时，每个 CTA 必须按自己的 CTA 编号、`TLane`
+和 `TCol` 读取，并使用与布局相容的合法 copy atom。不能把
+pair 的两块 TMEM 当成一块连续的 `256 x N` 地址空间来寻址。
+
+一句话记忆：
+
+```text
+M=256:
+    M 在 pair 上各分 128 行，N 不折
+
+M=128 dense A Layout B:
+    M 在 pair 上各分 64 行，
+    N 的 lower / upper half 折到 Lane 0..63 / 64..127
+```
+
+## 九、当前进度
 
 ### 本章剩余知识点
 
@@ -802,7 +980,7 @@ data-path 知识点：
 [x] cta_group::1, M=128 的直接映射
 [x] cta_group::1, M=64，非 .ws 的 Layout F
 [x] cta_group::2, M=256，M rows 在 CTA pair 上连续切分
-[ ] cta_group::2, M=128 dense A 的 Layout B
+[x] cta_group::2, M=128 dense A 的 Layout B
 [ ] block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 [ ] tcgen05 指令之间的 scope / layout / completion 三层契约
 ```
@@ -810,7 +988,7 @@ data-path 知识点：
 其中 sparse A 会把 `cta_group::2, M=128` 的 accumulator layout
 从 Layout B 改为 Layout C，因此需要和 dense A 对比理解。
 
-学完 M256 后，本章还剩 3 个主知识点。
+学完 M128 dense A 的 Layout B 后，本章还剩 2 个主知识点。
 
 `chapter_tensor_cores` 正在进行中：
 
@@ -829,10 +1007,11 @@ cta_group::2 的 CTA pair 资源访问边界
 cta_group::1, M=128 的直接 accumulator 映射
 cta_group::1, M=64 的 Layout F
 cta_group::2, M=256 的 CTA pair accumulator 切分
+cta_group::2, M=128 dense A 的 Layout B
 ```
 
 下一知识点：
 
 ```text
-cta_group::2, M=128 dense A 的 Layout B
+block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 ```
