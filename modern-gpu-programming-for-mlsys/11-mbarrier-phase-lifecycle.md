@@ -8,6 +8,7 @@
 - 软件为什么只记录 parity 的 `0 / 1`
 - 为什么复用 barrier 时必须切换等待的 parity
 - threads 写 SMEM 后交给 async proxy 读取时的 fence 与 thread sync
+- `full[stage]` / `empty[stage]` 如何通过所有权交接复用同一个 stage
 
 ## 一、本次讲解位置
 
@@ -539,18 +540,36 @@ T.ptx.cp_async.bulk.commit_group()
 T.ptx.cp_async.bulk.wait_group(0)
 ```
 
-含义是：
+TVM 中这个 intrinsic 的签名是：
 
-```text
-commit_group
-    把此前发出的 TMA stores 归入一个 group
-
-wait_group(0)
-    等所有已提交 group 完成
+```python
+ptx_cp_async_bulk_wait_group(n=0, read=True)
 ```
 
-`wait_group(0)` 返回后，TMA engine 已经读完 `Dsmem`，这块 buffer 才能
-被下一轮写入复用。
+因此上面的代码默认会生成：
+
+```text
+cp.async.bulk.wait_group.read 0
+```
+
+`0` 表示最多允许 0 个 bulk async group 继续 pending。`.read` 限定等待的
+是 tensormap 和 source 的读取完成，而不是 destination 的写入完成。
+
+对于课程里的 TMA store，这里的等待目的正好是：
+
+```text
+TMA engine 已经读完 Dsmem
+-> 这块 buffer 可以给下一轮 epilogue 覆盖
+```
+
+如果还需要等待完整的 destination write 和可见性，要使用：
+
+```python
+T.ptx.cp_async.bulk.wait_group(0, read=False)
+```
+
+它生成 `cp.async.bulk.wait_group 0`，等待 source read、destination write
+以及相应可见性都完成。
 
 课程再用一次同步，把“tid 0 已经确认 TMA store 完成”传播给整个
 warpgroup：
@@ -611,7 +630,250 @@ sync 负责让 TMA issuer 知道所有 thread 都写完了
 wait_group 负责确认 TMA 已经读完 SMEM
 ```
 
-## 十、当前进度
+## 十、Using barriers to reuse a stage
+
+```text
+本次讲解位置
+章节：chapter_async_barriers
+小节：Using barriers to reuse a stage
+知识点：full[stage] / empty[stage] 与 stage 所有权交接
+上次：threads 写 SMEM 后通过 fence.proxy.async 与 thread sync 交给 TMA
+下次：chapter_clc -> 静态 persistent scheduler 的局限
+PTX：mbarrier.arrive / mbarrier.try_wait.parity
+```
+
+上一课解决的是：
+
+```text
+thread 写进 SMEM 的数据
+什么时候能被 TMA async proxy 看见
+```
+
+这一课继续解决：
+
+```text
+一个 SMEM stage 被反复复用时
+producer 什么时候可以覆盖它
+consumer 什么时候可以读取它
+```
+
+只靠 `stage = k % S` 不够。stage 编号相同，只能说明两次使用落在
+同一块内存，不能说明上一轮 consumer 已经读完。
+
+### 一、full 和 empty 分别表示什么
+
+每个 stage 使用一对 barrier：
+
+| barrier | 所有权方向 | 完成时代表 |
+|---|---|---|
+| `full[stage]` | producer -> consumer | 数据已经写入，consumer 可以读 |
+| `empty[stage]` | consumer -> producer | 数据已经用完，producer 可以覆盖 |
+
+它们在 steady state 中构成一个循环：
+
+```text
+EMPTY / 可写
+    |
+    | producer 获得所有权
+    v
+producer 写入 stage
+    |
+    | full[stage] 完成
+    v
+FULL / 可读
+    |
+    | consumer 获得所有权
+    v
+consumer 读取 stage
+    |
+    | arrive empty[stage]
+    v
+EMPTY / 可写
+```
+
+一句话记忆：
+
+```text
+wait 是获取所有权
+arrive 是归还所有权
+full 归还给 consumer
+empty 归还给 producer
+```
+
+### 二、TMA load pipeline 中的具体协议
+
+以两级 pipeline 为例：
+
+```text
+S = 2
+stage = k % 2
+```
+
+producer 侧负责 TMA load：
+
+```text
+Producer:
+    如果需要复用 stage：
+        wait empty[stage]
+
+    issue TMA load -> SMEM[stage]
+    full[stage] 在 TMA 完成后完成当前 phase
+```
+
+consumer 侧负责 MMA 或 `tcgen05.mma`：
+
+```text
+Consumer:
+    wait full[stage]
+    使用 SMEM[stage] 中的数据
+    arrive empty[stage]
+```
+
+它们不是同一个线程。`full` 把数据从 producer 交给 consumer，
+`empty` 把 buffer 从 consumer 还给 producer。
+
+四个 K tile 的 stage 映射仍然是：
+
+```text
+k0 -> stage 0
+k1 -> stage 1
+k2 -> stage 0
+k3 -> stage 1
+```
+
+但是 `k2 -> stage 0` 之前必须满足：
+
+```text
+consumer 已经读完 k0
+producer 已经观察到 empty[0]
+```
+
+否则 producer 可能覆盖 consumer 仍在读取的 k0 数据。
+
+### 三、expected arrival count 取决于谁负责报告完成
+
+barrier 初始化时指定的 expected arrival count，必须等于每个 phase
+实际会发生的 arrival 次数。
+
+| barrier | 常见 arrival 来源 |
+|---|---|
+| `full[stage]` | TMA issuer 的 arrival，以及 TMA 的 complete-tx |
+| `empty[stage]` | consumer 完成读取后的一个或多个 arrival |
+
+例如：
+
+```text
+full[stage] init expected count = 1
+    producer 只有一个 elected thread 发起 TMA
+
+empty[stage] init expected count = 128
+    consumer warpgroup 的 128 个 thread 都要报告读完
+```
+
+也可以只让一个 elected thread 在确认整个 consumer 操作完成后
+`arrive empty[stage]`：
+
+```text
+empty[stage] init expected count = 1
+    consumer 只有一个 elected thread 负责归还 stage
+```
+
+关键不是固定写 `1` 或 `128`，而是：
+
+```text
+wait 方要求的完成条件
+必须和 arrive 方实际报告的次数完全一致
+```
+
+expected count 太小，可能提前完成，consumer 会读到未完成数据。
+expected count 太大，phase 永远无法完成，wait 会一直阻塞。
+
+如果 consumer 本身是异步操作，例如 `tcgen05.mma`，elected thread
+不能只在“发出 MMA”时立刻归还 stage。它必须先确保 MMA 已经完成，
+或通过 `tcgen05.commit` 把完成事件关联到 barrier，再产生对应的
+`empty` arrival。这里的“用完”必须表示硬件已经不需要继续读取
+这块 SMEM，而不是仅仅表示指令已经发出。
+
+### 四、full 和 empty 要分别跟踪 phase parity
+
+`full[stage]` 和 `empty[stage]` 是两个独立的 `mbarrier`，因此也有
+两套独立的 phase。不能共用一个 parity 变量。
+
+等待 parity `p` 的含义是：
+
+```text
+等待该 barrier 的第 p 个 parity 对应的 phase 完成
+```
+
+以 stage 0 为例：
+
+| stage 0 使用轮次 | consumer 等 `full[0]` | producer 覆盖前等 `empty[0]` |
+|---:|---:|---:|
+| 第 1 次，k0 | parity 0 | 初始就是 free，通常不等 |
+| 第 2 次，k2 | parity 1 | parity 0 |
+| 第 3 次，k4 | parity 0 | parity 1 |
+
+这里有两个容易混淆的点：
+
+```text
+full[0] 第 1 次等待 parity 0
+    TMA 完成第一次 fill 时，phase 0 完成
+
+empty[0] 第 1 次真正等待 parity 0
+    consumer 第一次用完 k0 后，phase 0 完成
+
+producer 第 2 次使用 stage 0 时
+    等待的就是这次 empty[0] phase 0 完成
+```
+
+prologue 第一次填满 stage 时，stage 本来就处于 free 状态，因此可以：
+
+```text
+直接填充
+```
+
+或者在初始化后预先完成一次 `empty[stage]`，明确表示所有 stage
+初始均为空闲。两种实现都必须保证“第一次填充前不等待一个尚未
+发生过的 consumer release”。
+
+### 五、和上一课的边界如何连接
+
+上一课的 `fence.proxy.async` 和 `warpgroup_sync` 解决的是：
+
+```text
+threads 已经写好的 SMEM
+如何安全地交给 TMA 读取
+```
+
+这一课的 `full / empty` 解决的是：
+
+```text
+一块 stage 在 producer 和 consumer 之间
+如何在多轮 iteration 中反复交接所有权
+```
+
+因此完整的理解顺序是：
+
+```text
+1. producer 获得 free stage
+2. producer 写完 SMEM
+3. fence + thread sync
+4. TMA 或 consumer 读取这块数据
+5. full / empty 对应的 phase 报告完成
+6. 另一方获得所有权
+```
+
+最后不要混淆两类 barrier：
+
+| 对象 | 用途 |
+|---|---|
+| `full[stage]` / `empty[stage]` | SMEM stage 的数据就绪与 buffer 归还 |
+| `bar.sync 10` 这类 named barrier | 让一组 thread 在代码位置同步 |
+
+前者是放在 SMEM 中、带 phase 和 arrival 协议的对象；后者只是
+named barrier slot。二者解决的问题不同。
+
+## 十一、当前进度
 
 `chapter_async_barriers` 的知识点：
 
@@ -619,7 +881,7 @@ wait_group 负责确认 TMA 已经读完 SMEM
 [x] mbarrier
 [x] How phases distinguish consecutive uses
 [x] Common synchronization handoffs
-[ ] Using barriers to reuse a stage
+[x] Using barriers to reuse a stage
 ```
 
 已经覆盖：
@@ -636,12 +898,16 @@ threads 写 SMEM 后通过 fence.proxy.async 发布给 TMA
 warpgroup_sync 保证所有 SMEM writer 已完成
 TMA store 使用 commit_group / wait_group 等待源 buffer 可复用
 TMA load 与 TMA store 两种交接方向的区别
+full[stage] / empty[stage] 的 producer-consumer 所有权协议
+empty barrier 的初始 free 状态
+full / empty 各自的 expected arrival count
+full / empty 两套独立的 phase parity
+chapter_async_barriers 完成
 ```
 
 下一知识点：
 
 ```text
-chapter_async_barriers
--> Using barriers to reuse a stage
--> full / empty barrier 与 stage 所有权交接
+chapter_clc
+-> 静态 persistent scheduler 的局限
 ```
