@@ -48,7 +48,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 09-tensor-cores-tcgen05.md
 ├── 10-tmem-allocation-lifecycle.md
 ├── 11-mbarrier-phase-lifecycle.md
-└── 12-clc-dynamic-scheduling.md
+├── 12-clc-dynamic-scheduling.md
+└── 13-tirx-first-kernel.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -198,7 +199,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-12：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-13：
 
 ```text
 layout / named axes / replication / offset
@@ -252,6 +253,10 @@ CLC 的 sm_100+ 硬件与编译目标边界
 H100/H200 不支持 CLC，但支持 thread block cluster
 把 CLC 封装为动态 tile scheduler，并保持 mainloop 不变
 chapter_clc 完成
+TIRx Scope / Layout / Dispatch
+单 tile GEMM 的 A/B 与 D 数据路径
+TIRx SMEMPool、mbarrier 与 TMEM 生命周期
+chapter_intro_tirx 第一个单 tile GEMM Kernel
 ```
 
 完整文档索引、当前进度和硬件环境说明见

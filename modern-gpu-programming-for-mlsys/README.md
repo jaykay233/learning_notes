@@ -26,6 +26,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp Lane 访问窗口、`tcgen05.ld/st`、shape/num、pack/unpack，以及 `wait::ld/st` 的异步完成边界 |
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
 | [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
+| [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
 
 ## 当前进度
 
@@ -150,6 +151,23 @@ CLC 的 sm_100+ 硬件与编译目标边界
 H100/H200 不支持 CLC，但支持 thread block cluster
 把 CLC 封装为动态 tile scheduler，并保持 mainloop 不变
 chapter_clc 完成
+TIRx 是使用 threads、SMEM、TMEM、barrier 与 Tensor Core 概念的 Python DSL
+Scope 决定哪些 threads 执行 tile 操作
+Layout 决定逻辑 tile 如何映射到 memory、Lane、register 或 TMEM
+Dispatch 决定 tile 操作使用哪条硬件路径
+单 tile GEMM 计算 D = A × B^T
+A/B 数据路径：GMEM -> SMEM -> tcgen05.mma
+D 数据路径：tcgen05.mma -> TMEM -> registers -> GMEM
+cta_id / warpgroup_id / warp_id_in_wg / lane_id
+SMEMPool 的 alloc / move_base_to / commit
+mbarrier.init 与 tcgen05.alloc
+TileLayout 将逻辑 tile 映射到 TLane / TCol
+Tx.cta.copy、Tx.gemm_async 与 Tx.wg.copy_async
+tcgen05.commit 与 mbarrier.try_wait
+tid_in_wg 将 output row 映射到 thread
+tcgen05.wait.ld 与 TMEM -> register writeback
+relinquish_alloc_permit 与 tcgen05.dealloc
+chapter_intro_tirx 第一个单 tile GEMM Kernel
 ```
 
 ## 核心主线
