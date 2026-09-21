@@ -23,7 +23,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [08-tma-tile-copy-and-synchronization.md](08-tma-tile-copy-and-synchronization.md) | TMA descriptor、128-byte swizzle、3D box、row layout、pipeline、`ldmatrix` 判断、mbarrier load 与 bulk-group store |
 | [08-tma-practice-and-solutions.md](08-tma-practice-and-solutions.md) | TMA 10 道自测题、计算推导与答案 |
 | [09-tensor-cores-tcgen05.md](09-tensor-cores-tcgen05.md) | Blackwell `tcgen05.mma`、TMEM accumulator、`tcgen05.commit` 与 `cta_group` |
-| [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp-collective 语义、地址可见性、释放与 `cta_group::2` |
+| [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp Lane 访问窗口、`tcgen05.ld/st`、shape/num、pack/unpack 与异步等待 |
 
 ## 当前进度
 
@@ -106,6 +106,11 @@ relinquish_alloc_permit 与 tcgen05.dealloc
 cta_group::2 的 CTA pair allocation 契约
 warpgroup 内四个 warp 的固定 32-Lane TMEM 访问窗口
 CTA allocation 边界与 warp Lane 访问限制的区别
+tcgen05.ld/st 的 warp-collective 数据通路
+shape 与 num 的 data volume / register count 计算
+16-bit pack/unpack 语义
+异步 ld/st 的 wait、fence 与跨线程同步边界
+chapter_tmem 完成
 ```
 
 ## 核心主线
@@ -142,5 +147,5 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 TMA producer / consumer warp specialization
-chapter_tmem 的 lane access / ld-st / packing / wait
+chapter_async_barriers 的 mbarrier phase 与 stage reuse
 ```

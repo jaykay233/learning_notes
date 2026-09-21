@@ -435,17 +435,293 @@ Column 看 allocation
 Lane 看 warp 在 warpgroup 中的位置
 ```
 
-## 九、当前进度
+## 九、TMEM 与寄存器之间的数据通路（合并课）
+
+```text
+本次讲解位置
+章节：chapter_tmem
+小节：How tcgen05.ld and tcgen05.st Move Data；Shape and Repeat Factor；Packing and Unpacking 16-Bit Data；Waiting for Asynchronous Loads and Stores
+知识点：TMEM 到寄存器的搬运、shape/num 数据量、16-bit pack/unpack 与异步等待
+上次：warpgroup 内四个 warp 的固定 32-Lane TMEM 访问窗口
+下次：chapter_async_barriers -> mbarrier 与 phase 生命周期
+PTX：9.7.18.8 Tensor Memory and Register Load/Store Instructions；9.7.18.8.2 Packing and Unpacking；9.7.18.8.3 tcgen05.ld；9.7.18.8.4 tcgen05.st；9.7.18.8.5 tcgen05.wait
+```
+
+这一课把四个原本分散的小点合成一条数据通路：
+
+```text
+访问哪个 TMEM 窗口
+    -> 一条指令搬运多少数据
+    -> 数据怎样进入 warp 内各线程的寄存器
+    -> 16-bit 数据是否需要 pack/unpack
+    -> 什么时候可以安全读取或覆盖这些数据
+```
+
+### 一、方向与 warp-collective 语义
+
+两条指令的方向正好相反：
+
+```text
+tcgen05.ld:
+    TMEM -> registers
+
+tcgen05.st:
+    registers -> TMEM
+```
+
+它们都是 warp-collective 指令：
+
+```text
+同一个 warp 中所有 32 个线程
+    执行同一条 tcgen05.ld/st
+
+所有线程提供同一个 [taddr]
+    [taddr] 是整个 warp 操作的 base address
+```
+
+如果 warp 内不同线程传入不同的 `taddr`，行为没有定义。硬件根据每条
+线程的 `%laneid`，把 TMEM 数据分发到各线程自己的寄存器，或者把各线程
+的寄存器写回对应的 TMEM cells。
+
+典型形式：
+
+```text
+tcgen05.ld.sync.aligned.16x128b.x4.b32
+    {r0, r1, r2, r3, r4, r5, r6, r7}, [taddr];
+```
+
+这里：
+
+```text
+一个 warp 共同执行一次 ld
+每个线程得到自己的 r0-r7
+[taddr] 对 warp 内所有线程相同
+```
+
+`tcgen05.st` 只是反向：
+
+```text
+tcgen05.st.sync.aligned.16x64b.x4.b32
+    [taddr], {r0, r1, r2, r3};
+```
+
+上一课的 Lane 窗口限制仍然生效。一个 warp 只能在自己的 32-Lane 窗口
+内执行这些访问。
+
+### 二、shape 与 num 决定搬运量
+
+`.shape` 不是 MMA 的 `M x N x K`。它是 TMEM 与寄存器之间的数据搬运
+形状，主要回答：
+
+```text
+有多少个 TMEM Lanes 参与
+每个 Lane 的基础数据宽度是多少
+```
+
+`.num` 是基础形状的重复次数：
+
+```text
+.x1  -> 重复 1 次
+.x2  -> 重复 2 次
+.x4  -> 重复 4 次
+.x8  -> 重复 8 次
+```
+
+统一用 32-bit cell 计数：
+
+```text
+cells_moved
+    = shape_lanes
+    * shape_bits_per_lane / 32
+    * num
+
+registers_per_thread
+    = cells_moved / 32
+```
+
+以：
+
+```text
+tcgen05.ld.sync.aligned.16x128b.x4.b32
+```
+
+为例：
+
+```text
+16 lanes
+128 bits / lane = 4 个 32-bit cells
+x4 repetition
+
+cells_moved = 16 * 4 * 4 = 256
+registers_per_thread = 256 / 32 = 8
+```
+
+这正好对应寄存器列表 `{r0, ..., r7}`。
+
+| 指令形式 | 每 Lane 数据 | 总 cells | 每线程寄存器 |
+|---|---:|---:|---:|
+| `.16x128b.x1` | 128 bit | 64 | 2 |
+| `.16x128b.x2` | 256 bit | 128 | 4 |
+| `.16x128b.x4` | 512 bit | 256 | 8 |
+| `.16x128b.x8` | 1024 bit | 512 | 16 |
+
+也可以用更常见的 `.32x32b` 做快速心算：
+
+```text
+.32x32b.x1:
+    32 lanes * 1 cell * 1 = 32 cells
+    每线程 1 个 32-bit register
+
+.32x32b.x4:
+    32 lanes * 1 cell * 4 = 128 cells
+    每线程 4 个 32-bit registers
+```
+
+`.shape` 和 `.num` 决定搬了**多少**数据，但不必单独决定每个寄存器
+对应哪个逻辑矩阵元素。最后的 fragment mapping 还取决于具体指令形状
+和寄存器 fragment 定义。
+
+可以先用一条简单规则检查：
+
+```text
+指令写的寄存器数量
+    必须等于 shape/num 计算出的每线程寄存器数量
+```
+
+### 三、pack 与 unpack
+
+TMEM cell 和 `tcgen05.ld/st` 的寄存器操作数都以 32 bit 为基本单位，
+但实际数据可能是 16-bit：
+
+```text
+tcgen05.ld + .pack::16b:
+    两个相邻 TMEM Column 中的 16-bit 数据
+    -> 一个 32-bit register
+
+tcgen05.st + .unpack::16b:
+    一个 32-bit register
+    -> 两个相邻 TMEM Column 中的 16-bit 数据
+```
+
+可以把它理解成：
+
+```text
+TMEM 中:
+    Column 2k     = 16-bit value low
+    Column 2k + 1 = 16-bit value high
+
+ld.pack:
+    register = (high, low)
+
+st.unpack:
+    (high, low) -> Column 2k, Column 2k + 1
+```
+
+pack/unpack 只改变搬运时的数据组织方式：
+
+```text
+不改变 TMEM allocation
+不改变一个 Column 仍然包含 128 Lanes
+不改变 Column 的分配单位
+```
+
+它解决的是“16-bit 逻辑数据怎样放进 32-bit 搬运单元”，不是重新设计
+TMEM 地址空间。
+
+### 四、异步完成与 wait
+
+`tcgen05.ld` 和 `tcgen05.st` 都是异步指令。发出指令不等于数据已经可用
+或已经写完。
+
+加载后的正确顺序：
+
+```text
+tcgen05.ld ...
+tcgen05.wait::ld.sync.aligned;
+使用目标寄存器
+```
+
+存储后的正确顺序：
+
+```text
+tcgen05.st ...
+tcgen05.wait::st.sync.aligned;
+再依赖这次 TMEM 写入已经完成
+```
+
+两个 wait 分别覆盖当前线程之前发出的所有相关操作：
+
+```text
+tcgen05.wait::ld:
+    等待当前线程此前所有 tcgen05.ld
+
+tcgen05.wait::st:
+    等待当前线程此前所有 tcgen05.st
+```
+
+但 wait 只解决当前线程自己的异步完成顺序。如果另一个线程或 warp
+接下来要消费这份数据，还需要：
+
+```text
+合适的 tcgen05.fence
+CTA / warpgroup 级别的线程同步
+发布者与消费者之间的内存顺序
+```
+
+所以不能把：
+
+```text
+tcgen05.wait::st
+```
+
+误认为：
+
+```text
+另一个 warp 已经能看到新数据
+```
+
+### 五、完整检查顺序
+
+读一段 TMEM kernel 时，按下面四步检查最稳定：
+
+```text
+1. allocation:
+    分配了多少 Columns，何时释放
+
+2. lane window:
+    当前 warp 能访问哪 32 个 Lanes
+
+3. movement:
+    shape/num 实际产生多少个寄存器
+    是否需要 pack/unpack
+
+4. completion:
+    ld 后是否 wait::ld
+    st 后是否 wait::st
+    跨线程消费是否补齐 fence + synchronization
+```
+
+一句话记忆：
+
+```text
+taddr 选起点
+shape 选基础搬运块
+num 决定重复几份
+laneid 决定线程拿到哪些寄存器
+wait 决定什么时候可以使用
+```
+
+## 十、当前进度
 
 `chapter_tmem` 的知识点：
 
 ```text
 [x] The TMEM Allocation Lifecycle
 [x] Which TMEM Lanes Each Warp Can Access
-[ ] How tcgen05.ld and tcgen05.st Move Data
-[ ] Shape and Repeat Factor
-[ ] Packing and Unpacking 16-Bit Data
-[ ] Waiting for Asynchronous Loads and Stores
+[x] How tcgen05.ld and tcgen05.st Move Data
+[x] Shape and Repeat Factor
+[x] Packing and Unpacking 16-Bit Data
+[x] Waiting for Asynchronous Loads and Stores
 ```
 
 已经覆盖：
@@ -464,10 +740,15 @@ tcgen05.dealloc
 cta_group::2 allocation 契约
 warpgroup 内四个 warp 的固定 32-Lane TMEM 访问窗口
 CTA allocation 边界与 warp Lane 访问限制的区别
+tcgen05.ld/st 的 warp-collective 数据通路
+shape 与 num 的 data volume / register count 计算
+16-bit pack/unpack 语义
+异步 ld/st 的 wait、fence 与跨线程同步边界
+chapter_tmem 完成
 ```
 
 下一知识点：
 
 ```text
-chapter_tmem -> How tcgen05.ld and tcgen05.st Move Data
+chapter_async_barriers -> mbarrier 与 phase 生命周期
 ```
