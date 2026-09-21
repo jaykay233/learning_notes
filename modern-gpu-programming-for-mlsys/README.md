@@ -25,7 +25,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [09-tensor-cores-tcgen05.md](09-tensor-cores-tcgen05.md) | Blackwell `tcgen05.mma`、TMEM accumulator、`tcgen05.commit` 与 `cta_group` |
 | [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp Lane 访问窗口、`tcgen05.ld/st`、shape/num、pack/unpack，以及 `wait::ld/st` 的异步完成边界 |
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
-| [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、tile 成本不均衡、CTA launch queue 与 CLC 动态接管 coordinate 的基本模型 |
+| [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、tile 成本不均衡、CTA launch queue、CLC 动态接管 coordinate，以及请求与当前 tile 计算的异步重叠 |
 
 ## 当前进度
 
@@ -139,6 +139,10 @@ CLC response 的 async-proxy 写入与 generic-proxy 读取
 generic proxy 与 async proxy 的抽象含义
 CLC response 的跨 proxy 读写顺序
 mbarrier 完成通知与 proxy fence 的分工
+在计算当前 tile 前提交 try_cancel
+用当前 tile 计算隐藏 grid scheduler 延迟
+先请求、再计算、最后等待的单请求软件流水
+CLC 单 outstanding request 的 buffer / barrier 复用约束
 ```
 
 ## 核心主线
@@ -175,6 +179,5 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 TMA producer / consumer warp specialization
-chapter_clc 的请求与当前 tile 计算重叠
 chapter_clc 的适用场景与动态 tile scheduler 封装
 ```

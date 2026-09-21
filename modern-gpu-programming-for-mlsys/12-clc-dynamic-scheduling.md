@@ -555,14 +555,171 @@ query_cancel.is_canceled
 答案是提前发出下一块工作的请求，让 grid scheduler 的延迟与当前
 tile 的计算重叠。
 
-## 九、当前进度
+## 九、把请求与当前计算重叠
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_clc
+小节：把请求与当前计算重叠
+知识点：在计算当前 tile 前提交 try_cancel，并在计算结束后等待结果
+上次：CLC request 的生命周期与跨 proxy 顺序
+下次：什么时候使用 CLC
+PTX：9.7.15.18 clusterlaunchcontrol.try_cancel
+     9.7.15.19 clusterlaunchcontrol.query_cancel
+```
+
+上一节已经知道一次请求如何完成:
+
+```text
+提交 try_cancel
+    -> 硬件异步写 response
+    -> mbarrier 报告完成
+    -> query_cancel 解读 coordinate
+```
+
+这一节只回答一个调度问题:
+
+```text
+try_cancel 应该在什么时刻提交？
+```
+
+### 一、persistent worker 的循环顺序
+
+worker 最开始仍使用自己的 `blockIdx` 确定第一块 tile。之后每一轮
+不再先计算、再请求，而是先请求下一块可能的工作:
+
+```text
+tile = decode(blockIdx)
+
+while true:
+    async_try_cancel(result, barrier)
+    compute(tile)
+    wait(barrier)
+
+    if not is_canceled(result):
+        break
+
+    tile = decode(get_first_ctaid(result))
+```
+
+这里要区分两个时刻:
+
+| 时刻 | 发生的事情 |
+|---|---|
+| 发出 `try_cancel` 时 | 只提交请求，不等待 response |
+| 当前 tile 计算期间 | grid scheduler 异步处理请求 |
+| 当前 tile 计算完成后 | 等待 CLC 的 `mbarrier` |
+| barrier 完成后 | 查询 response，决定是否进入下一轮 |
+
+如果 response 在当前 tile 计算期间已经写好，worker 在 tile 结束时
+通常不需要再等待调度器。请求的延迟被计算覆盖了。
+
+### 二、为什么顺序不能反过来
+
+假设 grid scheduler 处理一次请求需要 40 us。考虑两种安排:
+
+```text
+先算后请求:
+compute tile 0  [120 us]
+try_cancel      [等待 40 us]  <- worker 空闲
+start tile 1
+```
+
+```text
+先请求后计算:
+try_cancel      [后台处理 40 us]
+compute tile 0  [120 us]
+wait barrier    [通常已经完成]
+start tile 1
+```
+
+可以把这次重叠可见的等待写成:
+
+```text
+visible_schedule_latency
+    = max(0, request_latency - current_tile_time)
+```
+
+例如:
+
+```text
+request_latency = 40 us
+current_tile_time = 120 us
+
+visible_schedule_latency = max(0, 40 - 120) = 0 us
+```
+
+如果当前 tile 只计算 20 us:
+
+```text
+visible_schedule_latency = max(0, 40 - 20) = 20 us
+```
+
+这说明重叠不是让调度变快，而是尽量把调度延迟藏在当前 tile 的
+计算时间下面。当前 tile 越长，调度延迟越容易完全隐藏。
+
+### 三、用一个 coordinate 走一轮
+
+假设当前 worker 正在处理:
+
+```text
+tile = (x, y, z) = (2, 0, 0)
+```
+
+它先提交下一块工作的请求，然后计算坐标 `(2, 0, 0)` 对应的 tile。
+请求在后台可能取消原来的 CTA 5，并返回:
+
+```text
+next_cta = (5, 0, 0)
+next_tile = decode(next_cta) = 5
+```
+
+当前 tile 完成后，worker 看到 `is_canceled == true`，于是把
+`tile` 更新为 5，进入下一轮。如果 `is_canceled == false`，说明当前
+没有可供接管的 pending launch，worker 结束循环。
+
+失败后不能再次提交 `try_cancel`。PTX 规定，一旦 CTA 观察到某次
+`try_cancel` 失败，再次发出该指令的行为是未定义的。
+
+### 四、这只是调度延迟的软件流水
+
+这个结构和 TMA pipeline 的直觉一致:
+
+| 操作 | 提前发起的动作 | 计算期间隐藏的延迟 |
+|---|---|---|
+| TMA load | 提前搬下一块数据 | global memory transfer latency |
+| CLC schedule | 提前请求下一块 coordinate | grid scheduler latency |
+
+两者都没有消除延迟，只是把延迟放到当前 tile 的计算旁边执行。
+
+伪代码省略了实际实现中的关键约束:
+
+```text
+barrier 初始化与 phase 翻转
+response buffer 的 proxy fence
+多个 in-flight request 的 buffer / arrival / tx-count 计数
+coordinate 从 elected thread 广播到整个 CTA 或 cluster
+```
+
+简单版本应当只保持一个 outstanding CLC request。等当前 response
+读取并完成跨 proxy 顺序处理后，下一轮才能复用同一个 response buffer
+和 barrier。想同时维护多个请求，就必须把每个请求的 barrier、
+response buffer、phase 和 transaction count 分开管理。
+
+最后需要注意的是，CLC 提前请求的是“可能成为下一块工作的 pending
+coordinate”，不是必然等于 `tile + 1`。只有当 `is_canceled` 为 true
+且 `get_first_ctaid` 返回有效结果时，worker 才真正获得下一块工作。
+
+## 十、当前进度
 
 `chapter_clc` 的知识点:
 
 ```text
 [x] The limits of a static persistent scheduler
 [x] One CLC request -> clusterlaunchcontrol.try_cancel.async
-[ ] Overlap the request with the current tile
+[x] Overlap the request with the current tile
 [ ] When to use CLC
 ```
 
@@ -583,11 +740,15 @@ CLC response 的 async-proxy 写入与 generic-proxy 读取
 generic proxy 与 async proxy 的抽象含义
 CLC response 的跨 proxy 读写顺序
 mbarrier 完成通知与 proxy fence 的分工
+在计算当前 tile 前提交 try_cancel
+用当前 tile 计算隐藏 grid scheduler 延迟
+先请求、再计算、最后等待的单请求软件流水
+CLC 单 outstanding request 的 buffer / barrier 复用约束
 ```
 
 下一知识点:
 
 ```text
 chapter_clc
--> Overlap the request with the current tile
+-> When to use CLC
 ```

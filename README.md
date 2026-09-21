@@ -241,6 +241,10 @@ CLC response 的 async-proxy 写入与 generic-proxy 读取
 generic proxy 与 async proxy 的抽象含义
 CLC response 的跨 proxy 读写顺序
 mbarrier 完成通知与 proxy fence 的分工
+在计算当前 tile 前提交 try_cancel
+用当前 tile 计算隐藏 grid scheduler 延迟
+先请求、再计算、最后等待的单请求软件流水
+CLC 单 outstanding request 的 buffer / barrier 复用约束
 ```
 
 完整文档索引、当前进度和硬件环境说明见
