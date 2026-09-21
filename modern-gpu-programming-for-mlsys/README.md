@@ -168,6 +168,21 @@ tid_in_wg 将 output row 映射到 thread
 tcgen05.wait.ld 与 TMEM -> register writeback
 relinquish_alloc_permit 与 tcgen05.dealloc
 chapter_intro_tirx 第一个单 tile GEMM Kernel
+tvm.compile、IRModule 与 tir_pipeline="tirx"
+LowerTIRx 展开 tile-level primitives
+检查 TIRx script 与最终 CUDA source
+编译后 Executable 直接接收 PyTorch tensors
+用 fp32 PyTorch 参考值验证 fp16 kernel 输出
+rtol / atol 逐元素误差判断
+编译、执行、数值错误的三层排查
+chapter_intro_tirx 完成
+```
+
+## 下一知识点
+
+```text
+chapter_tirx_layout_api
+-> TileLayout 的 S、R 与 offset
 ```
 
 ## 核心主线

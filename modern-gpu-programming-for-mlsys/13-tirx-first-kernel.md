@@ -665,9 +665,9 @@ tile-level primitive
 -> 具体硬件指令序列
 ```
 
-## 十五、下一步
+## 十五、进入编译验证前的环境边界
 
-下一知识点会实际编译这段 kernel，并用 PyTorch 参考结果验证：
+下一步要实际编译这段 kernel，并用 PyTorch 参考结果验证：
 
 ```text
 D = A × B^T
@@ -681,13 +681,353 @@ D = A × B^T
 macOS 上没有 CUDA / Blackwell 硬件，只能做概念和静态代码分析
 ```
 
-## 十六、当前进度
+## 十六、编译并验证结果
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_intro_tirx
+小节：编译并验证结果
+知识点：把 TIRx PrimFunc 编译成可执行模块，并用 PyTorch 参考结果检查数值
+上次：第一个 TIRx Kernel
+下次：chapter_tirx_layout_api -> TileLayout 的 S、R 与 offset
+运行时：CUDA + Blackwell sm_100a + apache-tvm==0.26.0 + cuda-bindings
+```
+
+上一节关注 kernel 的数据路径。这一节关注三个闭环问题：
+
+```text
+1. TIRx PrimFunc 如何进入编译流程？
+2. 编译结果如何接收 PyTorch tensors？
+3. 怎样判断结果只是浮点误差，还是 Layout / 同步写错了？
+```
+
+### 一、编译前先确认环境和导入
+
+课程要求：
+
+```bash
+pip install apache-tvm==0.26.0 cuda-bindings
+python -c "import tvm, tvm.tirx; print(tvm.__version__)"
+```
+
+两行命令分别验证：
+
+| 命令 | 验证内容 |
+|---|---|
+| `pip install ...` | TIRx 位于正确版本的 TVM wheel 中，且有 NVRTC CUDA bindings |
+| `import tvm, tvm.tirx` | Python 环境能找到 TVM 与 TIRx 模块 |
+
+这一步只证明 Python 依赖可用。它不证明：
+
+```text
+本机有 CUDA GPU
+GPU 架构是 sm_100a
+tcgen05 相关指令能够运行
+```
+
+课程示例需要 Blackwell GPU，例如 B200。目标不是任何 CUDA GPU 都能运行。
+
+### 二、从 PrimFunc 到可执行模块
+
+验证代码先建立目标：
+
+```python
+target = tvm.target.Target("cuda")
+device = torch.device("cuda")
+```
+
+`Target("cuda")` 告诉 TVM 生成 CUDA 代码。实际编译时会从当前设备检测
+具体架构，例如：
+
+```text
+sm_100a
+```
+
+`"a"` 后缀很重要。`tcgen05` 等架构特定能力依赖目标允许相应的
+architecture-specific 指令。
+
+然后：
+
+```python
+M, N, K = 128, 128, 64
+kernel = hgemm_v1(M, N, K)
+
+with target:
+    ex = tvm.compile(
+        tvm.IRModule({"main": kernel}),
+        target=target,
+        tir_pipeline="tirx",
+    )
+```
+
+数据流是：
+
+```text
+hgemm_v1(...)
+-> TIRx PrimFunc
+-> IRModule({"main": kernel})
+-> tvm.compile(...)
+-> LowerTIRx
+-> 更底层 TIR / CUDA C
+-> Executable
+```
+
+`IRModule` 是编译单元，`"main"` 是入口函数名。
+
+`tir_pipeline="tirx"` 很关键：
+
+```text
+它选择 TIRx lowering pipeline
+LowerTIRx 负责展开 Tx.cta.copy、Tx.gemm_async 等 tile-level primitives
+```
+
+如果不选这个 pipeline，高层 tile primitive 不会按 TIRx 的规则展开
+成预期的 `tcgen05.mma` 和 thread-level 控制流。
+
+编译成功后得到 Executable：
+
+```python
+ex
+```
+
+后面的：
+
+```python
+ex.mod(...)
+```
+
+是编译后模块的调用入口。
+
+### 三、编译前后可以看到什么
+
+课程建议分别检查两层代码：
+
+```python
+kernel.show()
+print(kernel.script())
+
+print(ex.mod.imports[0].inspect_source())
+```
+
+它们对应：
+
+| 层级 | 代码 | 可以看到什么 |
+|---|---|---|
+| 输入层 | `kernel.script()` | TIRx tile primitives、Scope、Layout、Dispatch |
+| 输出层 | `inspect_source()` | 最终 CUDA C、MMA、copy、barrier 与地址计算 |
+
+排查问题时，两层都要看：
+
+```text
+高层代码符合预期，不代表 lowering 后布局和同步也符合预期
+低层代码不符合预期时，通常要回到 layout、scope 和 dispatch 查找原因
+```
+
+例如，高层的 `Tx.gemm_async` 只描述一次 tile GEMM；编译后应该能看到
+按 K 维展开的多次 `tcgen05.mma`，以及对应的 descriptor 和 TMEM
+地址设置。
+
+### 四、编译后的模块直接接收 PyTorch tensors
+
+准备输入和输出：
+
+```python
+torch.cuda.empty_cache()
+torch.cuda.synchronize()
+
+A_tensor = torch.randn(M, K, dtype=torch.float16, device=device)
+B_tensor = torch.randn(N, K, dtype=torch.float16, device=device)
+D_tensor = torch.zeros(M, N, dtype=torch.float16, device=device)
+```
+
+Shape 与 kernel 声明一致：
+
+| Tensor | Shape | dtype | 角色 |
+|---|---|---|---|
+| `A_tensor` | `128 × 64` | `float16` | 左矩阵 |
+| `B_tensor` | `128 × 64` | `float16` | 右矩阵，按 `(N, K)` 存放 |
+| `D_tensor` | `128 × 128` | `float16` | 输出 |
+
+`torch.cuda.empty_cache()` 和 `torch.cuda.synchronize()` 用来清理缓存并
+确认此前 CUDA 工作已经结束，让这次验证在干净状态下开始。
+
+调用方式是：
+
+```python
+ex.mod(A_tensor, B_tensor, D_tensor)
+```
+
+课程强调，这里不需要手工把 PyTorch tensor 转成 DLPack 或其他中间
+格式。编译后的 TVM module 能直接接收这些 tensors，并按函数参数顺序
+绑定到：
+
+```text
+A -> A_tensor
+B -> B_tensor
+D -> D_tensor
+```
+
+这里 `D_tensor` 是预先分配的 output buffer。Kernel 不返回一个新
+PyTorch tensor，而是把结果写入传入的 `D_tensor`。
+
+### 五、构造参考结果
+
+PyTorch 参考实现：
+
+```python
+D_ref = (A_tensor.float() @ B_tensor.float().T).half()
+```
+
+它分三步：
+
+```text
+1. A_tensor / B_tensor 转成 float32
+2. 在 float32 中计算 A × B^T
+3. 把结果转回 float16
+```
+
+这与 kernel 的精度路径一致：
+
+```text
+输入: fp16 A / fp16 B
+accumulator: fp32 TMEM
+输出: fp16 D
+```
+
+不要把 fp16 输入直接当作“应当和 PyTorch 逐位相同”。即使都使用
+fp32 accumulator，Tensor Core 的 K 维拆分顺序和 PyTorch GEMM 的
+reduction 顺序也可能不同：
+
+```text
+浮点加法不满足结合律
+不同累加顺序会产生很小的舍入差异
+最后 round 到 fp16 时，差异可能保留下来
+```
+
+因此需要通过误差容限判断，而不是使用：
+
+```python
+(D_tensor == D_ref).all()
+```
+
+### 六、比较结果
+
+先计算最大绝对误差：
+
+```python
+max_err = float((D_tensor - D_ref).abs().max())
+print(f"Max error vs torch reference: {max_err:.6f}")
+```
+
+然后是完整的逐元素检查：
+
+```python
+torch.testing.assert_close(
+    D_tensor,
+    D_ref,
+    rtol=2e-2,
+    atol=1e-2,
+)
+print("PASS")
+```
+
+`assert_close` 要求每个元素满足：
+
+```text
+abs(actual - expected)
+    <= atol + rtol * abs(expected)
+```
+
+其中：
+
+| 参数 | 含义 | 当前值 |
+|---|---|---|
+| `rtol=2e-2` | 相对于参考值的大元素允许 2% 误差 | `0.02` |
+| `atol=1e-2` | 接近 0 的元素仍有绝对误差下限 | `0.01` |
+
+例如参考值为：
+
+```text
+expected = 8.0
+```
+
+允许误差为：
+
+```text
+0.01 + 0.02 × 8.0 = 0.17
+```
+
+参考值接近 0 时，`atol` 更重要；参考值较大时，`rtol` 占主导。
+
+`max_err` 适合快速观察最大偏差，而 `assert_close` 会检查全部
+`128 × 128 = 16384` 个元素。最终输出 `PASS`，说明这个随机输入下的
+结果落在课程设定的容限内。
+
+### 七、失败时按三层排查
+
+编译和验证可以分为三层，排查时不要混在一起：
+
+| 层次 | 失败表现 | 优先检查 |
+|---|---|---|
+| 编译层 | `import`、lowering 或 NVRTC 报错 | TVM 版本、`cuda-bindings`、target、`tir_pipeline="tirx"` |
+| 执行层 | launch 失败、非法指令、越界 | GPU 是否为 Blackwell `sm_100a`、`tcgen05` 目标支持、TMEM/SMEM 生命周期 |
+| 数值层 | 能运行，但结果错误 | Scope、Layout、descriptor、sync、phase，最后才是浮点容限 |
+
+数值错误还可以继续缩小范围：
+
+```text
+只有少数行列错
+    -> 优先查 lane / row / register mapping
+
+整块 tile 错位
+    -> 优先查 SMEM swizzle 与 MMA descriptor
+
+结果偶发变化
+    -> 优先查 barrier phase、wait 和 release 顺序
+
+误差小但普遍存在
+    -> 更可能来自 fp16 输出与累加顺序
+```
+
+这也说明为什么前一节要区分三类语义：
+
+```text
+Scope 错了 -> 多线程、少线程或等待错误
+Layout 错了 -> 数值有规律地错位
+Dispatch 错了 -> 可能无法编译或运行
+```
+
+### 八、本机执行边界
+
+当前学习机器是 Apple M5 Pro，没有 CUDA 和 Blackwell GPU。因此这里可以
+完成：
+
+```text
+阅读 kernel
+检查 TIRx 源码与 lowering 逻辑
+理解编译接口和参考结果验证流程
+```
+
+不能在本机完成：
+
+```text
+运行 sm_100a 代码
+执行 tcgen05.mma
+检查真实 GPU 数值结果
+做真实性能测量
+```
+
+实际运行这份代码时，应使用支持 Blackwell 的 CUDA 环境。
+
+## 十七、当前进度
 
 `chapter_intro_tirx` 的知识点：
 
 ```text
 [x] 第一个 TIRx Kernel
-[ ] 编译并验证结果
+[x] 编译并验证结果
 ```
 
 已经覆盖：
@@ -712,11 +1052,20 @@ Tx.wg.copy_async 搬 TMEM -> registers
 tcgen05.wait.ld 等待异步 load 完成
 Tx.cast 与 per-thread row writeback
 relinquish_alloc_permit 与 tcgen05.dealloc
+tvm.compile 与 IRModule 的入口函数绑定
+tir_pipeline="tirx" 选择 TIRx lowering pipeline
+LowerTIRx 将 tile-level primitive 展开为底层 TIR
+kernel.script() 与 inspect_source() 的两层检查
+Executable module 直接接收 PyTorch tensors
+PyTorch float32 参考结果与 fp16 输出比较
+rtol / atol 的逐元素误差判断
+编译、执行、数值错误的三层排查
+chapter_intro_tirx 完成
 ```
 
 下一知识点：
 
 ```text
-chapter_intro_tirx
--> 编译并验证结果
+chapter_tirx_layout_api
+-> TileLayout 的 S、R 与 offset
 ```

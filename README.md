@@ -257,6 +257,8 @@ TIRx Scope / Layout / Dispatch
 单 tile GEMM 的 A/B 与 D 数据路径
 TIRx SMEMPool、mbarrier 与 TMEM 生命周期
 chapter_intro_tirx 第一个单 tile GEMM Kernel
+TIRx 编译、Executable 调用与 PyTorch 数值验证
+chapter_intro_tirx 完成
 ```
 
 完整文档索引、当前进度和硬件环境说明见
