@@ -225,6 +225,8 @@ chapter_tmem 完成
 mbarrier 的 arrival、pending count 与 phase parity
 phase 完成后进入下一轮，consumer 等待当前 round 的 parity
 双 stage pipeline 中 stage barrier 与 phase_tma 的关系
+threads 写 SMEM 后通过 fence.proxy.async 交接给 TMA
+generic proxy 与 async proxy 的可见性边界
 ```
 
 完整文档索引、当前进度和硬件环境说明见
