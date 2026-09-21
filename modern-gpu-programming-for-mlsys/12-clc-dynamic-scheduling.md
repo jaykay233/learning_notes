@@ -229,13 +229,270 @@ CLC 调度：由硬件返回一个尚未启动的 CTA 或 cluster coordinate
 时，重点是让所有已驻留 worker 尽可能保持忙碌，避免只剩少数 worker
 处理 launch tail。
 
-## 八、当前进度
+## 八、一次 CLC 请求
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_clc
+小节：一次 CLC 请求
+知识点：clusterlaunchcontrol.try_cancel.async 的提交、16-byte response 与 mbarrier 完成通知
+上次：静态 persistent scheduler 的 launch tail 与工作不均衡
+下次：把 CLC 请求与当前 tile 的计算重叠
+PTX：9.7.15.18 clusterlaunchcontrol.try_cancel
+     9.7.15.19 clusterlaunchcontrol.query_cancel
+```
+
+上一课已经说明静态 scheduler 为什么会产生 launch tail。CLC 允许
+运行中的 CTA 或 cluster 请求取消一个尚未启动的 launch，并接管其
+coordinate。本课只讲一次请求内部发生了什么。
+
+### 一、请求的对象是 pending cluster launch
+
+PTX 的核心指令是:
+
+```text
+clusterlaunchcontrol.try_cancel.async.mbarrier::complete_tx::bytes.b128 [addr], [mbar];
+```
+
+各部分的含义如下:
+
+| 部分 | 含义 |
+|---|---|
+| `clusterlaunchcontrol.try_cancel` | 请求取消一个尚未开始的 cluster launch |
+| `.async` | 异步提交请求，发出后线程继续执行 |
+| `.mbarrier::complete_tx::bytes` | 完成后用 `complete-tx` 更新指定 `mbarrier` |
+| `.b128` | 结果是一条 16-byte opaque response |
+| `[addr]` | response 写入的 shared memory 地址，必须 16-byte 自然对齐 |
+| `[mbar]` | 用于报告异步完成的 `mbarrier` |
+
+这里的 `cancel` 不是杀掉正在运行的 CTA。被取消对象必须还没有开始
+执行，因此没有执行状态需要迁移。硬件取消成功后，只把原 launch 的
+coordinate 返回给请求者。
+
+### 二、response 是不透明的 16-byte handle
+
+硬件不会直接把一个普通整数写回寄存器，而是在 shared memory 中写
+一条 16-byte 记录:
+
+```text
+[addr] + 0  ... [addr] + 15
++--------------------------------+
+|      16-byte opaque handle     |
++--------------------------------+
+```
+
+应用代码不能自行解释这些 bit。它必须把整条 handle 读到 16-byte
+register，再交给:
+
+```text
+clusterlaunchcontrol.query_cancel.is_canceled
+```
+
+只有当结果 predicate 为 true 时，才可以执行:
+
+```text
+clusterlaunchcontrol.query_cancel.get_first_ctaid
+```
+
+取得被取消 cluster 第一个 CTA 的 `(x, y, z)` coordinate。
+
+例如使用一维 launch:
+
+```text
+grid = 12 CTAs
+blockIdx.x = i 的 CTA 负责 tile i
+CTA 0 当前计算 tile 0
+```
+
+CTA 0 发出请求后，硬件可能取消原来的 CTA 3:
+
+```text
+被取消的 coordinate:
+(x, y, z) = (3, 0, 0)
+
+tile 映射:
+tile = x = 3
+```
+
+这样 CTA 0 后续可以计算 tile 3。
+
+如果请求失败，`get_first_ctaid` 的结果无效。PTX 还规定，一个 CTA
+一旦观察到 `try_cancel` 失败，再次发出 `try_cancel` 的行为是未
+定义的。因此失败后应结束取任务循环，而不是继续重试。
+
+### 三、异步完成必须通过 mbarrier 观察
+
+指令发出后，线程可以继续执行，但此时 response 可能还没有写完:
+
+```text
+try_cancel 提交
+    -> 线程继续执行
+    -> response 尚未可用
+    -> 不能读取 [addr]
+```
+
+CLC 使用与 TMA load 相似的完成机制。请求需要同时满足:
+
+```text
+arrival 条件
+    发起请求的一方报告约定次数的 arrival
+
+transaction 条件
+    硬件写完 16-byte response
+    通过 complete-tx 减去 16 bytes
+```
+
+`mbarrier` 的 phase 完成条件可以写成:
+
+```text
+pending arrivals == 0
+&&
+pending transaction bytes == 0
+```
+
+只选择一个 thread 发起请求时，概念上可以写成下面的伪代码:
+
+```text
+mbarrier.init(bar, 1)
+
+elected thread:
+    mbarrier.arrive.expect_tx(bar, 16)
+    clusterlaunchcontrol.try_cancel... [response], [bar]
+
+hardware:
+    response 写完
+    complete_tx(bar, 16)
+```
+
+这里需要分清两件事:
+
+```text
+try_cancel 指令负责 complete-tx(response bytes)
+arrival 仍需由发起方按 mbarrier 协议提供
+```
+
+因此不能只初始化 barrier 而不提供对应 arrival。否则即使 response
+已经写完，phase 也可能无法完成。
+
+### 四、一次请求的状态变化
+
+| 阶段 | 执行者 | `mbarrier` 状态变化 | 是否可以读 response |
+|---|---|---|---|
+| 初始化 | 一个 thread | `pending arrival = 1` | 否 |
+| 登记请求 | elected thread | `arrival` 减少，`tx-count += 16` | 否 |
+| 发出请求 | elected thread | 指令异步执行 | 否 |
+| 写入 response | 硬件 async proxy | response 写入 SMEM | 否 |
+| 报告完成 | 硬件 | `tx-count -= 16` | phase 完成后才可以 |
+| 读取 handle | worker threads | 不变 | 是 |
+| 查询结果 | worker threads | 不变 | 由 `is_canceled` 决定 |
+
+这里仍然沿用上一章的 phase 思想:
+
+```text
+等待 CLC barrier 完成
+不是只等 response 写完
+还要等约定的 arrival 条件满足
+```
+
+### 五、多个 thread 会产生多个独立请求
+
+通常只选择一个 thread 提交请求:
+
+```text
+if elected:
+    issue one request
+```
+
+如果多个 thread 都执行这条指令，它们会产生多个独立取消请求。
+此时必须准备多个 response 位置，并分别计入:
+
+```text
+request count
+response buffer count
+mbarrier arrival count
+mbarrier tx-count
+```
+
+例如两个请求，每个 response 16 bytes:
+
+```text
+response 0: 16 bytes
+response 1: 16 bytes
+
+tx-count 需求 = 16 + 16 = 32 bytes
+arrival 需求 = 2
+```
+
+否则可能出现:
+
+```text
+barrier 等两个 arrival，但只有一个请求
+两个请求只准备一个 response buffer
+response 写入位置互相覆盖
+tx-count 只登记 16，却会完成 32 bytes
+```
+
+### 六、response 写入与普通线程读取跨越 proxy
+
+CLC response 由硬件通过 async proxy 写入 shared memory，普通 thread
+则通过 generic proxy 读取 handle:
+
+```text
+硬件 async proxy 写 response
+        |
+    mbarrier 完成通知
+        |
+thread generic proxy 读 handle
+        |
+query_cancel 解析 handle
+```
+
+等待 `mbarrier` 能确认异步操作已经完成，但跨 proxy 的缓冲区复用
+还要遵守 PTX 的 fence 要求。读取完 response 后，代码需要建立本轮
+generic read 已经结束的顺序，再允许下一轮 async write 覆盖同一个
+`[addr]`。
+
+在本课只需要先记住:
+
+```text
+CLC response 不是普通 thread 写的
+CLC 完成不能只靠普通 ld.shared 判断
+必须使用 mbarrier 完成通知和 query_cancel
+```
+
+### 七、本课边界
+
+这里已经走完一条请求的生命周期:
+
+```text
+提交 try_cancel
+等待 mbarrier
+读取 16-byte handle
+query_cancel.is_canceled
+成功时 get_first_ctaid
+失败时结束取任务
+```
+
+下一课要解决:
+
+```text
+什么时候发请求
+为什么要提前发
+请求等待期间 worker 应该做什么
+```
+
+答案是提前发出下一块工作的请求，让 grid scheduler 的延迟与当前
+tile 的计算重叠。
+
+## 九、当前进度
 
 `chapter_clc` 的知识点:
 
 ```text
 [x] The limits of a static persistent scheduler
-[ ] One CLC request -> clusterlaunchcontrol.try_cancel.async
+[x] One CLC request -> clusterlaunchcontrol.try_cancel.async
 [ ] Overlap the request with the current tile
 [ ] When to use CLC
 ```
@@ -249,11 +506,16 @@ worker 延迟启动造成 launch tail
 不同 tile 成本造成 worker 负载不均衡
 CTA launch queue 与软件工作队列的区别
 CLC 取消 pending launch 并接管 coordinate 的基本模型
+clusterlaunchcontrol.try_cancel.async 的 16-byte response
+CLC request 的 mbarrier arrival 与 complete-tx 完成条件
+clusterlaunchcontrol.query_cancel 的 is_canceled 与 get_first_ctaid
+多个 thread 提交 CLC request 时的 response 与 barrier 计数
+CLC response 的 async-proxy 写入与 generic-proxy 读取
 ```
 
 下一知识点:
 
 ```text
 chapter_clc
--> One CLC request -> clusterlaunchcontrol.try_cancel.async
+-> Overlap the request with the current tile
 ```

@@ -131,6 +131,11 @@ chapter_async_barriers 完成
 worker 延迟启动与 tile 成本不均衡
 CTA launch queue 与软件工作队列的区别
 CLC 取消 pending launch 并接管 coordinate 的基本模型
+clusterlaunchcontrol.try_cancel.async 的 16-byte response
+CLC request 的 mbarrier arrival 与 complete-tx 完成条件
+clusterlaunchcontrol.query_cancel 的 is_canceled 与 get_first_ctaid
+多个 thread 提交 CLC request 时的 response 与 barrier 计数
+CLC response 的 async-proxy 写入与 generic-proxy 读取
 ```
 
 ## 核心主线
@@ -167,7 +172,6 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 TMA producer / consumer warp specialization
-chapter_clc 的一次 CLC 请求与异步 response
 chapter_clc 的请求与当前 tile 计算重叠
 chapter_clc 的适用场景与动态 tile scheduler 封装
 ```
