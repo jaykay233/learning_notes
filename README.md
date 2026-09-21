@@ -13,6 +13,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`communication/`](communication/) | GPU 通信提交、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
+| [`quantization/`](quantization/) | LLM 低比特量化、W4A8KV4、QoQ、KV4 Attention 与 SmoothAttention |
 
 ## 目录总览
 
@@ -43,6 +44,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 06-warp-tile-and-k-pipeline.md
 ├── 07-hopper-wgmma-and-blackwell-tmem.md
 └── 08-tma-tile-copy-and-synchronization.md
+quantization/                # LLM 低比特量化与推理系统
+└── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
 speculative-decoding/        # 投机解码
@@ -163,6 +166,7 @@ models/
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
 | GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
+| LLM 量化 / W4A8KV4 / QoQ / KV4 / SmoothAttention | [quantization/01-qoq-w4a8kv4.md](quantization/01-qoq-w4a8kv4.md) |
 | torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |
@@ -203,6 +207,16 @@ TMA tile copy / swizzle / pipeline / descriptor / mbarrier / bulk group
 
 完整文档索引、当前进度和硬件环境说明见
 [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md)。
+
+---
+
+## Quantization
+
+围绕 LLM 低比特推理量化与系统协同设计展开：
+
+| 文档 | 内容 |
+|---|---|
+| [01-qoq-w4a8kv4.md](quantization/01-qoq-w4a8kv4.md) | QServe 的 QoQ：W4A8KV4、渐进式分组量化、计算感知权重重排、KV4 Attention 与 SmoothAttention |
 
 ---
 
