@@ -25,6 +25,7 @@ cta_group::1, M=128 的直接 accumulator 映射
 cta_group::1, M=64 的 Layout F
 cta_group::2, M=128 dense A 的 Layout B
 cta_group::2, M=256 的 accumulator 切分
+block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 ```
 
 ## 目标
@@ -969,7 +970,219 @@ M=128 dense A Layout B:
     N 的 lower / upper half 折到 Lane 0..63 / 64..127
 ```
 
-## 九、当前进度
+## 九、block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
+
+```text
+本次讲解位置
+章节：chapter_tensor_cores
+小节：Block-Scaled MMA
+知识点：SFA/SFB 跨 CTA pair 的 shard / replicate
+上次：cta_group::2, M=128 dense A 的 Layout B
+下次：tcgen05 指令之间的 scope / layout / completion 三层契约
+PTX：9.7.18.10.7 Block Scaling for tcgen05.mma；9.7.18.9.2 tcgen05.cp
+```
+
+前面已经学过 SFA/SFB 的含义：
+
+```text
+SFA(M, SFK)
+    为 A 的每个 row 和 K-scale block 提供 scale
+
+SFB(N, SFK)
+    为 B 的每个 column 和 K-scale block 提供 scale
+```
+
+对于输出坐标 `C[m, n]`：
+
+```text
+SFA[m, sfk] 缩放 A 的这一行
+SFB[n, sfk] 缩放 B 的这一列
+```
+
+现在增加一个新的条件：MMA 使用 `cta_group::2`。这时 A、B、C 和
+scale factor 都要面对 CTA pair 的分布问题。核心原则是：
+
+```text
+谁计算哪些 C 行，谁就需要对应的 SFA 行
+
+谁需要完整 N 方向参与计算，谁就需要完整的 SFB
+```
+
+### 以课程中的 M=256 为例
+
+上一节已经知道 `M=256` accumulator 的切分：
+
+```text
+even CTA: C rows 0..127
+odd CTA:  C rows 128..255
+```
+
+因此，SFA 也按相同的 M 范围切分：
+
+```text
+even CTA: SFA[0:128,   :]
+odd CTA:  SFA[128:256, :]
+```
+
+这叫 SFA 沿 M 方向 **shard**：
+
+```text
+even CTA 不需要保存 odd CTA 的 SFA rows
+odd CTA  也不需要保存 even CTA 的 SFA rows
+```
+
+| CTA | 负责的 C rows | 本地需要的 SFA |
+|---|---|---|
+| even | `0..127` | `SFA[0:128, :]` |
+| odd | `128..255` | `SFA[128:256, :]` |
+
+### 为什么 SFB 要在两个 CTA 中各有一份
+
+课程图中使用一种常见实现：
+
+```text
+even CTA 的 SMEM 保存 B 的一半 N columns
+odd CTA  的 SMEM 保存 B 的另一半 N columns
+```
+
+但 `cta_group::2` MMA 作为 pair-wide 操作，消费的是完整的 B tile。
+even CTA 虽然只计算 M 的前 128 行，仍然需要与完整的 N columns
+组合。odd CTA 也同理。
+
+所以每个 CTA 本地都需要：
+
+```text
+SFB[0:N, :]
+```
+
+这不是把偶数 N 的 scale 放在 even CTA、奇数 N 的 scale 放在
+odd CTA，而是把完整的 SFB 复制到 pair 两边：
+
+```text
+even CTA TMEM: SFB[0:N, :]
+odd CTA TMEM:  SFB[0:N, :]
+```
+
+这里可以用一个坐标例子记忆。设 `N=128`，考虑：
+
+```text
+C[10, 11]
+C[200, 11]
+```
+
+它们所需的 scale factor 是：
+
+| 输出元素 | CTA | 本地 SFA | 本地 SFB |
+|---|---|---|---|
+| `C[10, 11]` | even | `SFA[10, :]` | `SFB[11, :]` |
+| `C[200, 11]` | odd | `SFA[200, :]` | `SFB[11, :]` |
+
+`SFA[10, :]` 只在 even CTA 需要，`SFA[200, :]` 只在 odd CTA
+需要；但 `SFB[11, :]` 在两边都需要。
+
+### SFA/SFB 怎样被布置到 CTA pair
+
+常见路径是：
+
+```text
+SFA/SFB
+  -> global memory
+  -> SMEM
+  -> tcgen05.cp
+  -> TMEM
+  -> tcgen05.mma
+```
+
+在 CTA pair 这一层：
+
+```text
+SFA:
+    按 M 方向 shard
+
+SFB:
+    multicast / replicate 到 pair 中两个 CTA 的本地 SMEM
+```
+
+接下来，`tcgen05.cp.cta_group::2` 根据 pair scope，把每个 CTA
+自己 SMEM 中的 scale 数据复制到自己的本地 TMEM。每个 CTA 的
+TMEM 仍然是独立的，不会因为 `cta_group::2` 变成一个共享地址空间。
+
+### CTA 内部还有一层 `.warpx4` 复制
+
+完成 CTA pair 之间的分片和复制后，每个 CTA 内部还会把基础
+32-lane scale layout 复制到四个 32-lane partitions：
+
+```text
+TLane 0..31
+TLane 32..63
+TLane 64..95
+TLane 96..127
+```
+
+`tcgen05.cp.32x128b.warpx4` 的复制偏移可以写成：
+
+```text
+copy 0: TLane + 0
+copy 1: TLane + 32
+copy 2: TLane + 64
+copy 3: TLane + 96
+```
+
+例如基础位置在 `TLane 10` 的一个 scale，复制后出现在：
+
+```text
+TLane 10
+TLane 42
+TLane 74
+TLane 106
+```
+
+这四个位置承载的是同一个逻辑 scale 的物理副本，不是四个不同的
+数学 scale。
+
+### 一定要区分两级复制
+
+```text
+CTA pair 级:
+    SFA 按 M shard
+    SFB 按当前 B 的分布，在 pair 中 replicated 或 multicast
+
+CTA 内部级:
+    SFA/SFB 的 32-lane base tile
+    通过 .warpx4 复制到四个 32-lane TMEM partitions
+```
+
+因此，“SFA 是 sharded，SFB 是 replicated”描述的是 CTA pair
+这一级；“两者在 CTA 内部还都广播到四个 partitions”描述的是
+第二级。两层同时成立，并不矛盾。
+
+### 适用范围
+
+上面“SFA 沿 M shard，SFB 完整复制到每个 CTA”的具体形式，对应
+课程图中的 `M=256` 和 B 按 N 分半放入两个 CTA 的实现。一般规则是：
+
+```text
+scale factor 的放置，必须跟随 A/B 在 CTA pair 中的切分和复用方式
+```
+
+如果 kernel 改变 B 的 SMEM 分布、N 的 multicast 方式或 MMA
+scope，SFB 的本地副本范围也要随之重新检查。不能只记住“SFA
+分片、SFB 复制”这句话而不核对 operand 划分。
+
+一句话记忆：
+
+```text
+SFA:
+    每个 CTA 只拿自己负责的 M rows
+
+SFB:
+    每个需要完整 B 的 CTA 都要拿到完整 SFB
+
+CTA 内部:
+    .warpx4 再把本地 scale layout 广播到四个 32-lane partitions
+```
+
+## 十、当前进度
 
 ### 本章剩余知识点
 
@@ -981,14 +1194,14 @@ data-path 知识点：
 [x] cta_group::1, M=64，非 .ws 的 Layout F
 [x] cta_group::2, M=256，M rows 在 CTA pair 上连续切分
 [x] cta_group::2, M=128 dense A 的 Layout B
-[ ] block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
+[x] block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 [ ] tcgen05 指令之间的 scope / layout / completion 三层契约
 ```
 
 其中 sparse A 会把 `cta_group::2, M=128` 的 accumulator layout
 从 Layout B 改为 Layout C，因此需要和 dense A 对比理解。
 
-学完 M128 dense A 的 Layout B 后，本章还剩 2 个主知识点。
+学完 SFA/SFB 跨 CTA pair 放置后，本章还剩 1 个主知识点。
 
 `chapter_tensor_cores` 正在进行中：
 
@@ -1008,10 +1221,11 @@ cta_group::1, M=128 的直接 accumulator 映射
 cta_group::1, M=64 的 Layout F
 cta_group::2, M=256 的 CTA pair accumulator 切分
 cta_group::2, M=128 dense A 的 Layout B
+block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 ```
 
 下一知识点：
 
 ```text
-block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
+tcgen05 指令之间的 scope / layout / completion 三层契约
 ```
