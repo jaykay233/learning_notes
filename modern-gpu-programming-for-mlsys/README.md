@@ -95,7 +95,8 @@ cta_group::1, M=64 的 Layout F
 cta_group::2, M=256 的 CTA pair accumulator 切分
 cta_group::2, M=128 dense A 的 Layout B
 block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
-chapter_tensor_cores 进行中
+tcgen05 指令之间的 scope / layout / completion 三层契约
+chapter_tensor_cores 完成
 ```
 
 ## 核心主线
@@ -131,6 +132,6 @@ TMEM lane / column 不匹配
 
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
-tcgen05 cta_group accumulator mappings
 TMA producer / consumer warp specialization
+chapter_tmem 的 allocation / access / ld-st
 ```

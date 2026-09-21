@@ -212,6 +212,8 @@ cta_group::1, M=64 的 Layout F
 cta_group::2, M=256 的 CTA pair accumulator 切分
 cta_group::2, M=128 dense A 的 Layout B
 block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
+tcgen05 指令之间的 scope / layout / completion 三层契约
+chapter_tensor_cores 完成
 ```
 
 完整文档索引、当前进度和硬件环境说明见

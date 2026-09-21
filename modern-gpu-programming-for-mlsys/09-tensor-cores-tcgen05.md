@@ -26,6 +26,7 @@ cta_group::1, M=64 的 Layout F
 cta_group::2, M=128 dense A 的 Layout B
 cta_group::2, M=256 的 accumulator 切分
 block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
+tcgen05 指令之间的 scope / layout / completion 三层契约
 ```
 
 ## 目标
@@ -1140,6 +1141,127 @@ TLane 106
 这四个位置承载的是同一个逻辑 scale 的物理副本，不是四个不同的
 数学 scale。
 
+### 补充：`.warpx4` 是怎么出现的
+
+```text
+本次讲解位置
+章节：chapter_tensor_cores
+小节：Block-Scaled MMA
+知识点：tcgen05.cp.32x128b.warpx4 的复制来源
+上次：SFA/SFB 跨 CTA pair 的 shard / replicate
+下次：tcgen05 指令之间的 scope / layout / completion 三层契约
+PTX：9.7.18.9.2 tcgen05.cp；9.7.18.10.7 Block Scaling for tcgen05.mma
+```
+
+`.warpx4` 不是任意选择的选项，而是由 base shape 和 MMA 的 TMEM
+访问方式共同决定的。
+
+先看一个具体的 SFA：
+
+```text
+M = 128
+SFK = 4
+每个 scale 占 1 byte
+```
+
+它总共有：
+
+```text
+128 rows * 4 bytes = 512 bytes
+```
+
+`tcgen05.cp.32x128b` 的基础 shape 是：
+
+```text
+32 lanes * 128 bits/lane
+= 32 * 16 bytes
+= 512 bytes
+```
+
+两边大小相同，所以一个 `32x128b` base tile 正好能装下完整的
+`SFA(128, 4)`。但注意，base tile 只有 32 个 Lane rows，而逻辑
+SFA 有 128 行，因此不能直接写成：
+
+```text
+TLane = m
+```
+
+需要把 128 个 M rows 打包进 32 个 Lane rows 和多个 TCol：
+
+```text
+local_lane = m % 32
+Mgroup     = m // 32
+TCol       = Mgroup
+byte       = sfk
+```
+
+以 `SFA[64, 2]` 为例：
+
+```text
+local_lane = 64 % 32 = 0
+Mgroup     = 64 // 32 = 2
+TCol       = 2
+byte       = 2
+```
+
+它一开始只存在于 base tile 的：
+
+```text
+(TLane, TCol, byte) = (0, 2, 2)
+```
+
+但 block-scaled `tcgen05.mma` 读取 TMEM 时，会按四个 32-lane
+partition 工作：
+
+```text
+partition 0: TLane 0..31
+partition 1: TLane 32..63
+partition 2: TLane 64..95
+partition 3: TLane 96..127
+```
+
+每个 partition 都必须能提供完整的 scale-factor tile。因此，PTX
+规定 `.32x128b` 必须搭配 `.warpx4`：
+
+```text
+tcgen05.cp.32x128b.warpx4
+```
+
+`.warpx4` 把上面的 base tile 广播到四个 warp windows：
+
+```text
+TLane = local_lane + 32 * p
+p = 0, 1, 2, 3
+```
+
+所以 `SFA[64, 2]` 在 `.warpx4` 之后出现在：
+
+```text
+(TLane, TCol, byte) = (0,  2, 2)
+(TLane, TCol, byte) = (32, 2, 2)
+(TLane, TCol, byte) = (64, 2, 2)
+(TLane, TCol, byte) = (96, 2, 2)
+```
+
+这里最容易混淆的是两组“四个”：
+
+| “四个” | 所在方向 | 作用 |
+|---|---|---|
+| `Mgroup = 0..3` | 沿 TCol 排列 | 把 128 个逻辑 M rows 打包进 32 lanes |
+| `p = 0..3` | 沿 TLane 排列 | 把完整 base tile 复制到四个 partitions |
+
+一句话记忆：
+
+```text
+32x128b:
+    一个 base tile 只有 32 个 Lane rows
+    但装得下完整的 128-row SFA
+
+warpx4:
+    把这个完整 base tile 再复制到四个 32-lane partitions
+    让 MMA 的每个 partition 都能读到完整 scale layout
+```
+
 ### 一定要区分两级复制
 
 ```text
@@ -1182,7 +1304,152 @@ CTA 内部:
     .warpx4 再把本地 scale layout 广播到四个 32-lane partitions
 ```
 
-## 十、当前进度
+## 十、tcgen05 指令之间的 scope / layout / completion 三层契约
+
+```text
+本次讲解位置
+章节：chapter_tensor_cores
+小节：Handing Data Between tcgen05 Instructions
+知识点：tcgen05 指令之间的 scope / layout / completion 三层契约
+上次：tcgen05.cp.32x128b.warpx4 的复制来源
+下次：chapter_tmem -> The TMEM Allocation Lifecycle
+PTX：9.7.18.5 Issue Granularity；9.7.18.6 Memory Consistency Model；9.7.18.9.2 tcgen05.cp；9.7.18.10 tcgen05.mma
+```
+
+到这里，`tcgen05.cp`、`tcgen05.mma`、`tcgen05.commit`、
+`tcgen05.ld` 和 `tcgen05.wait` 已经分别学过。最后需要把它们
+串成一个完整的异步数据流。
+
+连接这些指令时，必须同时满足三个条件：
+
+```text
+scope:      这条指令操作哪个 CTA 或 CTA pair 的资源
+layout:     producer 写出的 TMEM 坐标是否匹配 consumer 的读取坐标
+completion: consumer 是否在 producer 完成后才读取数据
+```
+
+可以简写为：
+
+```text
+scope      = 谁
+layout     = 在哪里
+completion = 什么时候可以读
+```
+
+### Scope：操作哪个 CTA 的资源
+
+`scope` 由 `cta_group` 和发起指令的线程共同确定：
+
+| Scope | 操作范围 |
+|---|---|
+| `cta_group::1` | 当前 CTA |
+| `cta_group::2` | 当前 CTA 和 peer CTA 组成的 pair |
+
+例如 block-scaled MMA 中：
+
+```text
+tcgen05.cp.cta_group::2
+    -> 两个 CTA 都从自己的 SMEM 复制到自己的 TMEM
+
+tcgen05.mma.cta_group::2
+    -> pair-wide MMA 读取 pair scope 内的 operand
+```
+
+如果 scope 写错，数据可能被复制到错误的 CTA，或者 MMA 读取了
+不符合预期的 peer CTA 资源。
+
+### Layout：producer 和 consumer 的坐标必须一致
+
+`layout` 不只是“有没有数据”，而是数据放在哪个：
+
+```text
+CTA
+TLane
+TCol
+byte / word packing
+```
+
+例如 `tcgen05.cp` 把 SFA 放进 TMEM 后，block-scaled `tcgen05.mma`
+必须按照相同的 TMEM address、partition layout、TCol 和 scale byte
+约定读取它。同理，`tcgen05.mma` 写 accumulator 时使用 Layout A/B/C，
+后续 `tcgen05.ld` 必须用匹配的 layout 读取 C tile。
+
+如果 scope 正确但 layout 错了，硬件不会自动帮你做逻辑坐标转换：
+
+```text
+数据可能确实在 TMEM 中
+但 MMA 读到的是另一个 TLane / TCol
+最后表现为结果错位、scale 用错或部分数据为零
+```
+
+### Completion：异步指令完成后才能安全消费
+
+`tcgen05` 操作通常是异步的。发出指令不代表下一条指令立即可以
+使用结果。不同 producer / consumer 组合使用不同的完成和排序机制：
+
+```text
+tcgen05.mma
+    -> tcgen05.commit
+    -> mbarrier wait
+    -> epilogue 读取 accumulator
+
+tcgen05.ld
+    -> tcgen05.wait::ld
+    -> 使用 destination registers
+
+tcgen05.cp -> tcgen05.mma
+    -> 满足 PTX 规定的同 scope、同地址和流水线依赖条件
+```
+
+这里的 completion 可能是显式 wait、commit + mbarrier，也可能是
+PTX 定义的 implicit pipeline dependency。不能在没有依据的情况下
+假设“上一条已经自动完成”。
+
+### 用一个 block-scaled 流程串起来
+
+```text
+1. SFA/SFB: SMEM -> tcgen05.cp -> TMEM
+   scope:      正确的 CTA / pair
+   layout:     32x128b + warpx4 + scale packing
+
+2. tcgen05.mma 读取 A/B/SFA/SFB
+   scope:      cta_group::2
+   layout:     A/B descriptor、SFA/SFB TMEM layout、accumulator layout
+
+3. tcgen05.commit + mbarrier
+   completion: 确认 MMA 已写入 TMEM accumulator
+
+4. tcgen05.ld 读取 accumulator
+   layout:     CTA、TLane、TCol 必须匹配 MMA 的写回布局
+
+5. tcgen05.wait::ld
+   completion: 确认寄存器已经收到 TMEM 数据
+```
+
+### 三类错误的定位方式
+
+| 失败条件 | 典型表现 | 先检查什么 |
+|---|---|---|
+| scope 错 | 读错 CTA、peer 数据不可见 | `cta_group`、elected thread、pair 关系 |
+| layout 错 | 结果错位、scale 错配、部分元素异常 | `TLane`、`TCol`、descriptor、copy shape |
+| completion 错 | 偶发旧数据、数据竞争、pipeline 不稳定 | commit、mbarrier、wait、流水线依赖 |
+
+真正的 `tcgen05` kernel 不是“把几个指令按顺序写下来”就够了，而是
+要同时维护这三个契约：
+
+```text
+scope:      资源范围正确
+layout:     坐标和 packing 正确
+completion: 依赖和时序正确
+```
+
+一句话记忆：
+
+```text
+scope 决定谁做，layout 决定放哪，completion 决定何时能读
+```
+
+## 十一、当前进度
 
 ### 本章剩余知识点
 
@@ -1195,15 +1462,15 @@ data-path 知识点：
 [x] cta_group::2, M=256，M rows 在 CTA pair 上连续切分
 [x] cta_group::2, M=128 dense A 的 Layout B
 [x] block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
-[ ] tcgen05 指令之间的 scope / layout / completion 三层契约
+[x] tcgen05 指令之间的 scope / layout / completion 三层契约
 ```
 
 其中 sparse A 会把 `cta_group::2, M=128` 的 accumulator layout
 从 Layout B 改为 Layout C，因此需要和 dense A 对比理解。
 
-学完 SFA/SFB 跨 CTA pair 放置后，本章还剩 1 个主知识点。
+这 6 个主知识点已经全部完成。
 
-`chapter_tensor_cores` 正在进行中：
+`chapter_tensor_cores` 已覆盖：
 
 ```text
 tcgen05.mma 的单 thread 发起语义
@@ -1222,10 +1489,12 @@ cta_group::1, M=64 的 Layout F
 cta_group::2, M=256 的 CTA pair accumulator 切分
 cta_group::2, M=128 dense A 的 Layout B
 block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
+tcgen05 指令之间的 scope / layout / completion 三层契约
+chapter_tensor_cores 完成
 ```
 
 下一知识点：
 
 ```text
-tcgen05 指令之间的 scope / layout / completion 三层契约
+chapter_tmem -> The TMEM Allocation Lifecycle
 ```
