@@ -711,7 +711,359 @@ laneid 决定线程拿到哪些寄存器
 wait 决定什么时候可以使用
 ```
 
-## 十、当前进度
+## 十、异步等待：tcgen05.wait::ld 与 tcgen05.wait::st
+
+```text
+本次讲解位置
+章节：chapter_tmem
+小节：Waiting for Asynchronous Loads and Stores
+知识点：tcgen05.ld/st 的异步完成边界
+上次：tcgen05.ld/st 的 shape/num 与 16-bit pack/unpack
+下次：chapter_async_barriers -> mbarrier 与 phase 生命周期
+PTX：9.7.18.8.3 tcgen05.ld；9.7.18.8.4 tcgen05.st；9.7.18.8.5 tcgen05.wait
+```
+
+这一节只解决一个问题：
+
+```text
+tcgen05.ld/st 已经把指令发出去了
+什么时候才能认为数据真的搬完了
+```
+
+### 一、发出指令不等于操作完成
+
+普通 shared memory load 通常可以按同步 load 来理解：
+
+```text
+ld.shared r0, [addr]
+下一条指令使用 r0
+```
+
+`tcgen05.ld` 不是这种模型。它是异步 collective load：
+
+```text
+tcgen05.ld ... {r0, ...}, [taddr]
+```
+
+这条指令只是告诉硬件：
+
+```text
+从 [taddr] 开始的 TMEM 区域
+搬一部分数据到当前 warp 各线程的寄存器
+```
+
+指令发射完成后，数据搬运仍可能还在后台进行。因此必须有明确边界，
+告诉硬件和编译器：
+
+```text
+之前的 tcgen05.ld 已经完成
+现在可以安全使用目标寄存器
+```
+
+这个边界就是：
+
+```text
+tcgen05.wait::ld.sync.aligned;
+```
+
+存储方向同理：
+
+```text
+tcgen05.st ... [taddr], {r0, ...}
+```
+
+它表示把寄存器数据写向 TMEM。即使指令已经发射，写入也可能仍在
+后台进行。后续 MMA 或其他 tcgen05 操作如果马上复用 `[taddr]`，就可能
+与前一次 store 重叠。此时需要：
+
+```text
+tcgen05.wait::st.sync.aligned;
+```
+
+一句话区分：
+
+```text
+tcgen05.ld/st:
+    发起异步数据搬运
+
+tcgen05.wait::ld/st:
+    等待此前同类异步搬运完成
+```
+
+### 二、wait::ld 保证什么
+
+典型顺序：
+
+```text
+tcgen05.ld.sync.aligned.32x32b.x2.b32
+    {r0, r1}, [taddr];
+
+tcgen05.wait::ld.sync.aligned;
+
+// 这里再使用 r0、r1
+```
+
+`tcgen05.wait::ld` 的 PTX 语义是：
+
+```text
+执行线程阻塞
+直到该线程此前发出的所有 tcgen05.ld 都已完成
+```
+
+它覆盖的是“此前发出的 load”，不是未来准备发出的 load：
+
+```text
+ld A
+ld B
+wait::ld       // A 和 B 都被等待
+ld C
+wait::ld       // 等待 C
+```
+
+因此可以把一次 wait 理解成一次 drain，也就是把此前积压的 load
+全部排空。wait 之后如果又发出了新的 load，就还需要新的 wait。
+
+它不会等待 `tcgen05.st`：
+
+```text
+wait::ld  -> 只管此前 tcgen05.ld
+wait::st  -> 只管此前 tcgen05.st
+```
+
+具体到坐标例子。假设 identity layout：
+
+```text
+C[m, n] -> (TLane = m, TCol = n)
+```
+
+某个 warp 执行：
+
+```text
+tcgen05.ld.sync.aligned.32x32b.x1.b32
+    {r0}, [taddr + column_offset];
+
+tcgen05.wait::ld.sync.aligned;
+
+float value = r0;
+```
+
+`wait::ld` 返回后，当前线程才把 `r0` 当作这次 load 已经完成的
+结果来使用。
+
+### 三、wait::st 保证什么
+
+假设当前 warp 把寄存器中的 `P` 写入 TMEM，随后 MMA 要读取这块
+`P`：
+
+```text
+tcgen05.st.sync.aligned.16x128b.x1.b32
+    [p_taddr], {r0, r1};
+
+tcgen05.wait::st.sync.aligned;
+
+// 在这个线程的后续 tcgen05 顺序中
+// 可以依赖前面的 P store 已经完成
+```
+
+`tcgen05.wait::st` 的 PTX 语义是：
+
+```text
+执行线程阻塞
+直到该线程此前发出的所有 tcgen05.st 都已完成
+```
+
+如果没有这个边界，后面对同一个 TMEM 区域的 MMA 或其他写入可能
+与前一次 `tcgen05.st` 竞争。典型后果是：
+
+```text
+MMA 读到了旧 P
+新的 TMEM write 覆盖了尚未落盘的 P
+结果依赖调度时序，偶发错误
+```
+
+所以 `wait::st` 的核心用途是：
+
+```text
+在复用或消费刚写入的 TMEM 区域前
+先确认之前的 store 已经完成
+```
+
+### 四、为什么是 wait，而不是 mbarrier
+
+`tcgen05.ld/st` 使用 `tcgen05.wait::ld/st` 完成本地等待。
+
+这与另外两类异步机制不同：
+
+| 异步操作 | 主要完成机制 |
+|---|---|
+| `tcgen05.ld` / `tcgen05.st` | `tcgen05.wait::ld` / `tcgen05.wait::st` |
+| `tcgen05.mma` / `tcgen05.cp` | `tcgen05.commit` 到 mbarrier |
+| TMA load | mbarrier 的 transaction completion |
+| TMA store | `cp.async.bulk.commit_group` / `wait_group` |
+
+这里的区别来自指令设计：
+
+```text
+tcgen05.ld/st 是 warp 在 TMEM 与自己的寄存器之间搬运数据
+    -> 直接使用 wait 排空当前线程的同类操作
+
+tcgen05.mma/cp 是更大的异步引擎操作
+    -> 使用 commit 把完成事件发布到 mbarrier
+```
+
+不要看到一个异步操作就默认它一定用 mbarrier。先看指令的完成协议。
+
+### 五、wait 不等于跨线程可见
+
+这是最容易混淆，也最重要的一点。
+
+`tcgen05.wait::st` 只说明：
+
+```text
+执行该 wait 的线程
+此前发出的 tcgen05.st
+已经完成
+```
+
+它不自动说明：
+
+```text
+另一个 warp 已经观察到这次写入
+另一个线程可以跳过同步直接消费
+```
+
+跨线程 handoff 还需要组成一条顺序链：
+
+```text
+生产者线程:
+    发出 tcgen05 操作
+    wait 本地完成
+    tcgen05.fence::before_thread_sync
+
+线程同步:
+    barrier / mbarrier / 其他执行顺序建立机制
+
+消费者线程:
+    tcgen05.fence::after_thread_sync
+    发出后续 tcgen05 操作
+```
+
+可以把三层边界记成：
+
+```text
+issue:
+    指令已经发出
+
+wait:
+    当前线程此前同类操作已经完成
+
+fence + thread synchronization:
+    把完成顺序扩展到另一个线程或 warp
+```
+
+因此：
+
+```text
+tcgen05.wait::st
+!=
+所有线程都已经看到新的 TMEM 内容
+```
+
+`wait::ld` 也有相同边界。它保证当前线程的 load 已完成，但如果另一个
+线程依赖这次 load 的结果，仍然需要合适的 fence 和线程同步。
+
+### 六、warp-collective 的 .sync.aligned
+
+`tcgen05.ld/st` 的 `.sync.aligned` 要求整个 warp 执行同一条指令。
+`tcgen05.wait::ld/st` 同样是：
+
+```text
+tcgen05.wait::ld.sync.aligned;
+tcgen05.wait::st.sync.aligned;
+```
+
+它们的等待语义可以拆成两层：
+
+```text
+每个线程先等待自己此前同类 tcgen05 操作完成
+然后 warp 内所有线程在 wait 指令处同步
+```
+
+所以 wait 返回时，不只是某一个 lane 完成了自己的 load 或 store，
+整个 warp 也已经共同越过了这个完成边界。
+
+这也是为什么不能在条件分支里只让部分 lane 执行 wait：
+
+```text
+if (lane_id < 16)
+    tcgen05.wait::ld.sync.aligned;   // 错误用法
+```
+
+`tcgen05.ld/st`、`tcgen05.wait` 都是 `.sync.aligned` warp-collective
+指令，执行条件必须对整个 warp 一致。
+
+### 七、和课程代码的对应关系
+
+课程里的 TIRx 写法：
+
+```python
+Tx.wg.copy_async(reg_wg, tmem[:, :BLK_N])
+T.ptx.tcgen05.wait.ld()
+```
+
+对应：
+
+```text
+Tx.wg.copy_async -> tcgen05.ld
+tcgen05.wait.ld  -> tcgen05.wait::ld.sync.aligned
+```
+
+反向写回：
+
+```python
+Tx.wg.copy_async(tmem_as_f16, reg)
+T.ptx.tcgen05.wait.st()
+```
+
+对应：
+
+```text
+Tx.wg.copy_async -> tcgen05.st
+tcgen05.wait.st  -> tcgen05.wait::st.sync.aligned
+```
+
+看到 `copy_async` 时，不要把它当成普通同步 copy。先找紧随其后的
+`wait.ld()` 或 `wait.st()`，再检查跨 warp 的 fence 和 barrier。
+
+### 八、完整判断流程
+
+遇到一段 TMEM 代码时，按下面顺序检查：
+
+```text
+1. 这是 tcgen05.ld 还是 tcgen05.st
+
+2. 谁会在之后使用结果，或者复用同一 TMEM 区域
+
+3. 如果是同一个执行线程：
+       ld -> wait::ld
+       st -> wait::st
+
+4. 如果是另一个 warp 或线程：
+       是否补齐 tcgen05.fence 和跨线程同步
+
+5. wait 之后是否又发起了新的同类操作
+       如果有，是否需要新的 wait
+```
+
+一句话记忆：
+
+```text
+tcgen05.ld/st 负责发射搬运
+tcgen05.wait::ld/st 负责排空本地同类搬运
+tcgen05.fence + 线程同步负责扩展到其他线程
+```
+
+## 十一、当前进度
 
 `chapter_tmem` 的知识点：
 
@@ -743,7 +1095,9 @@ CTA allocation 边界与 warp Lane 访问限制的区别
 tcgen05.ld/st 的 warp-collective 数据通路
 shape 与 num 的 data volume / register count 计算
 16-bit pack/unpack 语义
-异步 ld/st 的 wait、fence 与跨线程同步边界
+tcgen05.ld/st 的异步 issue / completion 边界
+tcgen05.wait::ld/st 的 per-thread 完成语义
+tcgen05.wait、tcgen05.fence 与跨线程线程同步的区别
 chapter_tmem 完成
 ```
 
