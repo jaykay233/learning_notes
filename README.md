@@ -217,6 +217,7 @@ chapter_tensor_cores 完成
 TMEM allocation / deallocation 生命周期
 tcgen05.alloc 的 warp-collective 语义
 TMEM 地址可见性、allocation size 限制与 cta_group::2 契约
+TMEM warpgroup Lane 访问窗口与 CTA allocation 边界
 ```
 
 完整文档索引、当前进度和硬件环境说明见

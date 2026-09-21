@@ -104,6 +104,8 @@ tmem_addr 的 SMEM 可见性与 allocated_addr 绑定
 allocation size 与连续 allocation 单调不增约束
 relinquish_alloc_permit 与 tcgen05.dealloc
 cta_group::2 的 CTA pair allocation 契约
+warpgroup 内四个 warp 的固定 32-Lane TMEM 访问窗口
+CTA allocation 边界与 warp Lane 访问限制的区别
 ```
 
 ## 核心主线

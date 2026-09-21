@@ -275,13 +275,173 @@ layout 决定逻辑坐标怎么落进去
 dealloc 决定什么时候归还
 ```
 
-## 八、当前进度
+## 八、Which TMEM Lanes Each Warp Can Access
+
+```text
+本次讲解位置
+章节：chapter_tmem
+小节：Which TMEM Lanes Each Warp Can Access
+知识点：warpgroup 内四个 warp 的固定 TLane 访问窗口
+上次：TMEM allocation 与 deallocation 生命周期
+下次：How tcgen05.ld and tcgen05.st Move Data
+PTX：9.7.18.8 Tensor Memory and Register Load/Store Instructions；9.7.18.8.1 Access restrictions
+```
+
+先区分两件容易混淆的事：
+
+```text
+allocation:
+    整个 CTA 当前拥有哪些 TMEM Columns
+
+lane access restriction:
+    CTA 内的某个 warp 能读取或写入哪些 TMEM Lanes
+```
+
+TMEM 在资源归属上属于 CTA。`tcgen05.alloc` 申请的是 Columns，而且一列
+会包含全部 128 Lanes。可是 `tcgen05.ld` 和 `tcgen05.st` 并不会让 CTA
+里的任意 warp 访问全部 128 个 Lanes。
+
+一个 warpgroup 中的四个 warp 各自拥有固定的 32-Lane 访问窗口：
+
+| warpgroup 内的 warp ID | 可访问的 TMEM Lanes |
+|---|---|
+| 0 | 0-31 |
+| 1 | 32-63 |
+| 2 | 64-95 |
+| 3 | 96-127 |
+
+如果令：
+
+```text
+warp_in_group = warp_id % 4
+```
+
+那么这个 warp 的窗口是：
+
+```text
+first_lane = 32 * warp_in_group
+last_lane  = first_lane + 31
+```
+
+也可以直接判断某个 TMEM Lane 是否属于该 warp：
+
+```text
+lane // 32 == warp_in_group
+```
+
+这里的 `warp_in_group` 是 warpgroup 内的相对编号，不是整个 thread block
+的绝对 `warp_id`。例如绝对 `warp_id = 5`：
+
+```text
+warpgroup       = 5 // 4 = 1
+warp_in_group   = 5 % 4 = 1
+可访问 Lanes    = 32-63
+```
+
+四个 warp 的区别只在 Lane 窗口；它们都可以访问该 allocation 内的所有
+Columns。也就是说：
+
+```text
+Lane 维:
+    warp 0 -> 0-31
+    warp 1 -> 32-63
+    warp 2 -> 64-95
+    warp 3 -> 96-127
+
+Column 维:
+    四个 warp 都覆盖当前 allocation 的全部 Columns
+```
+
+这里的“都能访问所有 Columns”仍然受 allocation 边界约束。某个 warp
+可以访问分配给自己窗口的 Lanes，但不能借此访问 CTA 尚未申请或已经
+释放的 Columns。
+
+以一个 identity layout 为例：
+
+```python
+TileLayout(
+    S[(128, 256) : (1@TLane, 1@TCol)]
+)
+```
+
+映射关系是：
+
+```text
+logical m -> TLane
+logical n -> TCol
+```
+
+于是：
+
+```text
+C[10, 130]
+    -> TLane = 10
+    -> TCol  = 130
+    -> 只有 warp 0 能通过 tcgen05.ld/st 访问
+
+C[74, 130]
+    -> TLane = 74
+    -> TCol  = 130
+    -> 只有 warp 2 能通过 tcgen05.ld/st 访问
+
+C[110, 7]
+    -> TLane = 110
+    -> TCol  = 7
+    -> 只有 warp 3 能通过 tcgen05.ld/st 访问
+```
+
+所以，当 accumulator 跨越全部 128 Lanes 时，需要四个 warp 协作读取：
+
+| warp | 负责读取的逻辑行 |
+|---|---|
+| 0 | `m = 0..31` |
+| 1 | `m = 32..63` |
+| 2 | `m = 64..95` |
+| 3 | `m = 96..127` |
+
+每个 warp 读取自己的 32-Lane 窗口。四个 warp 合起来，才形成“warpgroup
+读取了一整块 TMEM accumulator”的结果。
+
+这也能消除一个常见误解：
+
+```text
+tcgen05.mma 能写满整个 TMEM tile
+!=
+任意单个 warp 能读取整个 TMEM tile
+```
+
+`tcgen05.mma` 是 warp-level collective 指令，结果可以覆盖很宽的
+`TLane x TCol` 区域；但后续用 `tcgen05.ld` 把结果取回寄存器时，仍然
+必须遵守上面按 warp 划分的 Lane 窗口。
+
+最后要区分两类 lane：
+
+```text
+thread lane ID / laneid:
+    warp 内 32 个线程的编号
+
+TMEM TLane:
+    Tensor Memory 的 128 个逻辑 Lane 坐标
+```
+
+本小节的规则决定“哪个 warp 可以碰哪些 TMEM Lanes”。至于 warp 内每个
+线程具体拿到哪些寄存器元素，则由 `tcgen05.ld/st` 的 shape、num 和寄存器
+分布规则决定，留到下一个知识点。
+
+一句话记忆：
+
+```text
+Column 看 allocation
+Lane 看 warp 在 warpgroup 中的位置
+```
+
+## 九、当前进度
 
 `chapter_tmem` 的知识点：
 
 ```text
 [x] The TMEM Allocation Lifecycle
-[ ] Which TMEM Lanes Each Warp Can Access
+[x] Which TMEM Lanes Each Warp Can Access
 [ ] How tcgen05.ld and tcgen05.st Move Data
 [ ] Shape and Repeat Factor
 [ ] Packing and Unpacking 16-Bit Data
@@ -302,10 +462,12 @@ allocation size 与单调不增约束
 relinquish_alloc_permit
 tcgen05.dealloc
 cta_group::2 allocation 契约
+warpgroup 内四个 warp 的固定 32-Lane TMEM 访问窗口
+CTA allocation 边界与 warp Lane 访问限制的区别
 ```
 
 下一知识点：
 
 ```text
-chapter_tmem -> Which TMEM Lanes Each Warp Can Access
+chapter_tmem -> How tcgen05.ld and tcgen05.st Move Data
 ```
