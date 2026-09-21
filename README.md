@@ -44,7 +44,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 06-warp-tile-and-k-pipeline.md
 ├── 07-hopper-wgmma-and-blackwell-tmem.md
 ├── 08-tma-tile-copy-and-synchronization.md
-└── 08-tma-practice-and-solutions.md
+├── 08-tma-practice-and-solutions.md
+└── 09-tensor-cores-tcgen05.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -194,7 +195,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–08：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–09：
 
 ```text
 layout / named axes / replication / offset
@@ -204,6 +205,9 @@ warp tile / K pipeline / cp.async
 Hopper WGMMA / Blackwell TMEM
 tcgen05 / SFA/SFB / scale_vec
 TMA tile copy / swizzle / pipeline / descriptor / mbarrier / bulk group
+Blackwell tcgen05.mma / TMEM / commit + mbarrier / cta_group
+cta_group::2 的 CTA pair 资源访问边界
+cta_group::1, M=128 的直接 accumulator 映射
 ```
 
 完整文档索引、当前进度和硬件环境说明见

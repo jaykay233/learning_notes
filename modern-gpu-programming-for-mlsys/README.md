@@ -22,6 +22,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [07-hopper-wgmma-and-blackwell-tmem.md](07-hopper-wgmma-and-blackwell-tmem.md) | Hopper WGMMA accumulator fragment、CUTLASS `CLayout`、Blackwell TMEM、`tcgen05`、SFA/SFB 与 `scale_vec` |
 | [08-tma-tile-copy-and-synchronization.md](08-tma-tile-copy-and-synchronization.md) | TMA descriptor、128-byte swizzle、3D box、row layout、pipeline、`ldmatrix` 判断、mbarrier load 与 bulk-group store |
 | [08-tma-practice-and-solutions.md](08-tma-practice-and-solutions.md) | TMA 10 道自测题、计算推导与答案 |
+| [09-tensor-cores-tcgen05.md](09-tensor-cores-tcgen05.md) | Blackwell `tcgen05.mma`、TMEM accumulator、`tcgen05.commit` 与 `cta_group` |
 
 ## 当前进度
 
@@ -82,6 +83,15 @@ WGMMA / Tensor Core matrix descriptor
 descriptor 布局 ABI
 base offset / phase 与 descriptor 一致性
 chapter_tma 完成
+tcgen05.mma 的单 thread 发起语义
+tcgen05.mma 指令字段
+TMEM accumulator
+tcgen05.commit 与 mbarrier
+tcgen05 与 TMA load / store 的同步机制对比
+cta_group::1 与 cta_group::2 基本操作范围
+cta_group::2 的 CTA pair 资源访问边界
+cta_group::1, M=128 的直接 accumulator 映射
+chapter_tensor_cores 进行中
 ```
 
 ## 核心主线
@@ -117,5 +127,7 @@ TMEM lane / column 不匹配
 
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
+tcgen05 cta_group accumulator mappings
+tcgen05 block-scaled MMA
 TMA producer / consumer warp specialization
 ```
