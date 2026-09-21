@@ -1496,5 +1496,8 @@ chapter_tensor_cores 完成
 下一知识点：
 
 ```text
-chapter_tmem -> The TMEM Allocation Lifecycle
+chapter_tmem -> Which TMEM Lanes Each Warp Can Access
 ```
+
+`chapter_tmem -> The TMEM Allocation Lifecycle` 已记录在
+[10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md)。

@@ -195,7 +195,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–09：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–10：
 
 ```text
 layout / named axes / replication / offset
@@ -214,6 +214,9 @@ cta_group::2, M=128 dense A 的 Layout B
 block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 tcgen05 指令之间的 scope / layout / completion 三层契约
 chapter_tensor_cores 完成
+TMEM allocation / deallocation 生命周期
+tcgen05.alloc 的 warp-collective 语义
+TMEM 地址可见性、allocation size 限制与 cta_group::2 契约
 ```
 
 完整文档索引、当前进度和硬件环境说明见

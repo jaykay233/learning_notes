@@ -23,6 +23,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [08-tma-tile-copy-and-synchronization.md](08-tma-tile-copy-and-synchronization.md) | TMA descriptor、128-byte swizzle、3D box、row layout、pipeline、`ldmatrix` 判断、mbarrier load 与 bulk-group store |
 | [08-tma-practice-and-solutions.md](08-tma-practice-and-solutions.md) | TMA 10 道自测题、计算推导与答案 |
 | [09-tensor-cores-tcgen05.md](09-tensor-cores-tcgen05.md) | Blackwell `tcgen05.mma`、TMEM accumulator、`tcgen05.commit` 与 `cta_group` |
+| [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp-collective 语义、地址可见性、释放与 `cta_group::2` |
 
 ## 当前进度
 
@@ -97,6 +98,12 @@ cta_group::2, M=128 dense A 的 Layout B
 block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 tcgen05 指令之间的 scope / layout / completion 三层契约
 chapter_tensor_cores 完成
+TMEM 128 Lanes x 512 Columns 与 256 KiB 容量
+TMEM 按 Column allocation 与 warp-collective tcgen05.alloc
+tmem_addr 的 SMEM 可见性与 allocated_addr 绑定
+allocation size 与连续 allocation 单调不增约束
+relinquish_alloc_permit 与 tcgen05.dealloc
+cta_group::2 的 CTA pair allocation 契约
 ```
 
 ## 核心主线
@@ -133,5 +140,5 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 TMA producer / consumer warp specialization
-chapter_tmem 的 allocation / access / ld-st
+chapter_tmem 的 lane access / ld-st / packing / wait
 ```
