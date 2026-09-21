@@ -128,7 +128,149 @@ A/B 经过 SMEM 是为了让 Tensor Core 按矩阵 descriptor 读取正确布局
 D 先落在 TMEM，是因为 `tcgen05.mma` 的 accumulator 属于 TMEM，最后
 再由 `tcgen05.ld` 搬进 registers，完成 cast 和 GMEM writeback。
 
-## 四、TIRx 中一条 tile 操作描述什么
+## 四、完整 Kernel 代码
+
+下面是与课程对应的完整 kernel。可以把它保存为 `tirx_hgemm.py`，或者
+和后面的编译验证代码放进同一个 Python 文件。代码保留课程中的 import
+和注释，便于逐段对照本章后面的解释。
+
+```python
+import tvm
+from tvm.script import tirx as T
+from tvm.script.tirx import tile as Tx
+from tvm.backend.cuda.tile_primitive.tma_utils import mma_shared_layout, SwizzleMode
+from tvm.tirx.layout import TileLayout, S, TLane, TCol, tid_in_wg
+
+
+def hgemm_v1(M, N, K):
+    a_type = tvm.DataType("float16")
+    b_type = tvm.DataType("float16")
+    d_type = tvm.DataType("float16")
+    acc_type = tvm.DataType("float32")
+
+    BLK_M, BLK_N, BLK_K = 128, 128, 64
+    A_layout = mma_shared_layout(
+        a_type,
+        SwizzleMode.SWIZZLE_128B_ATOM,
+        (BLK_M, BLK_K),
+    )
+    B_layout = mma_shared_layout(
+        b_type,
+        SwizzleMode.SWIZZLE_128B_ATOM,
+        (BLK_N, BLK_K),
+    )
+
+    @T.prim_func
+    def kernel(
+        A: T.Buffer((M, K), a_type),
+        B: T.Buffer((N, K), b_type),
+        D: T.Buffer((M, N), d_type),
+    ):
+        T.device_entry()
+
+        # 本章调用时 M=BLK_M、N=BLK_N，
+        # 所以 grid shape 为 1x1，m_st 和 n_st 都是 0。
+        bx, by = T.cta_id([M // BLK_M, N // BLK_N])
+        wg_id = T.warpgroup_id([1])
+        warp_id = T.warp_id_in_wg([4])
+        lane_id = T.lane_id([32])
+
+        # --- 申请 SMEM ---
+        pool = T.SMEMPool()
+        tmem_addr = pool.alloc((1,), "uint32")
+        mma_bar = pool.alloc((1,), "uint64", align=8)
+        pool.move_base_to(1024)
+        Asmem = pool.alloc((BLK_M, BLK_K), a_type, layout=A_layout)
+        Bsmem = pool.alloc((BLK_N, BLK_K), b_type, layout=B_layout)
+        pool.commit()
+
+        # --- 由 warp 0 初始化 barrier 和 TMEM ---
+        if warp_id == 0:
+            if lane_id == 0:
+                T.ptx.mbarrier.init(mma_bar.ptr_to([0]), 1)
+            T.ptx.tcgen05.alloc(
+                T.address_of(tmem_addr),
+                n_cols=512,
+                cta_group=1,
+            )
+
+        T.ptx.fence.proxy_async("shared::cta")
+        T.ptx.fence.mbarrier_init()
+        T.cuda.cta_sync()
+
+        tmem = T.decl_buffer(
+            (128, 512),
+            "float32",
+            scope="tmem",
+            allocated_addr=tmem_addr[0],
+            layout=TileLayout(S[(128, 512) : (1@TLane, 1@TCol)]),
+        )
+
+        m_st = T.meta_var(bx * BLK_M)
+        n_st = T.meta_var(by * BLK_N)
+        phase_mma: T.int32 = 0
+
+        # --- Load：所有 threads 同步地将 A、B 从 GMEM 搬入 SMEM ---
+        Tx.cta.copy(Asmem[:, :], A[m_st:m_st + BLK_M, :])
+        Tx.cta.copy(Bsmem[:, :], B[n_st:n_st + BLK_N, :])
+        T.cuda.cta_sync()
+
+        # --- Compute：由一个被选中的 thread 发出 MMA ---
+        if warp_id == 0:
+            if T.ptx.elect_sync():
+                Tx.gemm_async(
+                    tmem[:, :BLK_N],
+                    Asmem[:, :],
+                    Bsmem[:, :],
+                    accum=False,
+                    dispatch="tcgen05",
+                    cta_group=1,
+                )
+                T.ptx.tcgen05.commit(
+                    mma_bar.ptr_to([0]),
+                    cta_group=1,
+                )
+
+        T.ptx.mbarrier.try_wait(mma_bar.ptr_to([0]), phase_mma)
+
+        # --- Writeback：TMEM -> registers -> GMEM ---
+        Dreg = T.alloc_local((BLK_N,), acc_type)
+        Dreg_f16 = T.alloc_local((BLK_N,), d_type)
+        Dreg_wg = Dreg.view(
+            128,
+            BLK_N,
+            layout=TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)]),
+        )
+        Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+        T.ptx.tcgen05.wait.ld()
+        Tx.cast(Dreg_f16[:], Dreg[:])
+        m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+        Tx.copy(D[m_thr, n_st : n_st + BLK_N], Dreg_f16[:])
+
+        # --- 释放 TMEM ---
+        T.cuda.cta_sync()
+        if warp_id == 0:
+            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
+            T.ptx.tcgen05.dealloc(
+                tmem_addr[0],
+                n_cols=512,
+                cta_group=1,
+            )
+
+    return kernel
+```
+
+这段代码可以直接和课程源文件中的 `hgemm_v1` 对照。需要特别注意：
+
+```text
+imports 不能省略
+A/B/D 的参数 shape 和 dtype 必须与调用端一致
+A_layout / B_layout 必须与 MMA 的 SMEM descriptor 约定一致
+tcgen05.alloc 与 dealloc 必须成对
+所有 barrier 和 TMEM 操作都需要正确的 scope 与同步
+```
+
+## 五、TIRx 中一条 tile 操作描述什么
 
 代码中最关键的三项 tile 操作是：
 
@@ -171,7 +313,7 @@ Tx.gemm_async(...) 描述的是完整的 128 × 128 × 64 tile GEMM
 也就是 4 次 MMA。这里的 4 次拆分来自编译器的 lowering，不需要在
 TIRx 源码中手工写一个 K-loop。
 
-## 五、线程坐标系
+## 六、线程坐标系
 
 Kernel 开头建立了几层 thread identity：
 
@@ -199,9 +341,9 @@ lane_id = T.lane_id([32])
 
 后面每次判断“谁执行”时，都建立在这套坐标系上。
 
-## 六、申请 SMEM 与 TMEM
+## 七、申请 SMEM 与 TMEM
 
-### 6.1 SMEMPool
+### 7.1 SMEMPool
 
 代码使用：
 
@@ -248,7 +390,7 @@ pool.commit()
 表示 allocation 规划结束。之后的 buffer 不再依赖 allocator 继续
 增长布局。
 
-### 6.2 为什么 A_layout / B_layout 很重要
+### 7.2 为什么 A_layout / B_layout 很重要
 
 ```python
 A_layout = mma_shared_layout(
@@ -272,9 +414,9 @@ A/B 在 SMEM 中不是简单的 row-major 平铺，而是采用匹配 MMA operan
 矩阵元素会落到错误位置。表现通常不是“程序报越界”，而是结果数值
 静静地变错。
 
-## 七、初始化 mbarrier 与 TMEM
+## 八、初始化 mbarrier 与 TMEM
 
-### 7.1 mbarrier
+### 8.1 mbarrier
 
 ```python
 if warp_id == 0:
@@ -290,7 +432,7 @@ if warp_id == 0:
 
 这个 barrier 后面与 `tcgen05.commit` 配对。
 
-### 7.2 tcgen05.alloc
+### 8.2 tcgen05.alloc
 
 ```python
 T.ptx.tcgen05.alloc(
@@ -311,7 +453,7 @@ tcgen05.alloc 写入的是实际 TMEM 起始地址
 后面的 tmem decl_buffer 才把这个地址解释成二维 tile
 ```
 
-### 7.3 fence 与 CTA-wide synchronization
+### 8.3 fence 与 CTA-wide synchronization
 
 ```python
 T.ptx.fence.proxy_async("shared::cta")
@@ -330,7 +472,7 @@ T.cuda.cta_sync()
 如果没有这些同步，其他 threads 可能在 barrier 尚未初始化，或者
 `tcgen05.alloc` 尚未写入有效地址时就开始执行后续操作。
 
-## 八、把 TMEM 地址解释成 tile
+## 九、把 TMEM 地址解释成 tile
 
 ```python
 tmem = T.decl_buffer(
@@ -374,7 +516,7 @@ TMEM Column = 91
 TMEM 的逻辑 Lane 坐标。线程和 Lane 的对应关系要到 writeback 时
 才由 `tid_in_wg` 建立。
 
-## 九、Load：GMEM -> SMEM
+## 十、Load：GMEM -> SMEM
 
 ```python
 m_st = T.meta_var(bx * BLK_M)
@@ -410,7 +552,7 @@ A/B tile 就已经由全部 threads 写完
 `Tx.cta.copy` 也可能 dispatch 到 TMA 路径，此时同步方式会换成
 mbarrier。
 
-## 十、Compute：由 elected thread 发起 MMA
+## 十一、Compute：由 elected thread 发起 MMA
 
 ```python
 if warp_id == 0:
@@ -428,11 +570,11 @@ if warp_id == 0:
 
 这段代码有三层“谁执行”的信息。
 
-### 10.1 `warp_id == 0`
+### 11.1 `warp_id == 0`
 
 选择 warp 0 作为发起 warp。其他 warps 不进入这个分支。
 
-### 10.2 `T.ptx.elect_sync()`
+### 11.2 `T.ptx.elect_sync()`
 
 在选中的 warp 内，再选出实际发出指令的单个 thread。`elect_sync`
 的结果不是“指定 lane 0”，而是由 warp 内部选出一个 active thread。
@@ -447,7 +589,7 @@ if warp_id == 0:
 thread 发指令，并不表示只有这个 thread 的数据参与计算；Tensor Core
 和 TMEM 会按更宽的硬件 scope 读取 operand 并写 accumulator。
 
-### 10.3 dispatch
+### 11.3 dispatch
 
 ```python
 dispatch="tcgen05"
@@ -460,7 +602,7 @@ cta_group=1
 `accum=False` 表示第一次 MMA 不累加已有 accumulator，而是直接写
 新的结果。
 
-### 10.4 commit 与 wait
+### 11.4 commit 与 wait
 
 ```python
 T.ptx.tcgen05.commit(mma_bar.ptr_to([0]), cta_group=1)
@@ -493,9 +635,9 @@ elect_sync 中的 thread: 发出 MMA
 全部需要结果执行者: 等待 mma_bar phase
 ```
 
-## 十一、Writeback：TMEM -> registers -> GMEM
+## 十二、Writeback：TMEM -> registers -> GMEM
 
-### 11.1 为每个 thread 建立 register view
+### 12.1 为每个 thread 建立 register view
 
 ```python
 Dreg = T.alloc_local((BLK_N,), acc_type)
@@ -543,7 +685,7 @@ D[73, 91]
 这正好把前面 TMEM 的二维坐标和 writeback 的 thread/register 坐标
 连接起来。
 
-### 11.2 TMEM load 与 wait
+### 12.2 TMEM load 与 wait
 
 ```python
 Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
@@ -560,7 +702,7 @@ T.ptx.tcgen05.wait.ld()
 `tcgen05.wait.ld()` 等待此前由该 thread 发出的 `tcgen05.ld` 完成。
 前面的 copy 是异步 issue，不等待就直接读 `Dreg` 会产生未定义结果。
 
-### 11.3 cast 与写回 GMEM
+### 12.3 cast 与写回 GMEM
 
 ```python
 Tx.cast(Dreg_f16[:], Dreg[:])
@@ -586,7 +728,7 @@ warp 3, lane 31  -> row 127
 每个 thread 负责它那一行的 128 个 columns，因此一次 writeback
 就写回完整的 `128 × 128` tile。
 
-## 十二、释放 TMEM
+## 十三、释放 TMEM
 
 ```python
 T.cuda.cta_sync()
@@ -609,7 +751,7 @@ tcgen05.dealloc: 释放此前申请的 512 columns
 
 顺序不能反。只要还有 thread 正在读取 TMEM，就不能提前 dealloc。
 
-## 十三、Scope、Layout、Dispatch
+## 十四、Scope、Layout、Dispatch
 
 现在可以把整段 kernel 放回三个维度中理解。
 
@@ -642,7 +784,7 @@ How?    Dispatch
 
 任何一项缺失，tile primitive 都无法唯一 lowers 成具体硬件指令。
 
-## 十四、这个版本的简化点
+## 十五、这个版本的简化点
 
 当前 kernel 故意只保留最小结构，因此还没有：
 
@@ -665,7 +807,7 @@ tile-level primitive
 -> 具体硬件指令序列
 ```
 
-## 十五、进入编译验证前的环境边界
+## 十六、进入编译验证前的环境边界
 
 下一步要实际编译这段 kernel，并用 PyTorch 参考结果验证：
 
@@ -681,7 +823,7 @@ D = A × B^T
 macOS 上没有 CUDA / Blackwell 硬件，只能做概念和静态代码分析
 ```
 
-## 十六、编译并验证结果
+## 十七、编译并验证结果
 
 ### 本次讲解位置
 
@@ -703,7 +845,61 @@ macOS 上没有 CUDA / Blackwell 硬件，只能做概念和静态代码分析
 3. 怎样判断结果只是浮点误差，还是 Layout / 同步写错了？
 ```
 
-### 一、编译前先确认环境和导入
+### 一、完整编译与验证脚本
+
+如果把前面的完整 kernel 保存为 `tirx_hgemm.py`，下面的脚本可以直接
+编译并验证它：
+
+```python
+import torch
+import tvm
+
+from tirx_hgemm import hgemm_v1
+
+
+target = tvm.target.Target("cuda")
+device = torch.device("cuda")
+
+M, N, K = 128, 128, 64
+kernel = hgemm_v1(M, N, K)
+
+with target:
+    ex = tvm.compile(
+        tvm.IRModule({"main": kernel}),
+        target=target,
+        tir_pipeline="tirx",
+    )
+
+torch.cuda.empty_cache()
+torch.cuda.synchronize()
+
+A_tensor = torch.randn(M, K, dtype=torch.float16, device=device)
+B_tensor = torch.randn(N, K, dtype=torch.float16, device=device)
+D_tensor = torch.zeros(M, N, dtype=torch.float16, device=device)
+
+ex.mod(A_tensor, B_tensor, D_tensor)
+
+D_ref = (A_tensor.float() @ B_tensor.float().T).half()
+max_err = float((D_tensor - D_ref).abs().max())
+print(f"Max error vs torch reference: {max_err:.6f}")
+
+torch.testing.assert_close(
+    D_tensor,
+    D_ref,
+    rtol=2e-2,
+    atol=1e-2,
+)
+print("PASS")
+```
+
+运行结果应符合：
+
+```text
+Max error vs torch reference: < 某个较小的数>
+PASS
+```
+
+### 二、编译前先确认环境和导入
 
 课程要求：
 
@@ -729,7 +925,7 @@ tcgen05 相关指令能够运行
 
 课程示例需要 Blackwell GPU，例如 B200。目标不是任何 CUDA GPU 都能运行。
 
-### 二、从 PrimFunc 到可执行模块
+### 三、从 PrimFunc 到可执行模块
 
 验证代码先建立目标：
 
@@ -800,7 +996,7 @@ ex.mod(...)
 
 是编译后模块的调用入口。
 
-### 三、编译前后可以看到什么
+### 四、编译前后可以看到什么
 
 课程建议分别检查两层代码：
 
@@ -829,7 +1025,7 @@ print(ex.mod.imports[0].inspect_source())
 按 K 维展开的多次 `tcgen05.mma`，以及对应的 descriptor 和 TMEM
 地址设置。
 
-### 四、编译后的模块直接接收 PyTorch tensors
+### 五、编译后的模块直接接收 PyTorch tensors
 
 准备输入和输出：
 
@@ -872,7 +1068,7 @@ D -> D_tensor
 这里 `D_tensor` 是预先分配的 output buffer。Kernel 不返回一个新
 PyTorch tensor，而是把结果写入传入的 `D_tensor`。
 
-### 五、构造参考结果
+### 六、构造参考结果
 
 PyTorch 参考实现：
 
@@ -912,7 +1108,7 @@ reduction 顺序也可能不同：
 (D_tensor == D_ref).all()
 ```
 
-### 六、比较结果
+### 七、比较结果
 
 先计算最大绝对误差：
 
@@ -965,7 +1161,7 @@ expected = 8.0
 `128 × 128 = 16384` 个元素。最终输出 `PASS`，说明这个随机输入下的
 结果落在课程设定的容限内。
 
-### 七、失败时按三层排查
+### 八、失败时按三层排查
 
 编译和验证可以分为三层，排查时不要混在一起：
 
@@ -999,7 +1195,7 @@ Layout 错了 -> 数值有规律地错位
 Dispatch 错了 -> 可能无法编译或运行
 ```
 
-### 八、本机执行边界
+### 九、本机执行边界
 
 当前学习机器是 Apple M5 Pro，没有 CUDA 和 Blackwell GPU。因此这里可以
 完成：
@@ -1021,7 +1217,7 @@ Dispatch 错了 -> 可能无法编译或运行
 
 实际运行这份代码时，应使用支持 Blackwell 的 CUDA 环境。
 
-## 十七、当前进度
+## 十八、当前进度
 
 `chapter_intro_tirx` 的知识点：
 
