@@ -208,6 +208,8 @@ TMA tile copy / swizzle / pipeline / descriptor / mbarrier / bulk group
 Blackwell tcgen05.mma / TMEM / commit + mbarrier / cta_group
 cta_group::2 的 CTA pair 资源访问边界
 cta_group::1, M=128 的直接 accumulator 映射
+cta_group::1, M=64 的 Layout F
+cta_group::2, M=256 的 CTA pair accumulator 切分
 ```
 
 完整文档索引、当前进度和硬件环境说明见

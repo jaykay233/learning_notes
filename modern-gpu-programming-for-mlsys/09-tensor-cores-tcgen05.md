@@ -21,6 +21,8 @@ tcgen05.commit 与 mbarrier
 tcgen05.commit + mbarrier 和 TMA load / store 的差异
 cta_group 的基本操作范围
 cta_group::2 的 CTA pair 资源访问边界
+cta_group::1, M=64 的 Layout F
+cta_group::2, M=256 的 accumulator 切分
 ```
 
 ## 目标
@@ -631,17 +633,175 @@ cta_group::2:
 epilogue 使用 `tcgen05.ld` 时，必须采用和 MMA 写回相兼容的
 TMEM 地址与 load shape，否则读出的逻辑 C tile 会错位。
 
-## 六、当前进度
+## 六、cta_group::1, M=64 的 Layout F
+
+这一节对应普通 `tcgen05.mma`，不是 weight-stationary 的 `.ws` 形式。
+`.ws` 使用 Layout E，两者的 accumulator placement 不同。
+
+### 为什么不能直接 `TLane = m`
+
+TMEM 有 128 个 Lane rows，但 `M=64` 不直接占用 `Lane 0..63`。
+普通 MMA 的 TMEM data path 分为四个 32-lane region：
+
+```text
+Lane 0..31
+Lane 32..63
+Lane 64..95
+Lane 96..127
+```
+
+`M=64` 被拆成四个 16-row group，每个 group 放入一个 32-lane
+region 的一半。当前 tile 因此只使用 half datapath。
+
+### Layout F 公式
+
+设 lane alignment：
+
+```text
+a = 0 或 16
+```
+
+逻辑坐标到 TMEM 坐标的映射是：
+
+```text
+group        = m // 16
+row_in_group = m % 16
+TLane        = group * 32 + a + row_in_group
+TCol         = n
+```
+
+`a=0` 时：
+
+```text
+m = 0..15   -> lanes   0..15
+m = 16..31  -> lanes  32..47
+m = 32..47  -> lanes  64..79
+m = 48..63  -> lanes  96..111
+```
+
+`a=16` 时使用互补的 Lane：
+
+```text
+m = 0..15   -> lanes  16..31
+m = 16..31  -> lanes  48..63
+m = 32..47  -> lanes  80..95
+m = 48..63  -> lanes 112..127
+```
+
+例如：
+
+```text
+m = 37, a = 0
+group        = 37 // 16 = 2
+row_in_group = 37 % 16 = 5
+TLane        = 2 * 32 + 0 + 5 = 69
+
+C[37, n] -> TMEM(TLane=69, TCol=n)
+```
+
+### lane alignment 的意义
+
+`a=0` 和 `a=16` 的 Lane placement 互不重叠，因此两张独立的
+`M=64` accumulator 可以共用同一组 TMEM columns：
+
+```text
+32-lane region:
+    [ a=0 的 16 行 ][ a=16 的 16 行 ]
+```
+
+Layout F 只使用一半 datapath，所以 A、D 和 sparsity metadata 等
+矩阵必须使用一致的同组 lane alignment。epilogue 通过
+`tcgen05.ld` 读取 accumulator 时，也要采用与之相容的 Lane
+alignment 和 load shape。
+
+一句话记忆：
+
+```text
+M=128:
+    TLane = m
+
+M=64 Layout F:
+    TLane = (m // 16) * 32 + (m % 16) + a
+    a = 0 或 16
+```
+
+## 七、cta_group::2, M=256 的 accumulator 切分
+
+`M=256` 超过了单个 CTA 的 128 个 Lane rows，因此 accumulator
+必须在 CTA pair 的两块独立 TMEM 上存放。
+
+### CTA pair 中 M 如何切分
+
+课程采用的映射是沿 M 方向连续切分：
+
+```text
+even CTA: logical rows 0..127
+odd CTA:  logical rows 128..255
+```
+
+每个 CTA 在自己的本地 TMEM 中使用：
+
+```text
+128 个 Lane rows
+N 个 Col columns
+```
+
+物理上这是两个独立的 `128 x N` TMEM region：
+
+```text
+even CTA TMEM          odd CTA TMEM
+128 x N accumulator    128 x N accumulator
+```
+
+逻辑上它们组成一个 `256 x N` accumulator tile。
+
+### 坐标公式
+
+对于逻辑元素 `C[m, n]`：
+
+```text
+if m < 128:
+    CTA   = even
+    TLane = m
+else:
+    CTA   = odd
+    TLane = m - 128
+
+TCol = n
+```
+
+具体例子：
+
+| 逻辑元素 | CTA | 本地 TLane | TCol |
+|---|---|---:|---:|
+| `C[0, 7]` | even | 0 | 7 |
+| `C[127, 7]` | even | 127 | 7 |
+| `C[128, 7]` | odd | 0 | 7 |
+| `C[255, 7]` | odd | 127 | 7 |
+
+### 与 `tcgen05.ld` 的关系
+
+两个 `128 x N` region 位于不同 CTA 的 TMEM 中，不是一个可以
+由单个 CTA 任意读取的连续地址空间。`tcgen05.ld/st` 只能访问
+当前 CTA 自己的 TMEM，因此 pair 的两侧需要各自完成自己那 128
+行的 epilogue，或者通过额外路径交换结果。
+
+A/B tile 如何分布到两个 CTA 的 SMEM，不属于 accumulator layout
+本身；它由具体 kernel 的 operand 切分和 descriptor 决定。
+`cta_group::2` MMA 通常由 pair 中的一个 elected thread 发起，
+但写入结果会覆盖 pair 中两个 CTA 的 TMEM。
+
+## 八、当前进度
 
 ### 本章剩余知识点
 
-`chapter_tensor_cores` 主目录对应 6 个尚未完成的 accumulator /
+`chapter_tensor_cores` 主目录对应 6 个 accumulator /
 data-path 知识点：
 
 ```text
 [x] cta_group::1, M=128 的直接映射
-[ ] cta_group::1, M=64，非 .ws 的 Layout F
-[ ] cta_group::2, M=256，M rows 在 CTA pair 上连续切分
+[x] cta_group::1, M=64，非 .ws 的 Layout F
+[x] cta_group::2, M=256，M rows 在 CTA pair 上连续切分
 [ ] cta_group::2, M=128 dense A 的 Layout B
 [ ] block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 [ ] tcgen05 指令之间的 scope / layout / completion 三层契约
@@ -650,7 +810,7 @@ data-path 知识点：
 其中 sparse A 会把 `cta_group::2, M=128` 的 accumulator layout
 从 Layout B 改为 Layout C，因此需要和 dense A 对比理解。
 
-完成当前知识点后，本章还剩 5 个主知识点。
+学完 M256 后，本章还剩 3 个主知识点。
 
 `chapter_tensor_cores` 正在进行中：
 
@@ -667,10 +827,12 @@ tcgen05.commit + mbarrier
 cta_group::1 与 cta_group::2 的基本资源范围
 cta_group::2 的 CTA pair 资源访问边界
 cta_group::1, M=128 的直接 accumulator 映射
+cta_group::1, M=64 的 Layout F
+cta_group::2, M=256 的 CTA pair accumulator 切分
 ```
 
 下一知识点：
 
 ```text
-cta_group::1, M=64，非 .ws 的 Layout F
+cta_group::2, M=128 dense A 的 Layout B
 ```

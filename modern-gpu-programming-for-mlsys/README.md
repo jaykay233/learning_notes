@@ -91,6 +91,8 @@ tcgen05 与 TMA load / store 的同步机制对比
 cta_group::1 与 cta_group::2 基本操作范围
 cta_group::2 的 CTA pair 资源访问边界
 cta_group::1, M=128 的直接 accumulator 映射
+cta_group::1, M=64 的 Layout F
+cta_group::2, M=256 的 CTA pair accumulator 切分
 chapter_tensor_cores 进行中
 ```
 
