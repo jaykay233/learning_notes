@@ -462,7 +462,76 @@ CLC 完成不能只靠普通 ld.shared 判断
 必须使用 mbarrier 完成通知和 query_cancel
 ```
 
-### 七、本课边界
+### 七、跨 proxy 到底是什么
+
+这里的 `proxy` 不是 VPN、物理 memory bank 或 cache level。它是 PTX
+对“这一次 memory access 走哪套访问路径”的抽象。不同 proxy 访问
+同一个 shared memory 地址时，完成通知不代表跨 proxy 的读写顺序
+已经自动安全。
+
+| Proxy | 典型操作 |
+|---|---|
+| generic proxy | 普通 thread `ld.shared`、`st.shared` |
+| async proxy | TMA、`cp.async.bulk`，以及 CLC response 这类异步硬件写入 |
+
+CLC 的路径是:
+
+```text
+async proxy 写入 16-byte CLC response
+    -> complete-tx 更新 mbarrier
+    -> generic proxy thread 读取 response
+    -> query_cancel 解析 response
+```
+
+这里有两项独立责任:
+
+```text
+mbarrier
+    回答“异步操作完成了吗？”
+
+proxy fence
+    回答“跨 proxy 的读写顺序安全吗？”
+    特别是那个 response buffer 能否被下一轮覆盖
+```
+
+可以用邮箱类比:
+
+```text
+async proxy: 硬件把信放进邮箱
+generic proxy: thread 从邮箱取信
+mbarrier: 确认信已经放进邮箱
+proxy fence: 确认上一封信已经读完，才能清空并覆盖邮箱
+```
+
+如果下一轮异步请求会复用同一个 `[addr]`，只等待上一轮 `mbarrier`
+完成还不够。generic proxy 的读取必须先形成可被 async proxy 观察
+的顺序，之后下一轮 async write 才能安全覆盖这块 response buffer。
+
+TMA 也会遇到方向相反的同类问题:
+
+```text
+普通 thread 通过 generic proxy 写 SMEM
+    -> fence.proxy.async
+    -> async TMA 读取 SMEM
+```
+
+也就是说，`mbarrier` 只负责发布“完成”，proxy fence 负责建立跨
+访问路径的顺序。两者不能互相替代。
+
+相关 PTX 位置:
+
+```text
+8.6 Proxies
+9.7.10.28.2 Async Proxy
+9.7.15.18 clusterlaunchcontrol.try_cancel
+9.7.15.19 clusterlaunchcontrol.query_cancel
+```
+
+PTX 特别说明，`try_cancel` 对 `mbarrier` operand 的访问通过
+generic proxy 完成，而 CLC response 由 async proxy 异步写入。
+这正是 CLC response 会出现跨 proxy 顺序问题的原因。
+
+### 八、本课边界
 
 这里已经走完一条请求的生命周期:
 
@@ -511,6 +580,9 @@ CLC request 的 mbarrier arrival 与 complete-tx 完成条件
 clusterlaunchcontrol.query_cancel 的 is_canceled 与 get_first_ctaid
 多个 thread 提交 CLC request 时的 response 与 barrier 计数
 CLC response 的 async-proxy 写入与 generic-proxy 读取
+generic proxy 与 async proxy 的抽象含义
+CLC response 的跨 proxy 读写顺序
+mbarrier 完成通知与 proxy fence 的分工
 ```
 
 下一知识点:

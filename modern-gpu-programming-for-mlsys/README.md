@@ -136,6 +136,9 @@ CLC request 的 mbarrier arrival 与 complete-tx 完成条件
 clusterlaunchcontrol.query_cancel 的 is_canceled 与 get_first_ctaid
 多个 thread 提交 CLC request 时的 response 与 barrier 计数
 CLC response 的 async-proxy 写入与 generic-proxy 读取
+generic proxy 与 async proxy 的抽象含义
+CLC response 的跨 proxy 读写顺序
+mbarrier 完成通知与 proxy fence 的分工
 ```
 
 ## 核心主线
