@@ -43,7 +43,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 05-ampere-mma-fragments.md
 ├── 06-warp-tile-and-k-pipeline.md
 ├── 07-hopper-wgmma-and-blackwell-tmem.md
-└── 08-tma-tile-copy-and-synchronization.md
+├── 08-tma-tile-copy-and-synchronization.md
+└── 08-tma-practice-and-solutions.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
