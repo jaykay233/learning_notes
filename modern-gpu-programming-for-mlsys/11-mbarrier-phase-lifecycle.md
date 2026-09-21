@@ -794,7 +794,84 @@ expected count 太大，phase 永远无法完成，wait 会一直阻塞。
 `empty` arrival。这里的“用完”必须表示硬件已经不需要继续读取
 这块 SMEM，而不是仅仅表示指令已经发出。
 
-### 四、full 和 empty 要分别跟踪 phase parity
+### 四、tcgen05.commit 如何产生 empty arrival
+
+`tcgen05.commit` 不是一次立即发生的软件 arrival。它建立的是：
+
+```text
+当此前发出的异步 tcgen05 operations 完成后
+由硬件对指定 mbarrier 执行一次 mbarrier::arrive::one
+```
+
+因此：
+
+```text
+tcgen05.commit [mbar]
+```
+
+可以理解成向硬件注册一个延迟完成通知：
+
+```text
+commit 指令执行
+    -> 只是建立关联
+    -> 此时 pending count 还没有减少
+
+tcgen05 operations 完成
+    -> 硬件执行 mbarrier.arrive(mbar, 1)
+    -> pending count 减 1
+```
+
+假设 `empty[s]` 表示 MMA 已经不再需要这块 SMEM：
+
+```python
+mbarrier_init(empty[s], expected_count=1)
+
+if elected:
+    tcgen05_mma(A_smem[s], B_smem[s], accumulator)
+    tcgen05_commit(empty[s])
+```
+
+这里不需要再额外执行：
+
+```python
+mbarrier_arrive(empty[s])
+```
+
+因为 `tcgen05.commit` 已经会在 MMA 完成后提供一次 arrival。producer
+仍然通过下面的 wait 获得 stage 所有权：
+
+```text
+wait empty[s], phase
+```
+
+这里必须核对 arrival 次数：
+
+```text
+empty[s] expected count = 1
+    commit 提供 1 次 arrival
+    不需要软件 arrive
+
+empty[s] expected count = 128
+    commit 只提供 1 次 arrival
+    还需要另外 127 次 arrival
+```
+
+如果把 `commit` 提供的那次 arrival 和软件 `mbarrier.arrive` 重复记账，
+可能导致 phase 提前完成，或者让后续轮次的 pending count 与原计划
+错位。
+
+标准 `tcgen05.commit` 等待此前异步 tcgen05 operations 的完整完成。
+较新的 PTX 还提供：
+
+```text
+tcgen05.commit...sync_restrict::shared::read::mma::a
+```
+
+这个变体在 A operand 已经从 SMEM 读取完成时触发 arrival，不等待整个
+MMA 最终完成。它适合只保护 A 对应 SMEM stage 的复用，不能用来表示
+TMEM accumulator 已经可以读取。
+
+### 五、full 和 empty 要分别跟踪 phase parity
 
 `full[stage]` 和 `empty[stage]` 是两个独立的 `mbarrier`，因此也有
 两套独立的 phase。不能共用一个 parity 变量。
@@ -836,7 +913,7 @@ prologue 第一次填满 stage 时，stage 本来就处于 free 状态，因此�
 初始均为空闲。两种实现都必须保证“第一次填充前不等待一个尚未
 发生过的 consumer release”。
 
-### 五、和上一课的边界如何连接
+### 六、和上一课的边界如何连接
 
 上一课的 `fence.proxy.async` 和 `warpgroup_sync` 解决的是：
 
@@ -902,6 +979,9 @@ full[stage] / empty[stage] 的 producer-consumer 所有权协议
 empty barrier 的初始 free 状态
 full / empty 各自的 expected arrival count
 full / empty 两套独立的 phase parity
+tcgen05.commit 作为 deferred hardware arrival
+commit arrival 与软件 mbarrier.arrive 不能重复记账
+sync_restrict::shared::read::mma::a 的提前释放语义
 chapter_async_barriers 完成
 ```
 
