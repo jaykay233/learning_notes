@@ -25,7 +25,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [09-tensor-cores-tcgen05.md](09-tensor-cores-tcgen05.md) | Blackwell `tcgen05.mma`、TMEM accumulator、`tcgen05.commit` 与 `cta_group` |
 | [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp Lane 访问窗口、`tcgen05.ld/st`、shape/num、pack/unpack，以及 `wait::ld/st` 的异步完成边界 |
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
-| [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、tile 成本不均衡、CTA launch queue、CLC 动态接管 coordinate，以及请求与当前 tile 计算的异步重叠 |
+| [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
 
 ## 当前进度
 
@@ -143,6 +143,13 @@ mbarrier 完成通知与 proxy fence 的分工
 用当前 tile 计算隐藏 grid scheduler 延迟
 先请求、再计算、最后等待的单请求软件流水
 CLC 单 outstanding request 的 buffer / barrier 复用约束
+静态 scheduler 在稳定、均匀、短 tile 场景中的优势
+CLC 在 worker 启动与 tile 成本不确定时的收益
+CLC 的 request / barrier / fence / query 额外开销
+CLC 的 sm_100+ 硬件与编译目标边界
+H100/H200 不支持 CLC，但支持 thread block cluster
+把 CLC 封装为动态 tile scheduler，并保持 mainloop 不变
+chapter_clc 完成
 ```
 
 ## 核心主线
@@ -179,5 +186,4 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 TMA producer / consumer warp specialization
-chapter_clc 的适用场景与动态 tile scheduler 封装
 ```

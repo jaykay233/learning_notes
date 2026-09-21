@@ -245,6 +245,13 @@ mbarrier 完成通知与 proxy fence 的分工
 用当前 tile 计算隐藏 grid scheduler 延迟
 先请求、再计算、最后等待的单请求软件流水
 CLC 单 outstanding request 的 buffer / barrier 复用约束
+静态 scheduler 在稳定、均匀、短 tile 场景中的优势
+CLC 在 worker 启动与 tile 成本不确定时的收益
+CLC 的 request / barrier / fence / query 额外开销
+CLC 的 sm_100+ 硬件与编译目标边界
+H100/H200 不支持 CLC，但支持 thread block cluster
+把 CLC 封装为动态 tile scheduler，并保持 mainloop 不变
+chapter_clc 完成
 ```
 
 完整文档索引、当前进度和硬件环境说明见

@@ -1,12 +1,8 @@
-# Cluster Launch Control: 静态 persistent scheduler 的局限
+# Cluster Launch Control: 从静态 persistent scheduler 到动态 tile scheduling
 
-本篇开始学习 `chapter_clc`。这一课只回答一个问题：
-
-```text
-为什么静态 persistent scheduler 会产生 launch tail？
-```
-
-CLC 请求本身、shared memory response 和 `mbarrier` 完成通知留到下一课。
+本篇整理 `chapter_clc`，从静态 persistent scheduler 的 launch tail
+出发，依次说明一次 CLC 请求的生命周期、请求与当前 tile 计算的异步
+重叠，以及在实际 kernel 中如何选择静态 scheduler 或 CLC。
 
 ## 一、本次讲解位置
 
@@ -712,7 +708,168 @@ response buffer、phase 和 transaction count 分开管理。
 coordinate”，不是必然等于 `tile + 1`。只有当 `is_canceled` 为 true
 且 `get_first_ctaid` 返回有效结果时，worker 才真正获得下一块工作。
 
-## 十、当前进度
+## 十、什么时候使用 CLC
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_clc
+小节：什么时候使用 CLC
+知识点：静态 persistent scheduler 与 CLC dynamic scheduler 的适用边界
+上次：提前提交请求，并与当前 tile 计算重叠
+下次：chapter_intro_tirx -> 第一个 TIRx Kernel
+PTX：9.7.15.18 clusterlaunchcontrol.try_cancel
+     9.7.15.19 clusterlaunchcontrol.query_cancel
+     Target ISA: sm_100 or higher
+```
+
+上一节已经知道 CLC 如何把 grid scheduler 的延迟藏进当前 tile 的
+计算。这一节不再讨论指令细节，只回答一个工程选择:
+
+```text
+什么时候应该保留静态 scheduler？
+什么时候值得引入 CLC？
+```
+
+### 一、两者共用计算主体
+
+静态调度和 CLC 调度处理 tile 的方式可以完全相同:
+
+```text
+mainloop(tile_coord)
+    -> load tile
+    -> compute tile
+    -> store tile
+```
+
+差异只在 `tile_coord` 从哪里来:
+
+| 调度方式 | 下一个 tile coordinate 的来源 | 主要成本 |
+|---|---|---|
+| 静态 persistent | worker ID 与迭代次数计算 | 几乎没有运行时调度开销 |
+| CLC dynamic | 硬件返回被取消 launch 的 coordinate | response、barrier、query、fence 与同步 |
+
+因此 CLC 不应该侵入 mainloop 的计算代码。更合理的边界是把 CLC
+封装成一个动态 tile scheduler:
+
+```text
+static scheduler: 返回公式计算的 coordinate
+CLC scheduler:    返回 try_cancel/query_cancel 得到的 coordinate
+```
+
+mainloop 和 epilogue 只接收当前 coordinate，不需要知道它是静态
+计算出来的，还是 CLC 返回的。
+
+### 二、先算静态调度的优势
+
+当运行环境稳定时，静态调度通常更简单也更快。它适合:
+
+```text
+可同时运行的 worker 数量接近预期
+各个 output tiles 的计算成本接近
+kernel 计算时间相对较长
+不希望增加额外 barrier、fence 和同步
+```
+
+例如有 8 个 workers 和 64 个成本接近的 tiles，最简单的分配是:
+
+```text
+worker w 处理:
+tile = w, w + 8, w + 16, ..., w + 56
+```
+
+每轮 coordinate 只需一次整数运算，无需 shared memory response，
+也不需要每次向 grid scheduler 提交取消请求。只要 worker 同时驻留
+且每个 tile 成本接近，静态调度已经足够。
+
+### 三、CLC 的价值来自不确定性
+
+CLC 主要解决两种静态调度难以处理的情况:
+
+| 不确定因素 | 静态调度的问题 | CLC 的机会 |
+|---|---|---|
+| worker 可用时间不确定 | 某些 worker 可能延迟启动 | 已运行的 worker 接管 pending coordinate |
+| tile 成本不均衡 | 固定分配可能把慢 tile 集中在少数 worker 上 | 先完成的 worker 继续领取尚未启动的工作 |
+
+例如 12 个 tiles、3 个驻留 workers:
+
+```text
+静态分配:
+worker 0: tile 0, 3, 6, 9
+worker 1: tile 1, 4, 7, 10
+worker 2: tile 2, 5, 8, 11
+```
+
+如果 tile 0、3、6 很快，而 tile 9 很慢，worker 0 仍必须亲自处理
+tile 9。CLC 则允许 worker 0 完成当前工作后接管 launch queue 中
+尚未启动的 coordinate，把工作交给当前真正空闲的 worker。
+
+判断是否值得使用 CLC，可以简化成:
+
+```text
+expected_gain
+    = reduced_launch_tail
+    - CLC request / barrier / fence / query overhead
+```
+
+只有当减少的尾部时间大于 CLC 的运行时开销时，动态调度才真正有收益。
+
+### 四、哪些情况反而不适合 CLC
+
+下面这些情况通常更适合静态 scheduler:
+
+```text
+grid 很小，worker 本来只会处理一块 tile
+每个 tile 很短，request latency 无法被计算完全覆盖
+resource 与 tile 成本都很稳定
+kernel 已经受到 barrier 或 shared memory capacity 限制
+目标硬件不支持 CLC
+```
+
+尤其是极短 tile:
+
+```text
+request overhead > scheduling gain
+```
+
+这时每次请求、等待、query 和 proxy fence 都可能变成新的固定成本。
+
+### 五、硬件与编译目标边界
+
+CLC 不是 Hopper 功能:
+
+| GPU | 架构目标 | CLC |
+|---|---|---|
+| A100 | `sm_80` | 不支持 |
+| H100 / H200 | `sm_90 / sm_90a` | 不支持 |
+| B100 / B200 / GB200 | `sm_100+` | 支持 |
+
+PTX 对 `clusterlaunchcontrol.try_cancel` 和
+`clusterlaunchcontrol.query_cancel` 的 Target ISA 要求是:
+
+```text
+sm_100 or higher
+```
+
+Hopper 支持 thread block cluster 和 DSMEM，但 cluster 与 CLC 是
+两个独立特性。H100/H200 kernel 仍可使用 cluster，只是不能使用
+CLC 动态取消 pending launch。面对 H100/H200 时，应继续使用静态
+scheduler，或者实现自己的软件工作队列。
+
+### 六、在推理系统中的选择
+
+对推理系统的 GEMM、Attention 和其他 tiled kernel，可以先问三个问题:
+
+1. worker 实际驻留数量和启动时间是否稳定？
+2. 不同 tiles 的计算成本是否明显不同？
+3. 当前 tile 是否足够长，可以覆盖 CLC 的请求延迟？
+
+如果答案是“稳定、均匀、很短”，优先静态 scheduler。如果答案是
+“不稳定、不均匀、足够长”，CLC 更可能减少 launch tail。最后还要
+确认部署目标确实是 Blackwell `sm_100+`。
+
+## 十一、当前进度
 
 `chapter_clc` 的知识点:
 
@@ -720,7 +877,7 @@ coordinate”，不是必然等于 `tile + 1`。只有当 `is_canceled` 为 true
 [x] The limits of a static persistent scheduler
 [x] One CLC request -> clusterlaunchcontrol.try_cancel.async
 [x] Overlap the request with the current tile
-[ ] When to use CLC
+[x] When to use CLC
 ```
 
 已经覆盖:
@@ -744,11 +901,18 @@ mbarrier 完成通知与 proxy fence 的分工
 用当前 tile 计算隐藏 grid scheduler 延迟
 先请求、再计算、最后等待的单请求软件流水
 CLC 单 outstanding request 的 buffer / barrier 复用约束
+静态 scheduler 在稳定、均匀、短 tile 场景中的优势
+CLC 在 worker 启动与 tile 成本不确定时的收益
+CLC request / barrier / fence / query 的额外开销
+CLC 的 `sm_100+` 硬件与编译目标边界
+H100/H200 不支持 CLC，但支持 thread block cluster
+把 CLC 封装为动态 tile scheduler，并保持 mainloop 不变
+chapter_clc 完成
 ```
 
 下一知识点:
 
 ```text
-chapter_clc
--> When to use CLC
+chapter_intro_tirx
+-> 第一个 TIRx Kernel
 ```
