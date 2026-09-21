@@ -5,9 +5,9 @@
 - <https://github.com/mlc-ai/modern-gpu-programming-for-mlsys>
 
 本目录整理对话中围绕 GPU 数据布局、命名轴、Replication、Offset、
-shared memory swizzle、Tensor Core fragment、`ldmatrix` 和 K 循环
-pipeline 展开的内容，重点关注这些概念如何影响推理系统中的 GEMM、
-Attention 以及 KV Cache 数据路径。
+shared memory swizzle、Tensor Core fragment、`ldmatrix`、K 循环
+pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影响推理
+系统中的 GEMM、Attention 以及 KV Cache 数据路径。
 
 ## 文档索引
 
@@ -20,6 +20,7 @@ Attention 以及 KV Cache 数据路径。
 | [05-ampere-mma-fragments.md](05-ampere-mma-fragments.md) | `mma.sync`、A/B/C/D fragment、`ldmatrix.x1/x2/x4`、`.trans` |
 | [06-warp-tile-and-k-pipeline.md](06-warp-tile-and-k-pipeline.md) | Warp tile、fragment 复用、K 循环、`cp.async`、double buffering |
 | [07-hopper-wgmma-and-blackwell-tmem.md](07-hopper-wgmma-and-blackwell-tmem.md) | Hopper WGMMA accumulator fragment、CUTLASS `CLayout`、Blackwell TMEM、`tcgen05`、SFA/SFB 与 `scale_vec` |
+| [08-tma-tile-copy-and-synchronization.md](08-tma-tile-copy-and-synchronization.md) | TMA descriptor、128-byte swizzle、3D box、row layout、mbarrier load 与 bulk-group store |
 
 ## 当前进度
 
@@ -59,6 +60,18 @@ Ampere / Hopper / Blackwell 三种数据路径的对比
 Producer / Consumer layout 契约检查
 布局错误与同步错误的区分方法
 chapter_layout_generations 完成
+TMA 单 thread 提交整个 tile
+tensor map descriptor 与单次 copy 参数
+TMA 写入 128-byte swizzled layout
+3D TMA 搬运多个 swizzle atoms
+TMA box 最内层宽度限制
+128-byte grouped layout 与 256-byte row stride
+TMA load 的 mbarrier completion
+arrival count 与 pending transaction bytes
+TMA store 的 commit group / wait group
+load / store 同步机制差异
+chapter_tma copy / swizzle / synchronization 主体完成
+pipeline overlap 待继续
 ```
 
 ## 核心主线
@@ -93,7 +106,7 @@ TMEM lane / column 不匹配
 ## 后续可继续整理
 
 ```text
-chapter_tma
+TMA pipeline
 WGMMA matrix descriptor
 TMA producer / consumer warp specialization
 ```

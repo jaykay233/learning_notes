@@ -41,7 +41,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 04-swizzle-layout.md
 ├── 05-ampere-mma-fragments.md
 ├── 06-warp-tile-and-k-pipeline.md
-└── 07-hopper-wgmma-and-blackwell-tmem.md
+├── 07-hopper-wgmma-and-blackwell-tmem.md
+└── 08-tma-tile-copy-and-synchronization.md
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
 speculative-decoding/        # 投机解码
@@ -188,7 +189,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–07：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01–08：
 
 ```text
 layout / named axes / replication / offset
@@ -197,6 +198,7 @@ Ampere mma.sync / ldmatrix
 warp tile / K pipeline / cp.async
 Hopper WGMMA / Blackwell TMEM
 tcgen05 / SFA/SFB / scale_vec
+TMA tile copy / swizzle / mbarrier / bulk group
 ```
 
 完整文档索引、当前进度和硬件环境说明见
