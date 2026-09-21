@@ -198,7 +198,7 @@ Ampere mma.sync / ldmatrix
 warp tile / K pipeline / cp.async
 Hopper WGMMA / Blackwell TMEM
 tcgen05 / SFA/SFB / scale_vec
-TMA tile copy / swizzle / mbarrier / bulk group
+TMA tile copy / swizzle / pipeline / descriptor / mbarrier / bulk group
 ```
 
 完整文档索引、当前进度和硬件环境说明见

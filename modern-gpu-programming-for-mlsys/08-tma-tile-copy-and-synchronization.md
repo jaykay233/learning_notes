@@ -21,12 +21,16 @@ TMA 如何写入 swizzled layout
 如何等待 TMA load 完成
 如何等待 TMA store 完成
 为什么 load 使用 mbarrier，而 store 使用 commit / wait group
+把 TMA 放进 pipeline
+TMA 之后是否仍然需要 ldmatrix
+TMA tensor map descriptor 与 Tensor Core matrix descriptor 的关系
 ```
 
-下一小节尚未展开：
+后续进入：
 
 ```text
-把 TMA 放进 pipeline
+chapter_tensor_cores
+具体拆解 WGMMA / tcgen05 matrix descriptor 与指令编码
 ```
 
 ## 目标
@@ -52,6 +56,12 @@ TMA box 的宽度限制是什么
 mbarrier 的 arrival count 和 pending bytes 如何交接 load
 commit group / wait group 如何保护 TMA store 的 source buffer
 为什么 load 和 store 使用不同的完成机制
+full / empty barrier 如何交接 stage 所有权
+双 stage pipeline 的 prologue、steady state 和 epilogue
+TMA 之后什么情况仍需要 ldmatrix
+什么情况由 WGMMA / tcgen05 直接消费 SMEM
+为什么 TMA descriptor 和 MMA descriptor 构成布局 ABI
+descriptor 不匹配为什么会静默产生错误结果
 ```
 
 ## 一、一个 thread 如何描述整个 tile
@@ -1022,7 +1032,462 @@ bulk group：
 
 两种机制不是任意可替换的标准路径。store 完成后如果还要通知其他 threads，可以在 `wait_group` 之后再叠加共享 barrier。
 
-## 九、放到推理系统中
+## 九、把 TMA 放进 pipeline
+
+### 没有 pipeline 时为什么会出现 bubble
+
+如果只有一个 SMEM stage：
+
+```text
+TMA load tile k
+wait full
+MMA 计算 tile k
+复用同一块 SMEM
+```
+
+时间线是：
+
+```text
+TMA k
+      等待
+           MMA k
+                  TMA k+1
+                         等待
+                              MMA k+1
+```
+
+Tensor Core 在等待 TMA 时没有工作，这段时间就是 bubble。
+
+### 双 stage
+
+准备两个 stage：
+
+```text
+A_smem[2]
+B_smem[2]
+full[2]
+empty[2]
+```
+
+计算当前 tile 时，同时搬运下一个 tile：
+
+```text
+时间 t:   MMA 读 stage 0，TMA 填 stage 1
+时间 t+1: MMA 读 stage 1，TMA 填 stage 0
+```
+
+这样 TMA 的搬运延迟就被当前 tile 的 MMA 计算掩盖。
+
+### full 与 empty 表示 stage 所有权
+
+```text
+full[stage]：
+    TMA 已经写满这个 stage
+    consumer 可以读取
+
+empty[stage]：
+    consumer 已经用完这个 stage
+    producer 可以覆盖
+```
+
+producer 和 consumer 的主循环分别是：
+
+```text
+Producer:
+    wait empty[stage]
+    TMA load 到 stage
+    TMA 完成时更新 full[stage]
+
+Consumer:
+    wait full[stage]
+    对 stage 执行 MMA
+    arrive empty[stage]
+```
+
+这里不是只靠“stage 编号不同”保证安全。即使编号不同，producer
+也可能在 consumer 还没读完旧数据时覆盖它，所以 `full` 和
+`empty` 是所有权交接协议。
+
+### 四个 K tiles 如何轮转
+
+只有两个 stages 时：
+
+```text
+k0 -> stage 0
+k1 -> stage 1
+k2 -> stage 0
+k3 -> stage 1
+```
+
+也就是：
+
+```text
+stage = k % 2
+```
+
+因此 `k2` 必须等 `k0` 的 consumer 执行完并发出 `empty[0]`，
+`k3` 必须等 `k1` 的 consumer 执行完并发出 `empty[1]`。
+
+### Prologue、steady state 和 epilogue
+
+双 stage 大致分为三个阶段：
+
+| 阶段 | 工作 |
+|---|---|
+| Prologue | 先把 stage 0 和 stage 1 填满 |
+| Steady state | 计算一个 tile，同时预取未来 tile |
+| Epilogue | 不再预取，只计算最后几个已加载的 tile |
+
+可以用下面的结构理解：
+
+```text
+prologue:
+    TMA k0 -> stage 0
+    TMA k1 -> stage 1
+
+steady state:
+    wait full[0]
+    MMA k0
+    arrive empty[0]
+    TMA k2 -> stage 0
+
+    wait full[1]
+    MMA k1
+    arrive empty[1]
+    TMA k3 -> stage 1
+
+epilogue:
+    wait full[0]
+    MMA k2
+    arrive empty[0]
+
+    wait full[1]
+    MMA k3
+    arrive empty[1]
+```
+
+真实实现经常把循环展开，让“当前 tile 的 MMA”和“未来 tile 的 TMA”
+并行存在，但数据依赖关系与上面相同。
+
+### phase 必须跟着 stage reuse 翻转
+
+`mbarrier` 可以被重复使用，但每完成一个 phase，其期望相位会翻转：
+
+```text
+第一次使用 stage 0：等 phase 0
+第二次使用 stage 0：等 phase 1
+第三次使用 stage 0：等 phase 0
+```
+
+如果始终等待旧 phase，consumer 可能把上一次 TMA 的完成误认为
+本次新数据已经就绪。
+
+### overlap 条件
+
+要在 steady state 中完全遮住 TMA：
+
+```text
+TMA time(下一 tile) <= MMA time(当前 tile)
+```
+
+如果 TMA 明显更慢，可以增加 stages：
+
+```text
+3 stages、4 stages ...
+```
+
+更多 stages 可以容忍更长的 TMA 延迟，但会线性增加 SMEM 占用。
+
+## 十、TMA 之后还需要 ldmatrix 吗
+
+### 两者解决的问题不同
+
+TMA 负责：
+
+```text
+GMEM -> SMEM
+整个 tile 的异步搬运
+地址生成
+边界处理
+swizzle
+```
+
+`ldmatrix` 负责：
+
+```text
+SMEM -> registers
+lane 之间的 fragment 分发
+构造 MMA 所需的 register fragment
+可选 transpose
+```
+
+因此 TMA 不会自动完成 `ldmatrix` 的寄存器分发工作。
+
+### 后续是 mma.sync
+
+`mma.sync` 的 A/B operands 来自 registers：
+
+```text
+GMEM
+  -> TMA
+SMEM
+  -> ldmatrix
+Registers
+  -> mma.sync
+Tensor Core
+```
+
+所以 TMA 之后仍然需要显式执行 `ldmatrix`。
+
+### 后续是 WGMMA SS
+
+Hopper WGMMA 的 shared-shared 形式可以让 Tensor Core 直接读取
+SMEM：
+
+```text
+GMEM
+  -> TMA
+SMEM
+  -> WGMMA shared-memory operand
+Tensor Core
+```
+
+这条主 A/B 路径通常不需要显式 `ldmatrix`，WGMMA 通过
+matrix descriptor 解释 SMEM 的起点、步长和 swizzle。
+
+accumulator 是否位于 registers、TMEM 或其他位置，取决于具体
+架构和指令形式，不影响这里关于 A/B operand 的判断。
+
+### 后续是 tcgen05.mma
+
+Blackwell `tcgen05.mma` 的 SMEM A/B 路径通常也可以直接消费
+matrix descriptor：
+
+```text
+GMEM
+  -> TMA
+SMEM
+  -> tcgen05.mma descriptor
+Tensor Core
+```
+
+但 accumulator 通常位于 TMEM。把 TMEM 中的结果取到 registers
+使用：
+
+```text
+tcgen05.ld
+tcgen05.wait::ld
+```
+
+这里的 `tcgen05.ld` 是 TMEM -> registers，不能把它和
+SMEM -> registers 的 `ldmatrix` 混为一谈。
+
+### TMA swizzle 不能替代 ldmatrix
+
+两者处理的是不同层次：
+
+```text
+TMA swizzle：
+    决定元素在 SMEM 中的物理地址排列
+
+ldmatrix：
+    决定元素进入哪个 lane 的哪个 register
+```
+
+TMA 可以把数据以正确的 swizzled layout 放进 SMEM，但若后面的
+`mma.sync` 需要 register fragments，仍然要把数据按 lane 分发到
+registers。
+
+### 判定规则
+
+| Tensor Core 路径 | A/B 是否需要显式 `ldmatrix` |
+|---|---|
+| `mma.sync` | 需要，operands 来自 registers |
+| `wgmma.mma_async` 的 SS 形式 | 主路径通常不需要，直接消费 SMEM descriptor |
+| `tcgen05.mma` 的 SMEM 路径 | 主路径通常不需要，直接消费 SMEM descriptor |
+| `tcgen05` accumulator 读取 | 使用 `tcgen05.ld` 从 TMEM 取回 registers |
+
+判断的关键不是“前面有没有 TMA”，而是：
+
+```text
+下一条 Tensor Core 指令从哪里读取 A/B？
+```
+
+如果它要求 register fragments，就需要寄存器分发；如果它支持直接
+读取 SMEM，则通常只需要正确的 matrix descriptor。
+
+## 十一、TMA descriptor 与 MMA descriptor 的契约
+
+### TMA tensor map descriptor
+
+TMA tensor map descriptor 描述：
+
+```text
+global shape
+global strides
+dtype
+box shape
+swizzle mode
+interleave
+OOB fill
+L2 promotion
+```
+
+它回答的是：
+
+```text
+从 GMEM 的哪个逻辑 tile 取数
+按什么形状和 swizzle 写入 SMEM
+越界元素如何处理
+```
+
+### WGMMA / Tensor Core matrix descriptor
+
+WGMMA 与 `tcgen05` 使用的 matrix descriptor 描述：
+
+```text
+SMEM 起点
+leading dimension stride
+stride dimension
+swizzle mode
+base offset / swizzle phase
+```
+
+它回答的是：
+
+```text
+Tensor Core 从哪里开始读 SMEM
+如何解释 SMEM 中的行距和 swizzle
+```
+
+不同架构的 descriptor 位域和编码并不完全相同，但核心语义都是：
+
+```text
+把一块已经存在的数据解释成 Tensor Core 所需的矩阵 operand
+```
+
+### 两段 descriptor 链
+
+完整数据路径可以写成：
+
+```text
+GMEM
+  -> TMA descriptor
+SMEM
+  -> MMA matrix descriptor
+Tensor Core
+```
+
+两个 descriptor 关注的方向不同：
+
+```text
+TMA descriptor：
+    GMEM 如何映射到 SMEM
+
+MMA descriptor：
+    SMEM 如何映射到 Tensor Core operand
+```
+
+它们共同决定最终结果。
+
+### pointer 与 descriptor 的区别
+
+一个 raw pointer 只能描述起点：
+
+```text
+starting address
+```
+
+descriptor 还描述：
+
+```text
+维度
+步长
+tile shape
+swizzle
+phase / base offset
+```
+
+因此 descriptor 不只是“地址的另一种写法”，而是搬运引擎和计算
+单元之间的 layout ABI。
+
+### 必须满足的布局契约
+
+核心约束是：
+
+```text
+TMA 写出的布局
+==
+SMEM 中的实际布局
+==
+MMA descriptor 声明的布局
+```
+
+例如：
+
+```text
+TMA 使用 SWIZZLE_128B
+  -> SMEM 按 SWIZZLE_128B 排列
+
+MMA descriptor 必须声明 SWIZZLE_128B
+  -> Tensor Core 才会按同样规则解释
+```
+
+如果 TMA descriptor 和 MMA descriptor 的 swizzle mode、leading
+dimension stride 或起始位置不一致，硬件可能仍会完成搬运和计算，
+但会读取错误的元素。
+
+### 为什么错误经常是静默的
+
+descriptor 不匹配通常不会触发越界异常，因为地址本身可能仍在
+SMEM 范围内。它更像是“用错误的坐标解释正确范围内的数据”：
+
+```text
+读到别的元素
+数值逐渐偏离
+没有明显崩溃
+```
+
+典型现象包括：
+
+```text
+部分 K/N tile 错位
+更改 tile size 后才暴露问题
+特定 swizzle 或 base offset 下才出错
+结果与 CPU reference 大面积不一致
+```
+
+### base offset 与 swizzle phase
+
+对齐决定数据的起点能不能满足 descriptor 要求：
+
+```text
+base address alignment
+```
+
+base offset / swizzle phase 则决定：
+
+```text
+从 atom 的哪个相对相位开始解释 swizzle
+```
+
+只保证 128-byte 或 1024-byte 对齐，不代表 phase 一定正确。
+如果 descriptor 声明的起始相位与 TMA 实际写入时的相位不一致，
+仍然会读错 layout。
+
+### 下一章继续拆
+
+下一章进入 `chapter_tensor_cores`，继续拆解：
+
+```text
+WGMMA matrix descriptor
+tcgen05 matrix descriptor
+descriptor 位域与编码
+base offset / phase 的精确计算
+相关 Tensor Core 指令形式
+```
+
+## 十二、放到推理系统中
 
 ### Prefill GEMM
 
@@ -1062,7 +1527,7 @@ wait_group 0
 
 确认 source 已读完，才能覆盖 `Dsmem`。
 
-## 十、当前进度
+## 十三、当前进度
 
 `chapter_tma` 已完成：
 
@@ -1082,10 +1547,20 @@ phase 翻转与 stage reuse
 TMA store 的 commit group / wait group
 source buffer 的复用条件
 load 与 store 同步机制不同的原因
+full / empty barrier 与 stage 所有权
+双 stage pipeline
+prologue / steady state / epilogue
+pipeline phase 与 stage reuse
+TMA 之后是否需要 ldmatrix 的判定
+mma.sync、WGMMA、tcgen05 的 operand 消费差异
+TMA tensor map descriptor
+WGMMA / tensor core matrix descriptor
+descriptor 布局 ABI
+base offset / phase 与 descriptor 一致性
 ```
 
-下一小节：
+下一章：
 
 ```text
-把 TMA 放进 pipeline
+chapter_tensor_cores
 ```

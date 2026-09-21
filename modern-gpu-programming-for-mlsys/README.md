@@ -20,7 +20,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [05-ampere-mma-fragments.md](05-ampere-mma-fragments.md) | `mma.sync`、A/B/C/D fragment、`ldmatrix.x1/x2/x4`、`.trans` |
 | [06-warp-tile-and-k-pipeline.md](06-warp-tile-and-k-pipeline.md) | Warp tile、fragment 复用、K 循环、`cp.async`、double buffering |
 | [07-hopper-wgmma-and-blackwell-tmem.md](07-hopper-wgmma-and-blackwell-tmem.md) | Hopper WGMMA accumulator fragment、CUTLASS `CLayout`、Blackwell TMEM、`tcgen05`、SFA/SFB 与 `scale_vec` |
-| [08-tma-tile-copy-and-synchronization.md](08-tma-tile-copy-and-synchronization.md) | TMA descriptor、128-byte swizzle、3D box、row layout、mbarrier load 与 bulk-group store |
+| [08-tma-tile-copy-and-synchronization.md](08-tma-tile-copy-and-synchronization.md) | TMA descriptor、128-byte swizzle、3D box、row layout、pipeline、`ldmatrix` 判断、mbarrier load 与 bulk-group store |
 
 ## 当前进度
 
@@ -70,8 +70,17 @@ TMA load 的 mbarrier completion
 arrival count 与 pending transaction bytes
 TMA store 的 commit group / wait group
 load / store 同步机制差异
-chapter_tma copy / swizzle / synchronization 主体完成
-pipeline overlap 待继续
+full / empty barrier 与 stage 所有权
+双 stage pipeline
+prologue / steady state / epilogue
+pipeline phase 与 stage reuse
+TMA 之后是否需要 `ldmatrix` 的判定
+`mma.sync`、WGMMA、`tcgen05` 的 operand 消费差异
+TMA tensor map descriptor
+WGMMA / Tensor Core matrix descriptor
+descriptor 布局 ABI
+base offset / phase 与 descriptor 一致性
+chapter_tma 完成
 ```
 
 ## 核心主线
@@ -106,7 +115,6 @@ TMEM lane / column 不匹配
 ## 后续可继续整理
 
 ```text
-TMA pipeline
-WGMMA matrix descriptor
+WGMMA / tcgen05 matrix descriptor 字段与编码
 TMA producer / consumer warp specialization
 ```
