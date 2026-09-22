@@ -50,7 +50,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 11-mbarrier-phase-lifecycle.md
 ├── 12-clc-dynamic-scheduling.md
 ├── 13-tirx-first-kernel.md
-└── 14-tirx-layout-api.md
+├── 14-tirx-layout-api.md
+└── 15-gemm-basics.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -200,7 +201,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-14：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-15：
 
 ```text
 layout / named axes / replication / offset
@@ -316,6 +317,9 @@ x=m>>M，source=(x>>S)&mask，x2=x^source，addr=(x2<<M)|low
 j=0 时八行地址为 72*i，bank 为 0,4,8,...,28
 无 swizzle 时八行都落 bank 0
 chapter_tirx_layout_api 第九个知识点完成：ComposeLayout 与 shared-memory swizzle
+GEMM 的 A(M,K) / B(N,K) / D(M,N) 约定
+单 tile baseline 的 GMEM -> SMEM -> TMEM -> registers -> GMEM 数据路径
+chapter_gemm_basics 第 1 个知识点完成：单 Tile Baseline
 ```
 
 完整文档索引、当前进度和硬件环境说明见
