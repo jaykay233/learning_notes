@@ -1,7 +1,8 @@
 # TIRx Layout API：`S[...]`、`R[...]`、offset 与命名轴
 
-这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前两个
-知识点：如何读取和计算：
+这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前三个
+知识点：`S[...] + R[...] + offset` 的语义与计算、命名轴的坐标空间，
+以及 `apply()` 的三种输入形式和 flatten / decompose 路径。先看：
 
 ```text
 S[...] + R[...] + offset
@@ -36,14 +37,14 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 ```text
 [x] TileLayout 的 S[...]、R[...] 与 offset
 [x] 命名轴：laneid / warpid / m / TLane / TCol
-[ ] apply() 的三种输入形式与 flatten / decompose
+[x] apply() 的三种输入形式与 flatten / decompose
 [ ] TMEM accumulator layout 示例
 [ ] scale-factor layout 中的 replication
 [ ] tmem_datapath_layout / tcgen05_atom_layout / wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前两项。后续知识点会在同一章新的小节中继续展开。
+本篇目前完成前三项。后续知识点会在同一章新的小节中继续展开。
 
 ## 一、这个 API 要解决什么问题
 
@@ -1122,21 +1123,711 @@ hardware_col = TCol // 2
 m = 1 * 16 + 3 * 1 = 19
 ```
 
-## 十二、当前进度
+## 十二、`apply()` 的三种输入形式与 flatten / decompose
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：正向映射
+知识点：apply() 的三种输入形式与 flatten / decompose
+上次：命名轴 laneid / warpid / m / TLane / TCol
+下次：TMEM accumulator layout 示例
+PTX：无直接 PTX 指令；结果供后续 tile operation 和 lowering 使用
+```
+
+上一课已经知道，layout 的物理坐标来自每个 iter 的：
+
+```text
+(extent, stride, axis)
+```
+
+这一课进一步解决一个很容易混淆的问题：
+
+```python
+layout.apply(1, 3, shape=[8, 16])
+layout.apply(19)
+layout.apply(1, 0, 1, 1)
+```
+
+为什么这三个看起来不同的调用会得到同一个坐标？它们并不是三个功能，
+而是从同一条映射流水线的三个位置进入。
+
+### 学习目标
+
+学完后应该能够：
+
+1. 说清 logical coordinate、linear coordinate 和 shard coordinate 的区别。
+2. 判断一次 `apply()` 调用是否执行 flatten，是否执行 decompose。
+3. 用逻辑 shape 和 shard extents 手算中间值。
+4. 解释为什么 `TileLayout` 本身不能自动推断逻辑 shape。
+5. 判断 `apply()` 的返回值是否包含 `R[...]` 产生的 replica。
+
+### 心智模型
+
+完整映射可以画成一条流水线：
+
+```text
+logical coordinate + logical shape
+    |
+    | flatten，row-major
+    v
+linear coordinate q
+    |
+    | decompose，按 shard extents
+    v
+shard coordinate (c0, c1, ..., cn-1)
+    |
+    | 每个分量乘 stride，并按 axis 合并
+    v
+physical base coordinate D
+    |
+    | 加固定 offset O
+    v
+layout.apply() 的返回值
+```
+
+`apply()` 的三个入口分别位于：
+
+```text
+logical coordinate + shape -> 从流水线最前面进入
+linear coordinate          -> 从 flatten 之后进入
+shard coordinate           -> 从 decompose 之后进入
+```
+
+因此三种入口的职责可以压缩为：
+
+| 调用形式 | 输入处于哪个阶段 | 是否 flatten | 是否 decompose |
+|---|---|---:|---:|
+| `apply(*logical_coord, shape=...)` | 逻辑坐标 | 是 | 是 |
+| `apply(linear_coord)` | 一维线性索引 | 否 | 是 |
+| `apply(*shard_coord)` | 各 shard iter 的坐标 | 否 | 否 |
+
+三者最后都会执行相同的：
+
+```text
+stride + axis
+-> 合并 physical coordinate
+-> 加 offset
+```
+
+### 三个坐标分别是什么
+
+继续使用前面的 layout：
+
+```python
+layout = TileLayout(
+    S[(8, 2, 4, 2) : (4 @ laneid, 1 @ warpid, 1 @ laneid, 1)]
+    + R[2 : 4 @ warpid]
+    + 5 @ warpid
+)
+```
+
+它包含四个 shard iters：
+
+```text
+(extent, stride, axis)
+(8,      4,      laneid)
+(2,      1,      warpid)
+(4,      1,      laneid)
+(2,      1,      m)
+```
+
+#### Logical coordinate
+
+逻辑坐标是业务或 tile 语义使用的坐标。例如，把 layout 表示的数据解释为
+一个 `8 x 16` 矩阵时：
+
+```text
+(row=1, col=3)
+```
+
+就是一个 logical coordinate。
+
+逻辑 shape 不来自 `TileLayout`，而是调用方在解释逻辑 tensor 时提供的：
+
+```python
+shape = [8, 16]
+```
+
+同一个 `TileLayout` 也可以被解释为：
+
+```python
+shape = [16, 8]
+```
+
+因为两者的元素总数都是：
+
+```text
+8 * 16 = 128
+16 * 8 = 128
+```
+
+但同一个 coordinate `(1, 3)` 在两种解释下的 row-major flatten 值不同。
+这也是本章最重要的边界之一：
+
+```text
+TileLayout 描述 128 个元素的物理映射；
+logical shape 决定 128 个元素如何被用户命名和 flatten。
+```
+
+#### Linear coordinate
+
+线性坐标是 row-major flatten 后的单个索引：
+
+```text
+q in [0, 128)
+```
+
+例如：
+
+```text
+logical (1, 3), shape [8, 16]
+-> q = 1 * 16 + 3
+     = 19
+```
+
+`19` 就是 linear coordinate。
+
+#### Shard coordinate
+
+Shard coordinate 是 `q` 根据 shard extents：
+
+```text
+(8, 2, 4, 2)
+```
+
+拆分后的四个分量：
+
+```text
+(c0, c1, c2, c3)
+```
+
+例如：
+
+```text
+q = 19
+-> (c0, c1, c2, c3) = (1, 0, 1, 1)
+```
+
+这些分量不是新的逻辑维度。它们只是 shard 的四个 iter 分别取什么值。
+
+### 完整可运行代码
+
+下面的脚本不需要 GPU，只需要 TVM。它同时调用三个入口，并用一个
+不同的逻辑 shape 证明逻辑 shape 不会从 `TileLayout` 自动推断。
+
+文件名：
+
+```text
+tirx_apply_inputs.py
+```
+
+完整代码：
+
+```python
+from tvm.tirx.layout import R, S, TileLayout, laneid, warpid
+
+
+def main():
+    layout = TileLayout(
+        S[(8, 2, 4, 2) : (4 @ laneid, 1 @ warpid, 1 @ laneid, 1)]
+        + R[2 : 4 @ warpid]
+        + 5 @ warpid
+    )
+
+    logical_coord = (1, 3)
+    logical_shape = [8, 16]
+
+    flat = logical_coord[0] * logical_shape[1] + logical_coord[1]
+    shard_coord = (1, 0, 1, 1)
+
+    by_logical = layout.apply(*logical_coord, shape=logical_shape)
+    by_linear = layout.apply(flat)
+    by_shard = layout.apply(*shard_coord)
+
+    print("logical + shape:", by_logical)
+    print("linear:", by_linear)
+    print("shard coords:", by_shard)
+    print("same result:", by_logical == by_linear == by_shard)
+
+    alternate_shape = [16, 8]
+    by_alternate_logical = layout.apply(
+        *logical_coord,
+        shape=alternate_shape,
+    )
+    print("alternate shape [16, 8]:", by_alternate_logical)
+
+    try:
+        layout.apply(*logical_coord)
+    except Exception as err:
+        first_line = str(err).splitlines()[0]
+        print("missing shape error:", type(err).__name__, first_line)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 三个阶段对应的代码
+
+#### 入口一：logical coordinate + shape
+
+```python
+by_logical = layout.apply(1, 3, shape=[8, 16])
+```
+
+它执行：
+
+```text
+flatten -> decompose -> stride / axis -> offset
+```
+
+调用者必须明确告诉 `apply()`：目前这两个整数应解释为 `[8, 16]` 中的
+`(row, col)`。`TileLayout` 只知道 shard extents 是 `(8, 2, 4, 2)`，
+并不知道外部逻辑 tensor 是 `8 x 16`、`16 x 8` 还是别的一种 reshape。
+
+#### 入口二：linear coordinate
+
+```python
+by_linear = layout.apply(19)
+```
+
+`19` 已经完成了 flatten，所以这个入口不执行 flatten，只执行：
+
+```text
+decompose -> stride / axis -> offset
+```
+
+它不需要 `shape`，因为一维线性索引不再依赖逻辑 tensor 的维数和每维
+大小。调用这个入口的前提是：调用者已经正确算出了逻辑坐标的 row-major
+linear index。
+
+#### 入口三：shard coordinate
+
+```python
+by_shard = layout.apply(1, 0, 1, 1)
+```
+
+四个参数已经分别对应四个 shard iters，所以这个入口既不 flatten，
+也不 decompose。它只执行：
+
+```text
+stride / axis -> offset
+```
+
+这条路径适合：
+
+```text
+调试 shard iter 到 physical coordinate 的映射
+直接验证某个 iter 组合是否产生期望的 lane / warp / m
+判断错误来自 flatten / decompose，还是来自 stride / axis
+```
+
+### Python 层如何选择入口
+
+当前 TVM 的简化分发逻辑是：
+
+```python
+if len(coord) == 1:
+    return LayoutApplyLinear(self, coord[0])
+if shape is None:
+    return LayoutApply(self, coord)
+return LayoutApplyWithShape(self, coord, shape)
+```
+
+因此：
+
+```text
+一个参数              -> 一律按 linear coordinate 处理
+多个参数且无 shape    -> 按 shard coordinate 处理
+多个参数且有 shape    -> 先按 logical shape flatten，再 decompose
+```
+
+这也解释了一个常见陷阱：
+
+```python
+layout.apply(19)
+```
+
+和：
+
+```python
+layout.apply(19, shape=[...])
+```
+
+在当前实现中不会进入同一分支。前者把 `19` 当 linear coordinate；
+后者只有一个参数，分发逻辑仍优先把它当 linear coordinate，`shape`
+并不会自动把单参数改写成多维逻辑坐标。
+
+### 完整数值追踪一：逻辑 shape `[8, 16]`
+
+查询：
+
+```text
+logical coordinate = (1, 3)
+logical shape      = [8, 16]
+```
+
+#### 1. Flatten
+
+row-major flatten：
+
+```text
+flat = row * shape[1] + col
+     = 1 * 16 + 3
+     = 19
+```
+
+#### 2. Decompose
+
+Shard extents：
+
+```text
+(8, 2, 4, 2)
+```
+
+从组合基数最大的维度开始拆：
+
+| 步骤 | 当前值 | Extent | 商/Coordinate | 余数/Remainder |
+|---:|---:|---:|---:|---:|
+| `c0` | 19 | 8 | `19 // 16 = 1` | `19 % 16 = 3` |
+| `c1` | 3 | 2 | `3 // 8 = 0` | `3 % 8 = 3` |
+| `c2` | 3 | 4 | `3 // 2 = 1` | `3 % 2 = 1` |
+| `c3` | 1 | 2 | `1 // 1 = 1` | `0` |
+
+得到：
+
+```text
+(c0, c1, c2, c3) = (1, 0, 1, 1)
+```
+
+#### 3. 计算 physical base coordinate
+
+| Iter | Coordinate | Stride | Axis | Contribution |
+|---:|---:|---:|---|---|
+| 0 | 1 | 4 | `laneid` | `4 @ laneid` |
+| 1 | 0 | 1 | `warpid` | `0 @ warpid` |
+| 2 | 1 | 1 | `laneid` | `1 @ laneid` |
+| 3 | 1 | 1 | `m` | `1 @ m` |
+
+同一个 axis 的贡献相加：
+
+```text
+laneid = 1 * 4 + 1 * 1
+       = 5
+warpid = 0 * 1
+       = 0
+m      = 1 * 1
+       = 1
+```
+
+所以：
+
+```text
+D(1, 3) = {laneid: 5, warpid: 0, m: 1}
+```
+
+#### 4. 加固定 offset
+
+```text
+O = {warpid: 5}
+```
+
+得到：
+
+```text
+D(1, 3) + O = {laneid: 5, warpid: 5, m: 1}
+```
+
+这就是三个入口共同返回的 base coordinate：
+
+```text
+{"m": 1, "warpid": 5, "laneid": 5}
+```
+
+它仍然不包含 `R[2 : 4@warpid]` 枚举出的副本 `warpid=9`。
+
+### 完整数值追踪二：同一个 `(1, 3)`，逻辑 shape 改成 `[16, 8]`
+
+现在不修改 layout，只把调用方对数据的逻辑解释改成：
+
+```python
+shape = [16, 8]
+```
+
+#### 1. Flatten
+
+```text
+flat = 1 * 8 + 3
+     = 11
+```
+
+同一个逻辑坐标 `(1, 3)` 从 `19` 变成了 `11`。
+
+#### 2. Decompose
+
+| 步骤 | 当前值 | Extent | Coordinate | Remainder |
+|---:|---:|---:|---:|---:|
+| `c0` | 11 | 8 | `11 // 16 = 0` | `11` |
+| `c1` | 11 | 2 | `11 // 8 = 1` | `3` |
+| `c2` | 3 | 4 | `3 // 2 = 1` | `1` |
+| `c3` | 1 | 2 | `1 // 1 = 1` | `0` |
+
+得到：
+
+```text
+(c0, c1, c2, c3) = (0, 1, 1, 1)
+```
+
+#### 3. 合成坐标
+
+```text
+laneid = 0 * 4 + 1 * 1
+       = 1
+warpid = 1 * 1
+       = 1
+m      = 1
+```
+
+再加固定 offset：
+
+```text
+warpid = 1 + 5
+       = 6
+```
+
+最终结果：
+
+```text
+{"m": 1, "warpid": 6, "laneid": 1}
+```
+
+对比表：
+
+| Logical shape | Flatten | Shard coordinate | Base before offset | Final base |
+|---|---:|---|---|---|
+| `[8, 16]` | `1 * 16 + 3 = 19` | `(1, 0, 1, 1)` | `laneid=5, warpid=0, m=1` | `laneid=5, warpid=5, m=1` |
+| `[16, 8]` | `1 * 8 + 3 = 11` | `(0, 1, 1, 1)` | `laneid=1, warpid=1, m=1` | `laneid=1, warpid=6, m=1` |
+
+它直接证明：
+
+```text
+layout 相同，不代表 logical coordinate 的 flatten 结果相同。
+```
+
+在真实 kernel 中，如果 producer 按 `[8, 16]` 解释 tile，而 consumer 按
+`[16, 8]` 解释同一个 coordinate，两边可能都不会报错，却会访问不同的
+warp 和 lane。
+
+### 用等价性检查定位错误
+
+对于合法输入，下面三个调用必须等价：
+
+```python
+layout.apply(1, 3, shape=[8, 16])
+layout.apply(19)
+layout.apply(1, 0, 1, 1)
+```
+
+可以利用这一点做分层检查：
+
+| 检查 | 如果失败，优先怀疑 |
+|---|---|
+| 手算 `flat` 是否等于代码中的 linear coordinate | 逻辑 shape、坐标顺序或 flatten 规则 |
+| `apply(linear)` 与 `apply(*shard_coord)` 是否相同 | decompose 或 shard extents |
+| `apply(logical, shape=...)` 与 `apply(linear)` 是否相同 | flatten、shape 传递或调用入口 |
+| `apply(*shard_coord)` 是否等于手算 coordinate | stride、axis 或 offset |
+
+这是一种很适合推理 kernel 的调试顺序：
+
+```text
+先分离 flatten
+再分离 decompose
+最后检查 stride / axis / offset
+```
+
+它比直接看最终生成的 CUDA 更容易定位布局偏差发生在哪一层。
+
+### `apply()` 的执行边界
+
+`apply()` 只做坐标计算。它不会：
+
+```text
+launch thread
+移动数据
+检查业务层的 row / col bounds
+枚举 replica
+建立 producer / consumer 同步
+```
+
+因此它适合在 Python 中做静态验证和算子开发调试，但不能单独证明
+硬件数据路径正确。`apply()` 返回正确坐标之后，还需要 tile operation、
+lowering 和同步协议各自满足约束。
+
+### 常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 | 优先检查 |
+|---|---|---|---|
+| 认为 `TileLayout` 保存了 logical shape | shape 来自调用方的逻辑解释，不来自 shard extents | 同一 coordinate 在 reshape 后落到不同 warp / lane | 调用双方是否使用同一个 input shape |
+| `apply(*logical_coord)` 忘记 `shape=` | 多参数无 shape 会被当作 shard coordinate | rank 不同时报 coordinate size 错误；rank 相同时可能静默产生错误坐标 | 输入参数个数和 `shape=` |
+| 把 `apply(19)` 当成逻辑坐标 | 单参数入口一律按 linear coordinate 处理 | 以为在查询 `(1, 9)` 或 `(0, 19)`，实际在查询已 flatten 的 `19` | 先手算 `flat` |
+| 给 `apply(19)` 再传 `shape` 期望改变语义 | 当前分发优先匹配单参数 linear 入口 | shape 没有按预期参与 flatten | 使用多参数逻辑坐标入口 |
+| 把 shard coordinate 当成逻辑坐标 | shard 分量属于 iter，不属于业务 tensor 轴 | stride / axis 组合看似正确但坐标来源错误 | 输入处于流水线的哪一阶段 |
+| 认为 `apply()` 会返回所有副本 | `apply()` 只返回 base + offset | 只处理一个位置，另一个 replica 没有数据 | `layout.replica` 的下游 consumer |
+| 假定越界坐标会自动报错 | `apply()` 是映射函数，不承担业务 bounds check | 编译通过，但 physical coordinate 超出预期范围 | 调用前验证 logical domain |
+| logical shape 的元素数不等于 shard 域 | 映射仍可能计算，但输入解释和 layout 契约不一致 | 部分物理位置不用，或越界访问 | `prod(shape)` 与 `prod(shard extents)` |
+| 只看最终 coordinate，不核对中间量 | 最终值错误可能来自 flatten、decompose 或 stride | 只能猜是“layout 错”，无法定位 | 三入口等价性检查 |
+
+在推理 kernel 中，这类错误常表现为：
+
+```text
+GEMM epilogue 按错误的 row / col reshape 读 accumulator
+Attention 的 tile reshape 与 Q/K/V layout 不一致
+量化 scale factor 按错误的扁平索引选择 block
+同一 tile 的 producer 和 consumer 对 logical shape 的理解不同
+debug 时 linear coordinate 手算正确，但传进 apply() 的入口错误
+```
+
+### 验证命令和预期输出
+
+运行：
+
+```bash
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python tirx_apply_inputs.py
+```
+
+本机 TVM `0.26.dev246` 实测输出：
+
+```text
+logical + shape: {"m": 1, "warpid": 5, "laneid": 5}
+linear: {"m": 1, "warpid": 5, "laneid": 5}
+shard coords: {"m": 1, "warpid": 5, "laneid": 5}
+same result: True
+alternate shape [16, 8]: {"m": 1, "warpid": 6, "laneid": 1}
+missing shape error: InternalError Check failed: coord.size() == shard.size() (2 vs. 4) : Coordinate size must match the number of shard axes
+```
+
+需要核对的稳定结果是：
+
+```text
+三个入口在 (1, 3), [8, 16] 下结果相同
+同一个 (1, 3) 在 [16, 8] 下变成 laneid=1, warpid=6, m=1
+多参数逻辑坐标漏掉 shape 时，坐标个数与 shard 个数不匹配
+```
+
+错误信息中的：
+
+```text
+coord.size() == shard.size() (2 vs. 4)
+```
+
+表示调用者传了两个 coordinate，但 layout 有四个 shard iters。它正好
+说明多参数无 `shape` 的分支期待的是 shard coordinate。
+
+本机运行边界：
+
+```text
+可以运行: TileLayout 构造、三个 apply() 入口、flatten / decompose 结果对比
+不能运行: 需要 NVIDIA GPU 或 Blackwell TMEM 的 kernel launch
+```
+
+### 本课结论
+
+把整条流水线再压缩一次：
+
+```text
+apply(*logical, shape=...)
+    = flatten + decompose + mapping
+
+apply(linear)
+    = decompose + mapping
+
+apply(*shard)
+    = mapping
+```
+
+其中三个入口最终都执行：
+
+```text
+mapping = 按 axis 合并 coordinate * stride + 加 offset
+```
+
+最关键的工程结论是：
+
+```text
+physical layout 正确，不代表 logical shape 解释正确；
+两者必须分别验证，并保持 producer / consumer 一致。
+```
+
+### 自测题
+
+#### 1. `apply(19)` 会执行 flatten 吗？
+
+答：不会。`19` 已经是一个 linear coordinate，当前 Python 分发会把它
+直接送入 `LayoutApplyLinear`。它仍然会执行 decompose 和 physical
+coordinate 合成。
+
+#### 2. `(1, 3)` 在逻辑 shape `[16, 8]` 下的 linear coordinate 是多少？
+
+答：
+
+```text
+flat = 1 * 8 + 3
+     = 11
+```
+
+再按 `(8, 2, 4, 2)` 拆成：
+
+```text
+(0, 1, 1, 1)
+```
+
+#### 3. 为什么 `apply(1, 3)` 不传 `shape` 会报错？
+
+答：多参数且没有 `shape` 时，`apply()` 把 `(1, 3)` 解释为 shard
+coordinate。当前 layout 有四个 shard iters，因此输入只有两个坐标，
+不满足：
+
+```text
+coord.size() == shard.size()
+```
+
+#### 4. 为什么同一个 `TileLayout` 可以对应多种 logical shape？
+
+答：`TileLayout` 描述的是固定大小线性域到物理坐标的映射。当前 shard
+域有：
+
+```text
+8 * 2 * 4 * 2 = 128
+```
+
+个元素。只要调用方提供与这个域相符的逻辑解释，`(8, 16)`、`(16, 8)`
+等 shape 都可以 flatten 到这个线性域，但不同 shape 会改变 coordinate
+到 linear index 的对应关系。
+
+#### 5. 三个入口都返回同一个坐标，能否证明整个 kernel 的 replica 和同步也正确？
+
+答：不能。它们只证明 flatten、decompose、stride、axis 和 offset 这一
+条坐标计算链路一致。Replica 枚举、数据移动、producer / consumer
+同步以及硬件执行仍需分别验证。
+
+## 十三、当前进度
 
 `chapter_tirx_layout_api` 的知识点：
 
 ```text
 [x] TileLayout 的 S[...]、R[...] 与 offset
 [x] 命名轴：laneid / warpid / m / TLane / TCol
-[ ] apply() 的三种输入形式与 flatten / decompose
+[x] apply() 的三种输入形式与 flatten / decompose
 [ ] TMEM accumulator layout 示例
 [ ] scale-factor layout 中的 replication
 [ ] tmem_datapath_layout / tcgen05_atom_layout / wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-已经覆盖：
+本篇目前完成前三项。已经覆盖：
 
 ```text
 TileLayout 可以表示 lane、warp、register、TMEM 等命名轴坐标
@@ -1157,11 +1848,21 @@ TLane 表示 TMEM 的硬件 Lane 坐标
 TCol 以 buffer element 为单位，dtype 决定多少个元素打包进 hardware Col
 同一个 axis 的多个 shard iter 贡献必须相加
 用 frag、TMEM 和普通 m layout 对比了三种坐标空间
+apply() 支持 logical + shape、linear、shard coordinate 三种入口
+logical + shape 会执行 flatten 和 decompose
+linear coordinate 只执行 decompose 和 coordinate 合成
+shard coordinate 只执行 stride / axis / offset
+单参数 apply(coord) 在当前实现中按 linear coordinate 处理
+TileLayout 不保存调用方的 logical shape
+逻辑 shape [8, 16] 下 (1, 3) flatten 为 19
+逻辑 shape [16, 8] 下 (1, 3) flatten 为 11
+同一个逻辑坐标在不同 logical shape 下会产生不同 warp / lane coordinate
+可以用三入口等价性分层定位 flatten、decompose、stride / axis 错误
 ```
 
 下一知识点：
 
 ```text
 chapter_tirx_layout_api
--> apply() 的三种输入形式与 flatten / decompose
+-> TMEM accumulator layout 示例
 ```

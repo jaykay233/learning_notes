@@ -271,6 +271,12 @@ chapter_tirx_layout_api 第一个知识点完成：S[...]、R[...] 与 offset
 不同 axis 是不同坐标空间，相同整数值不能直接合并
 m 的语义由 buffer scope 决定，TLane / TCol 描述 TMEM 存储坐标
 chapter_tirx_layout_api 第二个知识点完成：命名轴
+apply() 的 logical + shape、linear、shard coordinate 三种入口
+logical shape 决定 flatten，shard extents 决定 decompose
+TileLayout 不保存 logical shape，同一个 (1, 3) 在不同 shape 下映射不同
+单参数 apply(coord) 按 linear coordinate 处理
+用三入口等价性分层定位 flatten、decompose 与 stride / axis 错误
+chapter_tirx_layout_api 第三个知识点完成：apply() 输入形式
 ```
 
 完整文档索引、当前进度和硬件环境说明见
