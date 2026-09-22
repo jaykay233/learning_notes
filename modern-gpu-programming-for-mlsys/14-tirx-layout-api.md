@@ -1,9 +1,10 @@
 # TIRx Layout API：`S[...]`、`R[...]`、offset 与命名轴
 
-这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前五个
+这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前六个
 知识点：`S[...] + R[...] + offset` 的语义与计算、命名轴的坐标空间，
 `apply()` 的三种输入形式，以及 `2 x 128 x 112` accumulator 的
-`TLane / TCol` 映射，还有 scale-factor atom 沿 `TLane` 的复制。先看：
+`TLane / TCol` 映射、scale-factor atom 沿 `TLane` 的复制，以及
+`tcgen05.mma` D/F datapath 的 row 到 Lane 映射。先看：
 
 ```text
 S[...] + R[...] + offset
@@ -41,11 +42,13 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 [x] apply() 的三种输入形式与 flatten / decompose
 [x] TMEM accumulator layout 示例
 [x] scale-factor layout 中的 replication
-[ ] tmem_datapath_layout / tcgen05_atom_layout / wg_local_layout
+[x] tmem_datapath_layout：D/F datapath
+[ ] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+[ ] wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前五项。后续知识点会在同一章新的小节中继续展开。
+本篇目前完成前六项。后续知识点会在同一章新的小节中继续展开。
 
 ## 一、这个 API 要解决什么问题
 
@@ -3026,7 +3029,568 @@ byte          = 2 % 4 = 2
 描述保存在 `layout.replica` 中，由消费这个 layout 的 tile 操作负责
 生成或搬运。
 
-## 十五、当前进度
+## 十五、`tmem_datapath_layout`：逻辑 M 如何映射到物理 `TLane`
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：常用 Layout 构造函数
+知识点：tmem_datapath_layout 的 datapath / rows / cols 与 D/F row mapping
+上次：scale-factor atom 中 R[4 : 32@TLane] 的四份副本
+下次：tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+PTX：PTX ISA §9.7.16.10.5 的 tcgen05.mma datapath enumeration
+```
+
+上一课解决的是“同一份逻辑数据要不要复制到多个 `TLane`”。本课解决另一个
+问题：
+
+```text
+一个逻辑 accumulator 的第 r 行
+应该由 tcgen05.mma 写到哪条物理 TLane？
+```
+
+这个映射取决于 MMA 使用的 datapath。TIRx 提供：
+
+```python
+tmem_datapath_layout(datapath, rows, cols)
+```
+
+它不是分配 TMEM，也不启动 MMA。它根据 datapath 返回一个
+`TileLayout`，描述逻辑 `(row, col)` 对应的 `TLane / TCol`。
+
+### 为什么不能全部用恒等映射
+
+最直观的 M=128 layout 是：
+
+```text
+TLane = row
+TCol  = col
+```
+
+这在 `datapath="D"` 下成立。但 M=64 的 non-`.ws` MMA 使用 half
+datapath，物理 Lane 不是简单地只写 `0..63`。它把 64 个逻辑 row 分成
+四个 16-row 组，分散放进四个 32-lane partition：
+
+```text
+逻辑 rows  0..15 -> 物理 TLane   0..15
+逻辑 rows 16..31 -> 物理 TLane  32..47
+逻辑 rows 32..47 -> 物理 TLane  64..79
+逻辑 rows 48..63 -> 物理 TLane  96..111
+```
+
+每个 32-lane partition 只使用低 16 条 Lane。
+
+如果这个映射写错，MMA 的写入位置与后续 `tcgen05.ld` 的读取位置就会
+不一致。GEMM 结果可能出现整段 16-row 错位，甚至读到未写入的 Lane。
+
+### 当前支持的两种 datapath
+
+当前 TIRx 工厂支持：
+
+| `datapath` | rows / M | MMA 范围 | 映射思想 |
+|---|---:|---|---|
+| `"D"` | 128 | `cta_group::1` full datapath | `TLane = row` |
+| `"F"` | 64 | non-`.ws` half datapath | 四个 16-row slab 分散到 32-lane partitions |
+
+PTX 还定义其他 layout 名称，但当前工厂只实现 `D` 和 `F`。传入 `"A"`、
+`"B"`、`"C"`、`"E"`、`"G"` 会报 unknown datapath，而不是自动选择
+近似映射。
+
+这里必须区分：
+
+```text
+datapath 是 MMA 的硬件行映射契约；
+rows / cols 是它要描述的 accumulator 逻辑 shape。
+```
+
+`datapath` 和 `rows` 不能随意组合：
+
+```text
+"D" 只接受 rows=128
+"F" 只接受 rows=64
+```
+
+`cols` 是逻辑 column extent。它可以是实际 N tile 大小，例如 112、224、
+256；`TCol` 仍以 buffer element 为单位。
+
+### 等价的显式 TileLayout
+
+工厂没有引入新的 layout 类型。它只是生成常见的 `TileLayout`。
+
+#### Datapath D
+
+```python
+tmem_datapath_layout("D", 128, cols)
+```
+
+等价于：
+
+```python
+TileLayout(
+    S[(128, cols) : (1@TLane, 1@TCol)]
+)
+```
+
+映射：
+
+```text
+TLane = row
+TCol  = col
+```
+
+#### Datapath F
+
+```python
+tmem_datapath_layout("F", 64, cols)
+```
+
+等价于：
+
+```python
+TileLayout(
+    S[(4, 16, cols) : (32@TLane, 1@TLane, 1@TCol)]
+)
+```
+
+逻辑 row 先分解成：
+
+```text
+w     = row // 16
+intra = row % 16
+```
+
+再计算：
+
+```text
+TLane = 32 * w + intra
+TCol  = col
+```
+
+其中：
+
+```text
+w     in [0, 4)
+intra in [0, 16)
+```
+
+这是“四个 slab”的来源。
+
+### 完整可运行代码
+
+文件名：
+
+```text
+tirx_tmem_datapath_layout.py
+```
+
+完整代码：
+
+```python
+from tvm.tirx.layout import tmem_datapath_layout
+
+
+def show(name, layout, shape, coords):
+    print(f"{name} layout:", layout)
+    print(f"{name} shard:", layout.shard)
+    print(f"{name} size:", layout.size())
+    print(f"{name} span TLane:", layout.span("TLane"))
+    print(f"{name} span TCol:", layout.span("TCol"))
+    for r, c in coords:
+        print(f"{name} ({r}, {c}) ->", layout.apply(r, c, shape=shape))
+
+
+def expect_error(datapath, rows, cols):
+    try:
+        tmem_datapath_layout(datapath, rows, cols)
+    except ValueError as exc:
+        print(f"error ({datapath}, {rows}, {cols}):", exc)
+
+
+def main():
+    d = tmem_datapath_layout("D", 128, 112)
+    f = tmem_datapath_layout("F", 64, 112)
+
+    show(
+        "D",
+        d,
+        [128, 112],
+        [(0, 0), (15, 7), (16, 9), (127, 31)],
+    )
+    show(
+        "F",
+        f,
+        [64, 112],
+        [(0, 0), (15, 7), (16, 9), (31, 13), (32, 17), (63, 23)],
+    )
+
+    expect_error("D", 64, 16)
+    expect_error("F", 128, 16)
+    expect_error("A", 128, 16)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 逐段解释
+
+#### `datapath="D"`
+
+```python
+d = tmem_datapath_layout("D", 128, 112)
+```
+
+工厂检查：
+
+```text
+datapath 必须是 D
+rows 必须等于 128
+```
+
+然后返回：
+
+```text
+T.TileLayout(
+    T.S[(128, 112) : (1 @ Axis.TLane, 1 @ Axis.TCol)]
+)
+```
+
+这就是 M=128 的 full datapath，逻辑 row `0..127` 对应物理
+`TLane 0..127`。
+
+#### `datapath="F"`
+
+```python
+f = tmem_datapath_layout("F", 64, 112)
+```
+
+工厂检查：
+
+```text
+datapath 必须是 F
+rows 必须等于 64
+```
+
+返回的 shard 有三个 iter：
+
+```text
+T.Iter(4,   32, "TLane")
+T.Iter(16,   1, "TLane")
+T.Iter(112,  1, "TCol")
+```
+
+三个 extent 是 `(4, 16, 112)`，但调用方的逻辑 shape 仍是 `(64, 112)`。
+`TileLayout` 的 shard extent 与逻辑 shape 不需要逐个相等，因为 `apply()`
+可以先 flatten 逻辑 `(64,112)`，再按内部 shard 分解。
+
+#### 为什么 `F.apply` 要传 `shape`
+
+下面这个调用是不完整的：
+
+```python
+f.apply(row, col)
+```
+
+`F` 的内部 shard 有三个 iter，而这里只提供两个 coordinate，因此会报：
+
+```text
+Coordinate size must match the number of shard axes: 2 vs. 3
+```
+
+应该传逻辑 shape：
+
+```python
+f.apply(row, col, shape=[64, 112])
+```
+
+或者自己提供三个 shard coordinate：
+
+```python
+f.apply(row // 16, row % 16, col)
+```
+
+第一种调用保留了逻辑 `(row, col)` 语义，也是课程示例使用的方式。
+
+#### 为什么 `rows` 不能写错
+
+```python
+tmem_datapath_layout("F", 128, 112)
+```
+
+会得到：
+
+```text
+datapath='F' expects rows=64, got 128
+```
+
+因为 F 描述的是一个 M=64 的 half datapath。给它 128 行并不能自动变成
+D，也不能自动拆成两个 F tile。
+
+### D 与 F 的逐 row 对比
+
+对同一个 `TCol=col`，两种 datapath 的部分映射如下：
+
+| 逻辑 row | D 的 `TLane` | F 的 `TLane` | 说明 |
+|---:|---:|---:|---|
+| 0 | 0 | 0 | 第一个 slab 起点 |
+| 15 | 15 | 15 | 第一个 slab 终点 |
+| 16 | 16 | 32 | F 开始第二个 slab |
+| 31 | 31 | 47 | 第二个 slab 终点 |
+| 32 | 32 | 64 | F 开始第三个 slab |
+| 47 | 47 | 79 | 第三个 slab 终点 |
+| 48 | 48 | 96 | F 开始第四个 slab |
+| 63 | 63 | 111 | F 最后一个合法 row |
+| 64 | 64 | 非法 | F 只有 64 行 |
+| 127 | 127 | 非法 | D 的最后一行 |
+
+一个具体计算，F 的 `row=45`：
+
+```text
+w     = 45 // 16 = 2
+intra = 45 % 16 = 13
+
+TLane = 32 * 2 + 13
+      = 64 + 13
+      = 77
+```
+
+所以：
+
+```text
+逻辑 (45, col)
+-> 物理 (TLane=77, TCol=col)
+```
+
+### F 的 Lane hole
+
+F 只使用：
+
+```text
+0..15
+32..47
+64..79
+96..111
+```
+
+没有使用：
+
+```text
+16..31
+48..63
+80..95
+112..127
+```
+
+因此：
+
+```text
+logical rows  = 4 * 16 = 64
+active lanes  = 4 * 16 = 64
+span TLane    = 112
+```
+
+`span("TLane")=112` 表示最高使用坐标是 `111`，不是表示
+`TLane 0..111` 全部被使用。
+
+这正是 span 与 active set 的区别：
+
+```text
+span   描述坐标上界包络
+layout 的映射结果决定哪些坐标真正被使用
+```
+
+### 它与 scale-factor replica 的区别
+
+上一课的：
+
+```python
+R[4 : 32@TLane]
+```
+
+表示同一个逻辑 scale factor 被复制到四个物理位置。
+
+本课 F 的：
+
+```text
+S[(4, 16, cols) : (32@TLane, 1@TLane, 1@TCol)]
+```
+
+不是复制。不同的逻辑 row 被分配到不同的物理 Lane：
+
+```text
+row 0 和 row 16 是不同的逻辑数据
+它们分别去 TLane 0 和 TLane 32
+```
+
+对比：
+
+| 机制 | 逻辑数据是否重复 | 目的 |
+|---|---|---|
+| `R[...]` replica | 是 | 多个 partition 获得同一份数据 |
+| F datapath | 否 | 把一个 M=64 tile 分散到 half datapath |
+
+### 数据路径与契约边界
+
+真实路径中：
+
+```text
+tcgen05.mma
+  -> 按 datapath layout 写 TMEM accumulator
+
+tcgen05.ld / tcgen05.st atom
+  -> 使用匹配的 register tile layout 读 TMEM
+```
+
+`tmem_datapath_layout` 只负责生产端的 row -> Lane 映射描述。它不负责：
+
+```text
+选择 tcgen05.mma 的 datapath 指令形式
+分配 TMEM columns
+提交或等待 MMA
+生成 tcgen05.ld 的 register mapping
+验证 producer 与 consumer 的完整等价性
+```
+
+工程上必须满足：
+
+```text
+MMA 的 datapath
+== tmem_datapath_layout 的 datapath
+== tcgen05.ld atom 期望的 TMEM row mapping
+```
+
+在 GEMM 中，D/F 不匹配可能表现为：
+
+```text
+输出 rows 16..31、32..47、48..63 出现整段错位
+M=64 结果只填满错误的一半 Lane
+epilogue 从空白 Lane 读取数据
+同一次 MMA 的部分 warp partition 结果正确、其他 partition 错误
+```
+
+在 block-scaled 量化 GEMM 中，还会进一步导致 scale factor 的本地窗口
+与 accumulator row 对应错误，产生整块数值偏差。
+
+### 常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 | 优先检查 |
+|---|---|---|---|
+| `("D", 64, cols)` | D 是 M=128 full datapath | 工厂抛出 rows 不匹配 | datapath 与 M |
+| `("F", 128, cols)` | F 只支持 M=64 | 工厂抛出 rows 不匹配 | 是否需要用 D |
+| 用 `f.apply(row, col)` | F shard 有三个 iter | 报 coordinate size 2 vs. 3 | 是否传 logical shape |
+| 认为 F 使用 `TLane 0..63` | F 分散到四段 16-row slab | 后三个 slab 的读取地址错误 | `r // 16`、`r % 16` |
+| 认为 F 的 span 112 表示连续使用 112 Lane | 四段之间和末尾有 hole | 误分配或读取未使用 Lane | active lane 集合 |
+| 把 F 当成 scale replica | F 映射不同逻辑 row，不复制 | 数据被错误重复或 row 被覆盖 | `R[...]` 与 S[...] 的区别 |
+| D/F 与 MMA 形式不一致 | row mapping 是硬件契约 | MMA 写入与 readback 不匹配 | PTX datapath 与 lowering |
+| 把 `cols` 当成 hardware column 数 | `TCol` 以 buffer element 为单位 | fp16/fp8 打包地址出现倍数错误 | dtype 与 hardware cell |
+
+### 验证命令和预期输出
+
+运行：
+
+```bash
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python tirx_tmem_datapath_layout.py
+```
+
+本机 TVM `0.26.dev246` 实测输出：
+
+```text
+D layout: T.TileLayout(T.S[(128, 112):(1 @ Axis.TLane, 1 @ Axis.TCol)])
+D shard: (T.Iter(128, 1, "TLane"), T.Iter(112, 1, "TCol"))
+D size: 14336
+D span TLane: 128
+D span TCol: 112
+D (0, 0) -> {"TCol": 0, "TLane": 0}
+D (15, 7) -> {"TCol": 7, "TLane": 15}
+D (16, 9) -> {"TCol": 9, "TLane": 16}
+D (127, 31) -> {"TCol": 31, "TLane": 127}
+F layout: T.TileLayout(T.S[(4, 16, 112):(32 @ Axis.TLane, 1 @ Axis.TLane, 1 @ Axis.TCol)])
+F shard: (T.Iter(4, 32, "TLane"), T.Iter(16, 1, "TLane"), T.Iter(112, 1, "TCol"))
+F size: 7168
+F span TLane: 112
+F span TCol: 112
+F (0, 0) -> {"TCol": 0, "TLane": 0}
+F (15, 7) -> {"TCol": 7, "TLane": 15}
+F (16, 9) -> {"TCol": 9, "TLane": 32}
+F (31, 13) -> {"TCol": 13, "TLane": 47}
+F (32, 17) -> {"TCol": 17, "TLane": 64}
+F (63, 23) -> {"TCol": 23, "TLane": 111}
+error (D, 64, 16): tmem_datapath_layout: datapath='D' expects rows=128, got 64
+error (F, 128, 16): tmem_datapath_layout: datapath='F' expects rows=64, got 128
+error (A, 128, 16): tmem_datapath_layout: unknown datapath 'A'; supported: ['D', 'F']
+```
+
+本机运行边界：
+
+```text
+可以运行: datapath 工厂、TileLayout 查询、D/F 坐标推导和参数校验
+不能运行: 真实 tcgen05.mma 写入和需要 Blackwell 的 kernel
+```
+
+### 本课结论
+
+D：
+
+```text
+rows = 128
+TLane = row
+TCol  = col
+```
+
+F：
+
+```text
+rows = 64
+w     = row // 16
+intra = row % 16
+TLane = 32 * w + intra
+TCol  = col
+```
+
+最重要的边界是：
+
+```text
+datapath 是 MMA 写入 TMEM 的 row mapping 契约。
+工厂只生成布局描述，不执行 MMA，也不代替 tcgen05.ld 的匹配验证。
+```
+
+### 自测题
+
+#### 1. `datapath="D"`、`rows=112` 会发生什么？
+
+答：抛出参数错误。D 要求 `rows=128`，不能通过缩小 rows 得到 M=112
+的 D datapath。
+
+#### 2. `datapath="F"`、逻辑 `row=45` 映射到哪条 `TLane`？
+
+答：
+
+```text
+w     = 45 // 16 = 2
+intra = 45 % 16 = 13
+TLane = 32 * 2 + 13 = 77
+```
+
+所以映射到 `TLane=77`。
+
+#### 3. F 的 `span("TLane")` 为什么是 112？
+
+答：F 最高使用 `TLane=111`，坐标上界加一得到 112。它不表示
+`0..111` 都连续被使用，四段 slab 之间仍有 hole。
+
+#### 4. F 是否把同一行数据复制到四个 slab？
+
+答：不是。F 把不同的逻辑 row 分配到四个 slab，每个逻辑 row 只有一个
+物理位置。复制是 `R[...]` replica 的语义。
+
+#### 5. 为什么 `f.apply(16, 9)` 不能直接调用？
+
+答：F 的内部 shard 有三个 iter，而两个参数只提供两个坐标。应传逻辑
+shape，例如 `f.apply(16, 9, shape=[64, 112])`。
+
+## 十六、当前进度
 
 `chapter_tirx_layout_api` 的知识点：
 
@@ -3036,11 +3600,13 @@ byte          = 2 % 4 = 2
 [x] apply() 的三种输入形式与 flatten / decompose
 [x] TMEM accumulator layout 示例
 [x] scale-factor layout 中的 replication
-[ ] tmem_datapath_layout / tcgen05_atom_layout / wg_local_layout
+[x] tmem_datapath_layout：D/F datapath
+[ ] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+[ ] wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前五项。已经覆盖：
+本篇目前完成前六项。已经覆盖：
 
 ```text
 TileLayout 可以表示 lane、warp、register、TMEM 等命名轴坐标
@@ -3086,11 +3652,18 @@ q=0 就是 base 本身，因此总数是四份
 8-bit scale 的 logical TCol s 打包为 hardware TCol s//4 和 byte s%4
 layout.apply() 只返回 base，replica 保存在 layout.replica
 layout 描述复制目标，tcgen05.cp 执行数据搬运，MMA 消费本地副本
+tmem_datapath_layout(datapath, rows, cols) 返回 tcgen05.mma 的 TMEM row mapping
+datapath=D 要求 rows=128，TLane=row，TCol=col
+datapath=F 要求 rows=64，把四个 16-row slab 放到 Lane 0/32/64/96 起点的低 16 Lane
+F 的 TLane=32*(row//16)+row%16，映射不是复制
+F 使用 64 条 active Lane，但 span TLane 是 112，因为 111 是最高 Lane
+F.apply(row,col) 需要 shape=[64,cols]，因为内部 shard 有三个 iter
+datapath 必须同时匹配 MMA 写入形式和 tcgen05.ld atom 的读取映射
 ```
 
 下一知识点：
 
 ```text
 chapter_tirx_layout_api
--> tmem_datapath_layout 的 datapath / rows / cols 参数
+-> tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
 ```

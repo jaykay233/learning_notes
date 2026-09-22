@@ -27,7 +27,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
 | [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
 | [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
-| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、`TLane / TCol` accumulator layout，以及 scale-factor replica 推导 |
+| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica，以及 `tmem_datapath_layout` 的 D/F row mapping |
 
 ## 当前进度
 
@@ -208,13 +208,19 @@ scale-factor atom 的 R[4 : 32@TLane] 在 TLane 上生成四份副本
 8-bit logical TCol s 打包到 hardware TCol s//4 和 byte s%4
 layout.apply() 只返回 base，layout.replica 描述四份副本
 chapter_tirx_layout_api 第五个知识点完成：scale-factor replication
+tmem_datapath_layout 根据 datapath 返回 tcgen05.mma 的 TMEM row mapping
+datapath=D 使用 rows=128，恒等映射 TLane=row
+datapath=F 使用 rows=64，四个 16-row slab 分散到 Lane 0/32/64/96
+F 的公式 TLane=32*(row//16)+row%16，不复制逻辑数据
+F 只使用 64 条 active Lane，span TLane=112 来自最高 Lane 111
+chapter_tirx_layout_api 第六个知识点完成：tmem_datapath_layout D/F
 ```
 
 ## 下一知识点
 
 ```text
 chapter_tirx_layout_api
--> tmem_datapath_layout 的 datapath / rows / cols 参数
+-> tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
 ```
 
 ## 核心主线

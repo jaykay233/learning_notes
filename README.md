@@ -288,6 +288,12 @@ scale-factor atom 的 R[4 : 32@TLane] 在 TLane 上生成四份副本
 8-bit logical TCol s 打包到 hardware TCol s//4 和 byte s%4
 layout.apply() 只返回 base，layout.replica 描述四份副本
 chapter_tirx_layout_api 第五个知识点完成：scale-factor replication
+tmem_datapath_layout 根据 datapath 返回 tcgen05.mma 的 TMEM row mapping
+datapath=D 使用 rows=128，恒等映射 TLane=row
+datapath=F 使用 rows=64，四个 16-row slab 分散到 Lane 0/32/64/96
+F 的公式 TLane=32*(row//16)+row%16，不复制逻辑数据
+F 只使用 64 条 active Lane，span TLane=112 来自最高 Lane 111
+chapter_tirx_layout_api 第六个知识点完成：tmem_datapath_layout D/F
 ```
 
 完整文档索引、当前进度和硬件环境说明见
