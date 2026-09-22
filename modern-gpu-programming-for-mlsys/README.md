@@ -27,7 +27,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
 | [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
 | [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
-| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义，以及 `apply()` 的 logical / linear / shard 三种入口与完整 flatten / decompose 推导 |
+| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口，以及 `TLane / TCol` accumulator layout 推导 |
 
 ## 当前进度
 
@@ -197,13 +197,18 @@ TileLayout 不保存 logical shape，同一个 (1, 3) 在 [8, 16] 与 [16, 8] �
 单参数 apply(coord) 按 linear coordinate 处理
 用三入口等价性分层定位 flatten、decompose 与 stride / axis 错误
 chapter_tirx_layout_api 第三个知识点完成：apply() 输入形式
+(2, 128, 112) accumulator layout 的两个 128 x 112 TMEM 区域
+TLane 承载 128 个逻辑 M rows，TCol 覆盖 [0, 224)
+TCol = 112 * a + col，非 2 的幂 extent 112 无需补齐
+layout 只描述 TMEM 坐标，不负责 allocation、MMA 或 tcgen05.ld
+chapter_tirx_layout_api 第四个知识点完成：TMEM accumulator layout
 ```
 
 ## 下一知识点
 
 ```text
 chapter_tirx_layout_api
--> TMEM accumulator layout 示例
+-> scale-factor layout 中的 replication
 ```
 
 ## 核心主线

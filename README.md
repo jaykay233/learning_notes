@@ -277,6 +277,11 @@ TileLayout 不保存 logical shape，同一个 (1, 3) 在不同 shape 下映射�
 单参数 apply(coord) 按 linear coordinate 处理
 用三入口等价性分层定位 flatten、decompose 与 stride / axis 错误
 chapter_tirx_layout_api 第三个知识点完成：apply() 输入形式
+(2, 128, 112) accumulator layout 的两个 128 x 112 TMEM 区域
+TLane 承载 128 个逻辑 M rows，TCol 覆盖 [0, 224)
+TCol = 112 * a + col，非 2 的幂 extent 112 无需补齐
+layout 只描述 TMEM 坐标，不负责 allocation、MMA 或 tcgen05.ld
+chapter_tirx_layout_api 第四个知识点完成：TMEM accumulator layout
 ```
 
 完整文档索引、当前进度和硬件环境说明见

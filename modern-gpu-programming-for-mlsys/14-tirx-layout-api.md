@@ -1,8 +1,9 @@
 # TIRx Layout API：`S[...]`、`R[...]`、offset 与命名轴
 
-这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前三个
+这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前四个
 知识点：`S[...] + R[...] + offset` 的语义与计算、命名轴的坐标空间，
-以及 `apply()` 的三种输入形式和 flatten / decompose 路径。先看：
+`apply()` 的三种输入形式，以及 `2 x 128 x 112` accumulator 的
+`TLane / TCol` 映射。先看：
 
 ```text
 S[...] + R[...] + offset
@@ -38,13 +39,13 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 [x] TileLayout 的 S[...]、R[...] 与 offset
 [x] 命名轴：laneid / warpid / m / TLane / TCol
 [x] apply() 的三种输入形式与 flatten / decompose
-[ ] TMEM accumulator layout 示例
+[x] TMEM accumulator layout 示例
 [ ] scale-factor layout 中的 replication
 [ ] tmem_datapath_layout / tcgen05_atom_layout / wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前三项。后续知识点会在同一章新的小节中继续展开。
+本篇目前完成前四项。后续知识点会在同一章新的小节中继续展开。
 
 ## 一、这个 API 要解决什么问题
 
@@ -1813,7 +1814,568 @@ coord.size() == shard.size()
 条坐标计算链路一致。Replica 枚举、数据移动、producer / consumer
 同步以及硬件执行仍需分别验证。
 
-## 十三、当前进度
+## 十三、TMEM accumulator layout 示例：`2 x 128 x 112`
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：示例：Blackwell Tensor Memory
+知识点：2 x 128 x 112 accumulator 映射到 TLane / TCol
+上次：apply() 的三种输入形式与 flatten / decompose
+下次：scale-factor layout 中的 replication
+PTX：tcgen05.mma 的 d-tmem 坐标；本课不讨论具体指令编码
+```
+
+上一课解决了 `apply()` 如何从逻辑坐标计算物理坐标。这一课把同样的方法
+用于一个具体问题：
+
+```text
+一个 shape 为 (2, 128, 112) 的 accumulator 逻辑 tile，
+如何放到 TMEM 的 TLane / TCol 坐标中？
+```
+
+这里的重点不是背一个固定 layout，而是分清：
+
+```text
+逻辑 tensor 的 a / lane / col
+物理 TMEM 的 TLane / TCol
+```
+
+### 先建立 TMEM 的物理图
+
+在 `sm_100a` 上，一个 CTA 的 TMEM 可以画成：
+
+```text
+           TCol
+             0        ...        511
+TLane  0  +------+------+------+------+
+          | cell | cell | ...  | cell |
+       1  +------+------+------+------+
+          | cell | cell | ...  | cell |
+       ...                              ...
+     127  +------+------+------+------+
+```
+
+每个坐标最多对应一个 32-bit cell：
+
+```text
+TLane in [0, 128)
+TCol  in [0, 512)
+```
+
+本课要描述的 accumulator 只使用其中一部分：
+
+```text
+TLane in [0, 128)
+TCol  in [0, 224)
+```
+
+因此它没有填满 TMEM，只是在 128 条 Lane 上占用前 224 个 columns。
+
+### 心智模型
+
+把逻辑 tile 想成两个并排的 `128 x 112` 区域：
+
+```text
+逻辑 a = 0
+  +--------------------------+
+  | TLane 0..127             |
+  | TCol  0..111             |
+  +--------------------------+
+
+逻辑 a = 1
+  +--------------------------+
+  | TLane 0..127             |
+  | TCol  112..223           |
+  +--------------------------+
+```
+
+映射关系可以直接写成：
+
+```text
+TLane = lane
+TCol  = 112 * a + col
+```
+
+其中：
+
+| 坐标 | 逻辑范围 | 物理含义 |
+|---|---:|---|
+| `a` | `[0, 2)` | 外层区域编号 |
+| `lane` | `[0, 128)` | 当前区域内的 M row |
+| `col` | `[0, 112)` | 当前区域内的 N column |
+| `TLane` | `[0, 128)` | TMEM 硬件 Lane |
+| `TCol` | `[0, 224)` | TMEM element Column 坐标 |
+
+`a` 的语义由调用方决定。它可以表示一个外层 stage、region 或别的逻辑分组；
+`TileLayout` 本身只规定映射，不会自动赋予 `a` 这个业务含义。
+
+### 完整可运行代码
+
+下面的脚本可以在没有 NVIDIA GPU 的 macOS 上运行。它只构造 layout、
+查询 span 和计算坐标，不执行真正的 `tcgen05.mma`。
+
+文件名：
+
+```text
+tirx_tmem_accumulator_layout.py
+```
+
+完整代码：
+
+```python
+from tvm.tirx.layout import S, TCol, TileLayout, TLane
+
+
+def main():
+    layout = TileLayout(
+        S[(2, 128, 112) : (112 @ TCol, 1 @ TLane, 1 @ TCol)]
+    )
+    logical_shape = [2, 128, 112]
+
+    print("layout:", layout)
+    print("size:", layout.size())
+    print("span TLane:", layout.span("TLane"))
+    print("span TCol:", layout.span("TCol"))
+
+    coords = [
+        (0, 0, 0),
+        (0, 17, 30),
+        (1, 17, 30),
+        (1, 127, 111),
+    ]
+    for a, lane, col in coords:
+        physical = layout.apply(a, lane, col, shape=logical_shape)
+        print(f"({a}, {lane}, {col}) ->", physical)
+
+    from_logical = layout.apply(1, 17, 30, shape=logical_shape)
+    from_linear = layout.apply(16270)
+    print("linear 16270 ->", from_linear)
+    print("logical == linear:", from_logical == from_linear)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 逐行解释
+
+#### Shard extents
+
+```python
+S[(2, 128, 112) : (112 @ TCol, 1 @ TLane, 1 @ TCol)]
+```
+
+三个 iters 分别是：
+
+| Iter | Extent | Stride | Axis | 含义 |
+|---:|---:|---:|---|---|
+| 0 | 2 | 112 | `TCol` | 每进入一个外层区域，TCol 前进 112 |
+| 1 | 128 | 1 | `TLane` | M row 直接映射到 128 条 Lane |
+| 2 | 112 | 1 | `TCol` | 区域内 column 连续排列 |
+
+逻辑域大小是：
+
+```text
+2 * 128 * 112 = 28672
+```
+
+物理范围是：
+
+```text
+128 * 224 = 28672
+```
+
+所以这个 layout 是一对一映射，没有 replication，也没有空洞。
+
+#### `layout.size()` 和 `layout.span(...)`
+
+```python
+layout.size()
+layout.span("TLane")
+layout.span("TCol")
+```
+
+分别得到：
+
+```text
+size      = 28672
+TLane span = 128
+TCol span  = 224
+```
+
+需要区分：
+
+```text
+size       -> 逻辑元素总数
+TLane span -> 该 axis 上需要的坐标范围
+TCol span  -> 该 axis 上需要的坐标范围
+```
+
+`TCol span = 224` 不表示 TMEM 只有 224 个 columns；硬件容量仍是
+128 x 512。它只表示这个 layout 实际使用了 `[0, 224)`。
+
+#### `apply()` 的调用
+
+```python
+layout.apply(a, lane, col, shape=[2, 128, 112])
+```
+
+这里逻辑 shape 和 shard extents 都是 `(2, 128, 112)`，因此：
+
+```text
+logical coordinate
+-> flatten
+-> decompose
+-> 又得到同一个 (a, lane, col)
+```
+
+这看似绕了一圈，但它保持了上一课的统一模型。若调用者已经拥有 shard
+coordinate，也可以直接调用：
+
+```python
+layout.apply(a, lane, col)
+```
+
+本例中两者结果相同，因为逻辑 shape 恰好等于 shard extents。
+
+### 数值追踪一：`(0, 17, 30)`
+
+外层区域：
+
+```text
+a = 0
+```
+
+计算：
+
+```text
+TLane = lane
+      = 17
+
+TCol = 112 * a + col
+     = 112 * 0 + 30
+     = 30
+```
+
+结果：
+
+```text
+{"TLane": 17, "TCol": 30}
+```
+
+它位于第一个 `128 x 112` 区域。
+
+### 数值追踪二：`(1, 17, 30)`
+
+只把外层区域从 `0` 改成 `1`：
+
+```text
+TLane = 17
+
+TCol = 112 * 1 + 30
+     = 112 + 30
+     = 142
+```
+
+结果：
+
+```text
+{"TLane": 17, "TCol": 142}
+```
+
+两个逻辑坐标的 `lane` 和 `col` 相同，但属于不同的 `a`，因此物理
+`TCol` 相差 112。
+
+如果从逻辑坐标完整走一遍前面学过的 flatten / decompose：
+
+```text
+flat = ((1 * 128) + 17) * 112 + 30
+     = (128 + 17) * 112 + 30
+     = 145 * 112 + 30
+     = 16240 + 30
+     = 16270
+```
+
+按 shard extents `(2, 128, 112)` 分解：
+
+| 步骤 | 当前值 | 组合基数 | Coordinate | Remainder |
+|---:|---:|---:|---:|---:|
+| `c0` | 16270 | `128 * 112 = 14336` | `16270 // 14336 = 1` | `1934` |
+| `c1` | 1934 | `112` | `1934 // 112 = 17` | `30` |
+| `c2` | 30 | `1` | `30` | `0` |
+
+得到：
+
+```text
+(c0, c1, c2) = (1, 17, 30)
+```
+
+再计算：
+
+```text
+TLane = 17 * 1
+      = 17
+
+TCol = 1 * 112 + 30 * 1
+     = 142
+```
+
+所以下面的调用结果相同：
+
+```python
+layout.apply(1, 17, 30, shape=[2, 128, 112])
+layout.apply(16270)
+```
+
+#### 为什么是 `16270`？
+
+因为它是以 `(2, 128, 112)` 为逻辑 shape、按 row-major 顺序展开后的
+linear coordinate。若把逻辑 shape 改成 `(128, 2, 112)`，同一个坐标
+三元组即使数值相同，也会被解释成另一个逻辑元素；这就是上一课强调
+“逻辑 shape 不来自 layout”的具体表现。
+
+### 边界检查：`(1, 127, 111)`
+
+最后一个合法坐标：
+
+```text
+TLane = 127
+TCol  = 112 * 1 + 111
+      = 223
+```
+
+所以物理范围是半开区间：
+
+```text
+TLane in [0, 128)
+TCol  in [0, 224)
+```
+
+`TCol=224` 已经越界，不属于这个 layout。
+
+### 为什么 extent 可以是 112
+
+TMEM layout 并没有要求每一维必须是 2 的幂。这里可以直接写：
+
+```python
+112 @ TCol
+```
+
+原因有两层：
+
+```text
+物理层：TMEM 按 Lane / Col 坐标寻址，不是要求逻辑 extent 必须对齐到 128。
+布局层：TileLayout 只计算 coordinate，112 是一个合法的迭代范围。
+```
+
+使用两个 `112` column 区域的原因是设计选择，不是硬件强制：
+
+```text
+2 * 112 = 224 columns
+```
+
+这样还留下：
+
+```text
+512 - 224 = 288 columns
+```
+
+可给其他 accumulator stage、scale factors、workspace 或其他 TMEM 数据。
+
+在 block-scaled FP8 GEMM 中，这种“不要盲目占满 256 columns”的选择很常见：
+一个 kernel 可能同时需要多个 accumulator 区域和额外的 SFA/SFB 区域。
+本课只讲 accumulator 的基础坐标；SFA/SFB 的 replica 是下一课内容。
+
+### 与简单 `128 x N` layout 的关系
+
+如果不需要把两个区域并排，只写一个普通 accumulator：
+
+```python
+TileLayout(
+    S[(128, 224) : (1 @ TLane, 1 @ TCol)]
+)
+```
+
+它就是：
+
+```text
+TLane = lane
+TCol  = col
+```
+
+两者占用的物理 columns 都是 224。区别在于逻辑坐标的解释：
+
+| Layout | 逻辑坐标 | 映射 |
+|---|---|---|
+| `S[(128,224):(1@TLane,1@TCol)]` | `(lane,col)` | `TCol=col` |
+| `S[(2,128,112):(112@TCol,1@TLane,1@TCol)]` | `(a,lane,col)` | `TCol=112*a+col` |
+
+第一种把一个 `128 x 224` tile 看成一个整体；第二种明确把 224 个 columns
+分成两个逻辑区域，每个区域 112 columns。
+
+### 数据路径与同步边界
+
+本课只构造 layout，不搬运数据。真实 GEMM 路径是：
+
+```text
+A/B: GMEM -> SMEM
+     tcgen05.mma
+C:   SMEM operands -> TMEM accumulator
+     tcgen05.commit + mbarrier wait
+     tcgen05.ld
+     寄存器
+```
+
+`TileLayout` 只回答：
+
+```text
+逻辑 accumulator 元素 (a, lane, col)
+对应哪个 (TLane, TCol)？
+```
+
+它不负责：
+
+```text
+分配 TMEM columns
+启动 tcgen05.mma
+保证 MMA 已完成
+把 TMEM 数据读取到寄存器
+处理 CTA pair
+```
+
+因此 coordinate 正确只是必要条件，不是整个 kernel 正确的充分条件。
+
+### 常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 | 优先检查 |
+|---|---|---|---|
+| 认为 `a` 自动等于 pipeline stage | layout 不知道 stage 语义 | 把两个逻辑区域当成不能重叠的 stage，实际语义由 kernel 决定 | `a` 的调用方语义 |
+| 把 `TCol=223` 当成越界 | 两个 112 column 区域覆盖 `[0,224)` | 合法边界被误判，或者边界元素被排除 | `(2 - 1) * 112 + 112` |
+| 认为 `TCol` 一定到 511 | 511 是硬件最大坐标，不是这个 layout 的使用范围 | 为未使用 columns 多分配或错误索引 | `layout.span("TCol")` |
+| 以为 112 必须补齐到 128 | TileLayout 支持非 2 次幂 extent | 地址范围被放大，allocator 与 layout 不一致 | extent 和实际 allocation size |
+| 用逻辑 `col=130` 查询此 layout | 该 layout 的内层 N extent 只有 112 | flatten 可能给出看似合法但并非预期区域的坐标 | logical shape 和 bounds |
+| 把 `TCol` 当成 byte offset | `TCol` 以 element 为单位 | fp16/fp8 数据出现 2x/4x 打包误差 | dtype 和 hardware cell 宽度 |
+| 认为 `TileLayout` 会分配 TMEM | 它只描述坐标映射 | layout 正确但实际 allocation 不足或地址基址不同 | `tcgen05.alloc` 和 base address |
+| 忽略 `R[...]` | 本布局没有 replica，不代表其他 TMEM layout 也没有 | 下一课的 scale factor 数据只复制一份或不复制 | `layout.replica` |
+
+在推理 kernel 中，这类坐标错误通常表现为：
+
+```text
+GEMM 输出部分列正确、部分列整块错位
+两个 accumulator 区域互相覆盖或只写到一个区域
+epilogue 读取的 TMEM column 与 MMA 写入位置不一致
+allocator 留出的 TMEM columns 少于 layout 实际使用的范围
+block-scaled GEMM 的 scale 区域覆盖 accumulator
+```
+
+### 验证命令和预期输出
+
+运行：
+
+```bash
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python tirx_tmem_accumulator_layout.py
+```
+
+本机 TVM `0.26.dev246` 实测输出：
+
+```text
+layout: T.TileLayout(T.S[(2, 128, 112):(112 @ Axis.TCol, 1 @ Axis.TLane, 1 @ Axis.TCol)])
+size: 28672
+span TLane: 128
+span TCol: 224
+(0, 0, 0) -> {"TLane": 0, "TCol": 0}
+(0, 17, 30) -> {"TLane": 17, "TCol": 30}
+(1, 17, 30) -> {"TLane": 17, "TCol": 142}
+(1, 127, 111) -> {"TLane": 127, "TCol": 223}
+linear 16270 -> {"TLane": 17, "TCol": 142}
+logical == linear: True
+```
+
+本机运行边界：
+
+```text
+可以运行: TileLayout 构造、size / span 查询、apply() 坐标计算
+不能运行: tcgen05.mma、tcgen05.ld 以及需要 Blackwell 的实际 kernel
+```
+
+### 本课结论
+
+这个 layout 可以用一行记住：
+
+```text
+TLane = lane
+TCol  = 112 * a + col
+```
+
+它描述的是：
+
+```text
+两个逻辑区域
+每个区域 128 个 Lane、112 个 columns
+两个区域在 TCol 轴上首尾相接
+总计覆盖 128 x 224 个 TMEM cell
+```
+
+最重要的工程边界是：
+
+```text
+layout 只描述“逻辑元素放哪里”，
+不决定 a 的业务语义，也不负责 TMEM 分配和同步。
+```
+
+### 自测题
+
+#### 1. 逻辑坐标 `(0, 17, 30)` 映射到哪里？
+
+答：
+
+```text
+TLane = 17
+TCol  = 112 * 0 + 30
+      = 30
+```
+
+结果是 `{"TLane": 17, "TCol": 30}`。
+
+#### 2. 逻辑坐标 `(1, 17, 30)` 为什么和上一题相差 112 个 columns？
+
+答：它属于外层区域 `a=1`。外层 iter 的 stride 是：
+
+```text
+112 @ TCol
+```
+
+因此：
+
+```text
+TCol = 112 * 1 + 30 = 142
+```
+
+#### 3. 这个 layout 使用了多少 TMEM columns？
+
+答：使用：
+
+```text
+2 * 112 = 224
+```
+
+个 element columns，范围是 `[0, 224)`；不是 256，也不是完整的 512。
+
+#### 4. extent 为 112 是否需要补齐到 128？
+
+答：不需要。`TileLayout` 不要求 extent 是 2 的幂。112 是合法的
+column 区域大小，是否补齐取决于具体 kernel 的 allocator 和对齐选择。
+
+#### 5. `TileLayout` 构造完成后，是否已经为 TMEM 分配了空间？
+
+答：没有。它只描述逻辑坐标到 `TLane / TCol` 的映射。实际 TMEM
+allocation、基址和生命周期仍由 `tcgen05.alloc`、地址转换以及
+`tcgen05.dealloc` 等机制负责。
+
+## 十四、当前进度
 
 `chapter_tirx_layout_api` 的知识点：
 
@@ -1821,13 +2383,13 @@ coord.size() == shard.size()
 [x] TileLayout 的 S[...]、R[...] 与 offset
 [x] 命名轴：laneid / warpid / m / TLane / TCol
 [x] apply() 的三种输入形式与 flatten / decompose
-[ ] TMEM accumulator layout 示例
+[x] TMEM accumulator layout 示例
 [ ] scale-factor layout 中的 replication
 [ ] tmem_datapath_layout / tcgen05_atom_layout / wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前三项。已经覆盖：
+本篇目前完成前四项。已经覆盖：
 
 ```text
 TileLayout 可以表示 lane、warp、register、TMEM 等命名轴坐标
@@ -1858,11 +2420,18 @@ TileLayout 不保存调用方的 logical shape
 逻辑 shape [16, 8] 下 (1, 3) flatten 为 11
 同一个逻辑坐标在不同 logical shape 下会产生不同 warp / lane coordinate
 可以用三入口等价性分层定位 flatten、decompose、stride / axis 错误
+用 (2, 128, 112) accumulator layout 完成 TMEM 坐标推导
+TMEM physical coordinate 使用 TLane / TCol，TLane 范围是 [0, 128)
+(2, 128, 112) 将两个 128 x 112 区域并排放置在 TCol 0..223
+outer region 的 112@TCol stride 产生 TCol = 112 * a + col
+TMEM layout 不要求 extent 是 2 的幂，112 column 区域无需补齐到 128
+layout.apply() 返回基础 TLane / TCol，不分配 TMEM，也不发射 tcgen05 指令
+layout 与 allocation / MMA / wait / tcgen05.ld 是四个独立契约
 ```
 
 下一知识点：
 
 ```text
 chapter_tirx_layout_api
--> TMEM accumulator layout 示例
+-> scale-factor layout 中的 replication
 ```
