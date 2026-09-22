@@ -306,6 +306,12 @@ wg_local_layout(rows=128).shard 与 32x32b fp32 fragment 的 shard 相同
 wg_local_layout 不校验 atom、不处理 dtype packing，也不执行 allocation 或 copy
 rows=64 时只生成 tid_in_wg 0..63，剩下 64 个线程没有该 layout 的数据坐标
 chapter_tirx_layout_api 第八个知识点完成：wg_local_layout
+ComposeLayout 将 affine TileLayout 与 XOR swizzle 组合起来
+M/B/S 是 bit count，不是 bytes
+(8,64) fp16 的 128B swizzle 使用 M=B=S=3
+j=0 时八行地址为 72*i，bank 为 0,4,8,...,28
+无 swizzle 时八行都落 bank 0
+chapter_tirx_layout_api 第九个知识点完成：ComposeLayout 与 shared-memory swizzle
 ```
 
 完整文档索引、当前进度和硬件环境说明见

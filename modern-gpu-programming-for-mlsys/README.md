@@ -27,7 +27,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
 | [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
 | [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
-| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica、`tmem_datapath_layout` 的 D/F row mapping、`tcgen05_atom_layout` 的 atom / rep / register mapping，以及 `wg_local_layout` 的 warpgroup row-to-thread mapping |
+| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica、`tmem_datapath_layout` 的 D/F row mapping、`tcgen05_atom_layout` 的 atom / rep / register mapping、`wg_local_layout` 的 warpgroup row-to-thread mapping，以及 `ComposeLayout` 与 shared-memory XOR swizzle |
 
 ## 当前进度
 
@@ -226,13 +226,19 @@ wg_local_layout(rows=128).shard 与 32x32b fp32 fragment 的 shard 相同
 wg_local_layout 不校验 atom、不处理 dtype packing，也不执行 allocation 或 copy
 rows=64 时只生成 tid_in_wg 0..63，剩下 64 个线程没有该 layout 的数据坐标
 chapter_tirx_layout_api 第八个知识点完成：wg_local_layout
+ComposeLayout 将 affine TileLayout 与 XOR swizzle 组合起来
+M/B/S 是 bit count，不是 bytes
+(8,64) fp16 的 128B swizzle 使用 M=B=S=3
+j=0 时八行地址为 72*i，bank 为 0,4,8,...,28
+无 swizzle 时八行都落 bank 0
+chapter_tirx_layout_api 第九个知识点完成：ComposeLayout 与 shared-memory swizzle
 ```
 
 ## 下一知识点
 
 ```text
-chapter_tirx_layout_api
--> ComposeLayout 与 shared-memory swizzle
+chapter_tirx_layout_api 完成
+-> chapter_gemm_basics
 ```
 
 ## 核心主线

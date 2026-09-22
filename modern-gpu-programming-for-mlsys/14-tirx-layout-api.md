@@ -1,12 +1,13 @@
 # TIRx Layout API：`S[...]`、`R[...]`、offset 与命名轴
 
-这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前八个
+这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前九个
 知识点：`S[...] + R[...] + offset` 的语义与计算、命名轴的坐标空间，
 `apply()` 的三种输入形式，以及 `2 x 128 x 112` accumulator 的
 `TLane / TCol` 映射、scale-factor atom 沿 `TLane` 的复制，以及
 `tcgen05.mma` D/F datapath 的 row 到 Lane 映射，最后通过
 `tcgen05_atom_layout` 把 TMEM fragment 分布到 warpgroup 的线程寄存器，
-并说明 `wg_local_layout` 如何把逻辑 row 直接分配给 `tid_in_wg`。先看：
+说明 `wg_local_layout` 如何把逻辑 row 直接分配给 `tid_in_wg`，并用
+`ComposeLayout` 把仿射 TileLayout 与 shared-memory XOR swizzle 组合起来。先看：
 
 ```text
 S[...] + R[...] + offset
@@ -47,10 +48,10 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 [x] tmem_datapath_layout：D/F datapath
 [x] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
 [x] wg_local_layout
-[ ] ComposeLayout 与 shared-memory swizzle
+[x] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前八项。后续知识点会在同一章新的小节中继续展开。
+本篇目前完成前九项。后续内容将进入下一章。
 
 ## 一、这个 API 要解决什么问题
 
@@ -4753,7 +4754,599 @@ thread-local `m` 轴。`32x32b` 额外带有 atom 约束，但在 `M=128` 的
 答：不能。它只描述 element 级的 `m` 坐标。fp16 packing 需要 dtype-aware
 的 layout 或 lowering，例如 `tcgen05_atom_layout` 所描述的 register mapping。
 
-## 十八、当前进度
+## 十八、ComposeLayout 与 shared-memory swizzle
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：ComposeLayout / Why Swizzle / Swizzle Transform / Choosing Swizzle Parameters
+知识点：ComposeLayout 与 shared-memory swizzle
+上次：wg_local_layout 的行到 tid_in_wg 映射
+下次：chapter_gemm_basics -> tiled GEMM 章节入口
+PTX：无固定指令；对应 shared-memory XOR swizzle 及 TMA descriptor 的同构约束
+```
+
+### 这一节要解决什么问题
+
+前面的 `TileLayout` 都是仿射映射：每个逻辑坐标乘以固定 stride，再把
+不同 axis 上的贡献相加。它适合描述 register fragment、TMEM fragment
+和 scale-factor replication。
+
+但 shared-memory swizzle 含有 XOR：
+
+```text
+new_address = old_address XOR shifted_bits
+```
+
+XOR 不是加法，也不是线性 stride，因此不能只靠一个普通的
+`S[shape : strides]` 表示。TIRx 的做法是把两个映射串起来：
+
+```text
+逻辑坐标
+-> TileLayout：得到线性 element address m
+-> SwizzleLayout：把 m 重排成 shared-memory 物理地址 addr
+```
+
+这正是 `ComposeLayout` 的职责：
+
+```text
+ComposeLayout(swizzle, tile)
+```
+
+执行顺序是：
+
+```text
+先应用 tile:    (i, j) -> m
+再应用 swizzle:  m -> addr
+```
+
+构造参数的顺序看起来是 `swizzle, tile`，但实际数据路径是
+`tile` 在前、`swizzle` 在后。原因是 Python 对象表示的是
+“组合后的函数”，函数复合的书写顺序与调用顺序相反。
+
+### 心智模型
+
+可以把 shared-memory tile 想成两层地址：
+
+```text
+逻辑地址 m
+  行优先 tile 中，元素本来应该在的位置
+
+物理地址 addr
+  开启 swizzle 后，元素实际写入 shared memory 的位置
+```
+
+Swizzle 不删除、不复制、不改变逻辑 tile：
+
+```text
+tile 中仍然是相同的 (8, 64) 元素
+矩阵语义仍然是原来的行列索引
+改变的只是元素在 SMEM 地址空间中的落点
+```
+
+所以 producer 和 consumer 必须使用同一套 swizzle：
+
+```text
+TMA descriptor 按 swizzled layout 写入 SMEM
+TIRx buffer layout 记录同一个 swizzle
+MMA/ldmatrix 读取时按同一个 swizzle 解释地址
+```
+
+只改其中一层，逻辑元素就会“看起来存在”，但具体位置不一致。
+
+### `M`、`B`、`S` 的含义
+
+课程中的伪代码是：
+
+```python
+ComposeLayout(
+    per_element=M,
+    swizzle_len=B,
+    atom_len=S,
+    tile_layout=tile,
+    swizzle_inner=True,
+)
+```
+
+三个参数都是 bit count，不是 byte count：
+
+| 参数 | 课程名字 | TIRx 属性 | 作用 |
+|---|---|---|---|
+| `M` | `per_element` | `per_element` | 保留线性地址最低 `M` bit |
+| `B` | `swizzle_len` | `swizzle_len` | 对 `B` bit 宽度的字段做 XOR |
+| `S` | `atom_len` | `atom_len` | 指定被异或的高位字段距离 |
+
+对 float16 的 128-byte swizzle：
+
+```text
+一个 16-byte vector
+= 16 / 2
+= 8 个 float16
+
+M = log2(8) = 3
+```
+
+这里的 16-byte vector 是连续保留的地址单元。`per_element=3` 表示
+低三位 element address 不参与 XOR，因此 `8` 个 float16 仍然连续。
+
+`B=3` 表示 XOR 字段有 `2^3 = 8` 个位置。结合 `M=3`，一个字段覆盖：
+
+```text
+8 个元素 * 2 bytes = 16 bytes
+8 个 16-byte chunk = 128 bytes
+```
+
+这就是 “128-byte swizzle” 中 128 的来源。它不是把
+`M/B/S` 直接写成 `128`，而是由参数组合出来的。
+
+### 完整 XOR 公式
+
+设线性 element address 为 `m`：
+
+```text
+x = m >> M
+
+low  = m & ((1 << M) - 1)
+mask = (1 << B) - 1
+x2   = x ^ ((x >> S) & mask)
+
+addr = (x2 << M) | low
+```
+
+逐步解释：
+
+1. `low = m & ((1 << M) - 1)` 保存最低 `M` bit。
+2. `x = m >> M` 把低位拿掉，得到参与 swizzle 的高位字段。
+3. `(x >> S) & mask` 从距离 `S` 的位置取 `B` bit。
+4. `x ^ ...` 用这些 bit XOR 当前低 `B` bit。
+5. `addr = (x2 << M) | low` 把保留的低位拼回去。
+
+约束是：
+
+```text
+S >= B
+```
+
+如果 `S < B`，参与 XOR 的两个字段会重叠，当前 TVM 会拒绝构造：
+
+```text
+InternalError: The swizzle layout is not well-formed
+```
+
+### 完整可运行代码
+
+下面这段代码可以直接在 Python 3.11 的 `mlc` uv 环境中运行。它同时做
+三件事：
+
+```text
+构造 TIRx ComposeLayout
+用等价 Python 公式计算 swizzled address
+计算 float16 地址对应的 shared-memory bank
+```
+
+```python
+import tvm
+from tvm.tirx.layout import ComposeLayout, SwizzleLayout, TileLayout, S, m
+
+ROWS = 8
+COLS = 64
+M_BITS = 3
+B_BITS = 3
+S_BITS = 3
+
+tile = TileLayout(S[(ROWS, COLS) : (COLS @ m, 1 @ m)])
+
+swizzle = SwizzleLayout(
+    per_element=M_BITS,
+    swizzle_len=B_BITS,
+    atom_len=S_BITS,
+    swizzle_inner=True,
+)
+
+layout = ComposeLayout(swizzle, tile)
+
+print(f"TVM version: {tvm.__version__}")
+print(f"tile        = {tile}")
+print(f"swizzle     = {swizzle}")
+print(f"layout      = {layout}")
+print(f"well_formed = {layout.verify_well_formed()}")
+print(f"size = {layout.size()}, span = {layout.span()}")
+
+
+def swizzle_address(i: int, j: int) -> int:
+    linear = COLS * i + j
+    low = linear & ((1 << M_BITS) - 1)
+    x = linear >> M_BITS
+    mask = (1 << B_BITS) - 1
+    x ^= (x >> S_BITS) & mask
+    return (x << M_BITS) | low
+
+
+def fp16_bank(element_addr: int) -> int:
+    return (element_addr // 2) % 32
+
+
+print("\ncolumn j=0:")
+print(" i | linear | addr | bank")
+for i in range(ROWS):
+    addr = swizzle_address(i, 0)
+    print(f"{i:2d} | {COLS * i:6d} | {addr:4d} | {fp16_bank(addr):4d}")
+
+print("\nwithout swizzle:")
+print(" i | linear | bank")
+for i in range(ROWS):
+    linear = COLS * i
+    print(f"{i:2d} | {linear:6d} | {fp16_bank(linear):4d}")
+
+print("\napply() boundary:")
+try:
+    print(layout.apply(0, 0))
+except Exception as err:
+    print(f"{type(err).__name__}: {err}")
+```
+
+### 每段代码在做什么
+
+`TileLayout(S[(ROWS, COLS) : (COLS @ m, 1 @ m)])`：
+
+```text
+逻辑坐标 (i, j)
+-> i 的 stride 是 COLS=64，作用于默认线性轴 m
+-> j 的 stride 是 1，也作用于默认线性轴 m
+-> m = 64 * i + j
+```
+
+`SwizzleLayout(...)`：
+
+```text
+只保存 M/B/S 和 swizzle_inner
+它不是 buffer 分配
+也不主动搬运数据
+```
+
+`ComposeLayout(swizzle, tile)`：
+
+```text
+先调用 tile 得到 m
+再调用 swizzle 得到物理 addr
+```
+
+`swizzle_address(i, j)`：
+
+```text
+直接复现本节的 XOR 公式
+用于观察当前版本 ComposeLayout.apply() 尚未实现时的静态结果
+```
+
+`fp16_bank(element_addr)`：
+
+```text
+一个 bank 对应 4 bytes
+一个 fp16 对应 2 bytes
+两个相邻 fp16 共用一个 bank
+bank = floor(element_addr / 2) mod 32
+```
+
+### 本机实测输出
+
+运行：
+
+```bash
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python swizzle_demo.py
+```
+
+当前 TVM `0.26.dev246` 的实际输出是：
+
+```text
+TVM version: 0.26.dev246
+tile        = T.TileLayout(T.S[(8, 64):(64, 1)])
+swizzle     = T.SwizzleLayout(3, 3, 3, swizzle_inner=True)
+layout      = T.ComposeLayout(T.SwizzleLayout(3, 3, 3, swizzle_inner=True), T.TileLayout(T.S[(8, 64):(64, 1)]))
+well_formed = True
+size = 512, span = 512
+
+column j=0:
+ i | linear | addr | bank
+ 0 |      0 |    0 |    0
+ 1 |     64 |   72 |    4
+ 2 |    128 |  144 |    8
+ 3 |    192 |  216 |   12
+ 4 |    256 |  288 |   16
+ 5 |    320 |  360 |   20
+ 6 |    384 |  432 |   24
+ 7 |    448 |  504 |   28
+
+without swizzle:
+ i | linear | bank
+ 0 |      0 |    0
+ 1 |     64 |    0
+ 2 |    128 |    0
+ 3 |    192 |    0
+ 4 |    256 |    0
+ 5 |    320 |    0
+ 6 |    384 |    0
+ 7 |    448 |    0
+
+apply() boundary:
+InternalError: ComposeLayoutNode::Apply(Array<PrimExpr>) is not implemented
+```
+
+这里有一个必须如实说明的版本差异：
+
+```text
+课程伪代码:
+ComposeLayout(per_element, swizzle_len, atom_len, tile_layout)
+
+本机 TVM 0.26.dev246:
+SwizzleLayout(per_element, swizzle_len, atom_len, swizzle_inner=True)
+ComposeLayout(swizzle_layout, tile_layout)
+```
+
+本机版本可以构造组合 layout，并检查 `well_formed`、`size` 和
+`span`；但 `ComposeLayout.apply()` 尚未实现，因此地址表由等价公式
+独立计算。这不影响理解 swizzle 语义，但说明“layout 对象可构造”不等于
+“所有查询方法都已实现”。
+
+### `(8, 64)` float16 的具体推导
+
+对于 `(8, 64)` 的行优先 tile：
+
+```text
+m = 64 * i + j
+```
+
+令：
+
+```text
+q = j // 8
+r = j % 8
+```
+
+当 `M=B=S=3` 时：
+
+```text
+low = r
+x = (64 * i + j) >> 3
+  = 8 * i + q
+
+x >> 3 = i
+
+x2 = (8 * i + q) ^ i
+   = 8 * i + (q ^ i)
+
+addr = 64 * i + 8 * (q ^ i) + r
+```
+
+因为 `j < 64`，所以 `q` 只有 `0..7`：
+
+```text
+q 是 8 个 16-byte vector 在行内的编号
+i 是 8 行中的 row 编号
+q ^ i 把 row 编号混入 vector 编号
+```
+
+这也是 swizzle 的核心：同一列在原本相隔 128 bytes 的不同行中，不再
+固定落到同一个 bank。
+
+### 追踪 `j=0`
+
+`j=0` 时：
+
+```text
+q = 0
+r = 0
+addr = 64 * i + 8 * (0 ^ i) + 0
+     = 64 * i + 8 * i
+     = 72 * i
+```
+
+float16 的 bank 是：
+
+```text
+bank = floor(addr / 2) mod 32
+```
+
+逐行计算：
+
+| `i` | 无 swizzle `m=64i` | swizzled `addr=72i` | swizzled bank |
+|---:|---:|---:|---:|
+| 0 | 0 | 0 | 0 |
+| 1 | 64 | 72 | 4 |
+| 2 | 128 | 144 | 8 |
+| 3 | 192 | 216 | 12 |
+| 4 | 256 | 288 | 16 |
+| 5 | 320 | 360 | 20 |
+| 6 | 384 | 432 | 24 |
+| 7 | 448 | 504 | 28 |
+
+例如 `i=3`：
+
+```text
+addr = 72 * 3 = 216
+bank = floor(216 / 2) mod 32
+     = 108 mod 32
+     = 12
+```
+
+例如 `i=5`：
+
+```text
+addr = 72 * 5 = 360
+bank = floor(360 / 2) mod 32
+     = 180 mod 32
+     = 20
+```
+
+### swizzle 前后的 bank 对比
+
+| 行 | 无 swizzle bank | swizzled bank |
+|---:|---:|---:|
+| 0 | 0 | 0 |
+| 1 | 0 | 4 |
+| 2 | 0 | 8 |
+| 3 | 0 | 12 |
+| 4 | 0 | 16 |
+| 5 | 0 | 20 |
+| 6 | 0 | 24 |
+| 7 | 0 | 28 |
+
+没有 swizzle 时：
+
+```text
+m = 64 * i
+bank = floor(64 * i / 2) mod 32
+     = 32 * i mod 32
+     = 0
+```
+
+八行全部落到 bank 0。加入 128-byte swizzle 后，这个选择 `j=0` 的
+按列访问分散到 8 个不同 bank。
+
+这里不能进一步推导成“任何访问都无冲突”。实际 bank conflict 还取决于：
+
+```text
+访问的 data type
+每条 load/store 一次覆盖多少个 elements
+warp 内 threads 如何组成 access
+读取的是 fp16、fp32 还是 packed data
+```
+
+本节的结论只针对这个具体的按列访问例子。
+
+### `swizzle_inner=True` 与 `False`
+
+当前课程给出的 128-byte 示例使用：
+
+```python
+swizzle_inner=True
+```
+
+它表示常规方向的 XOR。设为 `False` 时，方向镜像。初学时先固定
+`True`，重点掌握 `M/B/S`、线性地址和 bank 的关系。不要在没有
+descriptor 约束依据时随意翻转方向，因为 TMA、TIRx 和 MMA 三方必须
+协商一致。
+
+### 常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 | 优先检查 |
+|---|---|---|---|
+| 把 `M/B/S` 当成 bytes | 它们是 bit count | 想写 128B 却传 `128`，实际字段范围完全错位 | `log2(vector_elements)` |
+| 把 `S < B` 当成可接受参数 | 两个 XOR 字段发生重叠 | 构造时报 `swizzle layout is not well-formed` | 是否满足 `S >= B` |
+| 用 `ComposeLayout(tile, swizzle)` | 参数顺序正好相反 | `TypeError`，期望 `SwizzleLayout` 却收到 `TileLayout` | 构造签名 |
+| 认为 `ComposeLayout.apply()` 必然可用 | 本机版本尚未实现该 FFI 方法 | `InternalError: ... Apply ... is not implemented` | API 版本和验证边界 |
+| TIRx layout 开了 swizzle，TMA descriptor 没开 | producer 与 consumer 的物理地址解释不同 | 数据错位、数值错误或 lowering 布局不匹配 | descriptor swizzle mode |
+| 手写地址时继续使用未 swizzle 的 `m` | TIRx buffer 已经按物理地址重排 | producer 读到的列/行内容错乱 | 所有访问是否经过同一 layout |
+| 认为 swizzle 会复制或删除元素 | 它是地址置换，不是 replication | size/span 逻辑变化判断错误 | 是否存在 `R[...]` |
+| 只按 `j=0` 例子判断所有访存无冲突 | conflict 取决于完整 warp access | 其他向量宽度仍可能出现 bank conflict | 实际 load/store 宽度 |
+
+### swizzle 在推理系统中的位置
+
+对推理系统最直接的场景是 GEMM 和 Attention 的 shared-memory staging：
+
+```text
+global memory
+-> TMA 按 swizzled box 写入 SMEM
+-> MMA/ldmatrix 按同一 swizzle 读取
+-> Tensor Core 计算
+```
+
+它解决的不是数学计算问题，而是数据搬运后的 bank access pattern。
+在高吞吐 GEMM、低精度 GEMM 和 attention 的 K/V tile staging 中，
+错误的 swizzle 会表现为：
+
+```text
+kernel 能编译但数值不对
+某些 tile shape 正常，另一些 tile shape 异常
+去掉 swizzle 后结果恢复正确但性能下降
+descriptor swizzle 与 buffer layout 不一致时直接编译失败
+```
+
+### 本机执行边界
+
+本机可以验证：
+
+```text
+SwizzleLayout 参数是否能构造
+ComposeLayout 是否 well-formed
+layout 的 size 和 span
+等价 XOR 公式的地址与 bank 结果
+```
+
+本机当前不能验证：
+
+```text
+真实 TMA 是否按该 descriptor 写入 SMEM
+真实 MMA fragment 是否按该 swizzle 正确读取
+Blackwell kernel 的峰值性能
+```
+
+后三者需要相应的 CUDA/Blackwell GPU、驱动和课程运行环境。这里完成的是
+layout 与地址语义验证，不是端到端 kernel 性能验证。
+
+### 自测题
+
+#### 1. 为什么 `M/B/S` 不能写成 `128` 来表示 128-byte swizzle？
+
+答：它们是 bit count。128-byte swizzle 的参数由数据宽度和字段布局推导。
+float16 的 16-byte vector 含 8 个元素，所以 `M=log2(8)=3`；`B=3`
+表示 XOR 8 个 16-byte chunk；`S=3` 是 XOR 高位字段的距离。
+
+#### 2. `(8, 64)` float16 tile 中，`i=3, j=0` 的 swizzled address 和 bank 是多少？
+
+答：
+
+```text
+m = 64 * 3 + 0 = 192
+q = 0
+r = 0
+addr = 64 * 3 + 8 * (0 ^ 3) + 0
+     = 192 + 24
+     = 216
+
+bank = floor(216 / 2) mod 32
+     = 108 mod 32
+     = 12
+```
+
+#### 3. `(8, 64)` float16 tile 中，`i=2, j=10` 的 swizzled address 和 bank 是多少？
+
+答：
+
+```text
+m = 64 * 2 + 10 = 138
+q = 10 // 8 = 1
+r = 10 % 8 = 2
+addr = 64 * 2 + 8 * (1 ^ 2) + 2
+     = 128 + 24 + 2
+     = 154
+
+bank = floor(154 / 2) mod 32
+     = 77 mod 32
+     = 13
+```
+
+#### 4. 为什么无 swizzle 时，`j=0` 的 8 行全部落到 bank 0？
+
+答：`m=64i`，每个 bank word 是 2 个 fp16，所以：
+
+```text
+bank = floor(64i / 2) mod 32
+     = 32i mod 32
+     = 0
+```
+
+行 stride 正好覆盖完整一圈的 32 个 bank，所以八行都回到 bank 0。
+
+#### 5. 如果 TIRx buffer 使用 `ComposeLayout`，但 TMA descriptor 仍按无 swizzle 模式配置，会发生什么？
+
+答：TMA 会按一种物理地址写入，TIRx/MMA 会按另一种物理地址读取。
+逻辑 tile 的形状可以完全正确，但元素位置不一致，通常表现为数值错误、
+数据错位或 lowering 的 layout 不匹配。必须让 TIRx layout、
+TMA descriptor 和 MMA 读取方式使用同一种 swizzle 配置。
+
+## 十九、当前进度
 
 `chapter_tirx_layout_api` 的知识点：
 
@@ -4766,10 +5359,10 @@ thread-local `m` 轴。`32x32b` 额外带有 atom 约束，但在 `M=128` 的
 [x] tmem_datapath_layout：D/F datapath
 [x] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
 [x] wg_local_layout
-[ ] ComposeLayout 与 shared-memory swizzle
+[x] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前八项。已经覆盖：
+本篇目前完成前九项。已经覆盖：
 
 ```text
 TileLayout 可以表示 lane、warp、register、TMEM 等命名轴坐标
@@ -4843,11 +5436,27 @@ wg_local_layout 不校验 atom，也不处理 fp16 register packing
 wg_local_layout(rows=64) 只使用 tid_in_wg 0..63，另外 64 个线程空闲
 wg_local_layout 不分配寄存器、不执行 copy、也不提供同步
 layout.shard 相同不代表 allocation、dispatch 和同步契约也相同
+ComposeLayout 将 affine TileLayout 与 XOR SwizzleLayout 串起来
+tile layout 先产生线性 m 地址，swizzle 再把 m 重排为物理地址
+课程伪代码参数是 per_element=M、swizzle_len=B、atom_len=S
+本机 TVM 0.26.dev246 使用 SwizzleLayout(3,3,3) 再构造 ComposeLayout(swizzle,tile)
+M/B/S 都是 bit count，不是 bytes；S >= B 是合法约束
+fp16 的 16-byte vector 含 8 个元素，因此 M=log2(8)=3
+M=B=S=3 对应 8 个 16-byte chunk，也就是 128-byte swizzle
+swizzle 公式为 low=m&((1<<M)-1)、x=m>>M、x2=x^((x>>S)&mask)、addr=(x2<<M)|low
+(8,64) fp16 row-major tile 的线性地址是 m=64*i+j
+j=0 时 128B swizzle 得到 addr=72*i
+fp16 bank=floor(addr/2) mod 32
+j=0 的八行 bank 从全部 0 变为 0,4,8,12,16,20,24,28
+swizzle 不改变逻辑元素，只改变 shared-memory 物理地址
+当前版本 ComposeLayout.apply() 尚未实现，位置验证必须使用等价公式
+TIRx layout、TMA descriptor 与 MMA 读取必须使用同一种 swizzle
+本机只能验证 layout 构造、well-formed、size/span 和静态地址公式
 ```
 
 下一知识点：
 
 ```text
-chapter_tirx_layout_api
--> ComposeLayout 与 shared-memory swizzle
+chapter_tirx_layout_api 完成
+-> chapter_gemm_basics
 ```
