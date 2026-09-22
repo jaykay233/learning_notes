@@ -49,7 +49,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 10-tmem-allocation-lifecycle.md
 ├── 11-mbarrier-phase-lifecycle.md
 ├── 12-clc-dynamic-scheduling.md
-└── 13-tirx-first-kernel.md
+├── 13-tirx-first-kernel.md
+└── 14-tirx-layout-api.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -199,7 +200,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-13：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-14：
 
 ```text
 layout / named axes / replication / offset
@@ -259,6 +260,13 @@ TIRx SMEMPool、mbarrier 与 TMEM 生命周期
 chapter_intro_tirx 第一个单 tile GEMM Kernel
 TIRx 编译、Executable 调用与 PyTorch 数值验证
 chapter_intro_tirx 完成
+TileLayout 的 S[...]、R[...] 与固定 offset
+S[...] 的逻辑索引相关基础映射
+R[...] 的逻辑索引无关物理副本
+offset 的整体平移但不增加副本
+apply() 只返回 D(x) + O
+(1, 3)、shape [8, 16] 的 flatten、decompose 与坐标推导
+chapter_tirx_layout_api 第一个知识点完成：S[...]、R[...] 与 offset
 ```
 
 完整文档索引、当前进度和硬件环境说明见

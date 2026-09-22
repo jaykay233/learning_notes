@@ -27,6 +27,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
 | [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
 | [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
+| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、`apply()` 基础坐标与完整 flatten / decompose 推导 |
 
 ## 当前进度
 
@@ -176,13 +177,21 @@ LowerTIRx 展开 tile-level primitives
 rtol / atol 逐元素误差判断
 编译、执行、数值错误的三层排查
 chapter_intro_tirx 完成
+TileLayout 可以组合 S[...]、R[...] 与固定 offset
+S[...] 描述依赖逻辑索引的基础物理映射
+R[...] 枚举与逻辑索引无关的额外物理副本
+固定 offset 整体平移所有物理坐标但不增加副本
+apply() 只返回 D(x) + O，不枚举 replica
+用 (1, 3)、shape [8, 16] 完整追踪 flatten、decompose 与坐标合成
+R[2 : 4@warpid] 为示例元素生成 warpid 5 和 9 两个位置
+chapter_tirx_layout_api 第一个知识点完成：S[...]、R[...] 与 offset
 ```
 
 ## 下一知识点
 
 ```text
 chapter_tirx_layout_api
--> TileLayout 的 S、R 与 offset
+-> 命名轴：laneid / warpid / m / TLane / TCol
 ```
 
 ## 核心主线
