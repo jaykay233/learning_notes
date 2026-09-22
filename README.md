@@ -299,6 +299,13 @@ instr_shape 是 lane x bits 的 atom，tensor_shape 和 dtype 推导 .xN
 16x128b 的 fp32 K=128 与 fp16 K=256 都使用 .x32
 fp16 的两个相邻元素打包进一个 32-bit register 的低半和高半
 chapter_tirx_layout_api 第七个知识点完成：tcgen05_atom_layout
+wg_local_layout 把逻辑 row 映射到 tid_in_wg，把同一行的 columns 映射到局部 m
+默认 rows=128 时，完整 warpgroup 的每个 thread 负责一行
+warp 0/1/2/3 分别负责 rows 0..31 / 32..63 / 64..95 / 96..127
+wg_local_layout(rows=128).shard 与 32x32b fp32 fragment 的 shard 相同
+wg_local_layout 不校验 atom、不处理 dtype packing，也不执行 allocation 或 copy
+rows=64 时只生成 tid_in_wg 0..63，剩下 64 个线程没有该 layout 的数据坐标
+chapter_tirx_layout_api 第八个知识点完成：wg_local_layout
 ```
 
 完整文档索引、当前进度和硬件环境说明见

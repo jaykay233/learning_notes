@@ -1,12 +1,12 @@
 # TIRx Layout API：`S[...]`、`R[...]`、offset 与命名轴
 
-这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前七个
+这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前八个
 知识点：`S[...] + R[...] + offset` 的语义与计算、命名轴的坐标空间，
 `apply()` 的三种输入形式，以及 `2 x 128 x 112` accumulator 的
 `TLane / TCol` 映射、scale-factor atom 沿 `TLane` 的复制，以及
 `tcgen05.mma` D/F datapath 的 row 到 Lane 映射，最后通过
-`tcgen05_atom_layout` 把 TMEM fragment 分布到 warpgroup 的线程寄存器。
-先看：
+`tcgen05_atom_layout` 把 TMEM fragment 分布到 warpgroup 的线程寄存器，
+并说明 `wg_local_layout` 如何把逻辑 row 直接分配给 `tid_in_wg`。先看：
 
 ```text
 S[...] + R[...] + offset
@@ -46,11 +46,11 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 [x] scale-factor layout 中的 replication
 [x] tmem_datapath_layout：D/F datapath
 [x] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
-[ ] wg_local_layout
+[x] wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前七项。后续知识点会在同一章新的小节中继续展开。
+本篇目前完成前八项。后续知识点会在同一章新的小节中继续展开。
 
 ## 一、这个 API 要解决什么问题
 
@@ -4222,7 +4222,538 @@ rep = 12 / 4 = 3
 
 PTX 没有 `.x3`，合法重复次数只能从表中的 `.x1, .x2, .x4, ...` 选择。
 
-## 十七、当前进度
+## 十七、`wg_local_layout`：一行一线程的 warpgroup 寄存器布局
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：常用 Layout 构造函数
+知识点：wg_local_layout 的行到 tid_in_wg 映射
+上次：tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+下次：ComposeLayout 与 shared-memory swizzle
+PTX：无专用指令；描述 warpgroup 的 thread / register 数据所有权
+```
+
+上一课学习了硬件相关的 `tcgen05_atom_layout`。它知道 atom shape、warp、
+lane、dtype packing 和 `.xN`。
+
+本课学习一个更基础的局部寄存器布局：
+
+```python
+wg_local_layout(cols, rows=128)
+```
+
+它要解决的问题更简单：
+
+```text
+一个逻辑 register tile，应该由 128 个 warpgroup 线程怎样共同持有？
+```
+
+### 先建立心智模型
+
+假设有一个逻辑 tile：
+
+```text
+shape = [128, 8]
+```
+
+可以把它看成 128 行，每行 8 个元素：
+
+```text
+row 0:   0 1 2 3 4 5 6 7
+row 1:   0 1 2 3 4 5 6 7
+...
+row 127: 0 1 2 3 4 5 6 7
+```
+
+`wg_local_layout` 选择的分配方式是：
+
+```text
+一个线程负责一整行
+该线程在 local 中按 column 顺序保存这一行的元素
+```
+
+也就是说：
+
+```text
+logical (row, col)
+-> (tid_in_wg = row, m = col)
+```
+
+这不是“把一行拆给多个 lane”，而是：
+
+```text
+row 决定哪个线程负责
+col 决定该线程内部的第几个局部元素
+```
+
+### 命名轴的含义
+
+`wg_local_layout` 只使用两个核心概念：
+
+| 名称 | 范围 | 含义 |
+|---|---:|---|
+| `tid_in_wg` | `[0, 128)` | thread 在 warpgroup 中的编号 |
+| `m` | `[0, cols)` | 该 thread 的局部 element 槽位 |
+
+`tid_in_wg` 和前面的轴不能混用：
+
+| 轴 | 范围 | 含义 |
+|---|---:|---|
+| `laneid` | `[0, 32)` | 某个 warp 内部的 lane |
+| `wid_in_wg` | `[0, 4)` | warp 在 warpgroup 中的编号 |
+| `tid_in_wg` | `[0, 128)` | warpgroup 中 128 个 thread 的全局编号 |
+
+三者的关系是：
+
+```text
+tid_in_wg = wid_in_wg * 32 + laneid
+```
+
+例如：
+
+```text
+wid_in_wg=0, laneid=0  -> tid_in_wg=0
+wid_in_wg=0, laneid=31 -> tid_in_wg=31
+wid_in_wg=1, laneid=0  -> tid_in_wg=32
+wid_in_wg=3, laneid=31 -> tid_in_wg=127
+```
+
+### API 生成的 TileLayout
+
+实现是：
+
+```python
+def wg_local_layout(cols, rows=128):
+    return TileLayout(S[(rows, cols) : (1 @ Axis.tid_in_wg, 1)])
+```
+
+对应的 shard 是两个 iter：
+
+```text
+Iter(rows, 1, "tid_in_wg")
+Iter(cols, 1, "m")
+```
+
+两个 stride 都是 1：
+
+```text
+row 每增加 1 -> tid_in_wg 增加 1
+col 每增加 1 -> m 增加 1
+```
+
+因此对于坐标 `(r, c)`：
+
+```text
+tid_in_wg = r
+m         = c
+```
+
+### 参数和边界
+
+#### `cols`
+
+`cols` 是每个逻辑 row 有多少个连续元素。
+
+它是第一个位置参数：
+
+```python
+wg_local_layout(8)
+```
+
+表示：
+
+```text
+每个 row 有 8 个元素
+rows 使用默认值 128
+```
+
+注意 `wg_local_layout(128)` 表示 `cols=128`，不是 `rows=128`。
+
+#### `rows`
+
+默认值是：
+
+```text
+rows = 128
+```
+
+它对应完整的 warpgroup：
+
+```text
+128 rows
+128 threads
+每个 thread 一行
+```
+
+也可以传其他值：
+
+```python
+wg_local_layout(8, rows=64)
+```
+
+这会产生：
+
+```text
+rows 0..63 -> tid_in_wg 0..63
+```
+
+但是：
+
+```text
+tid_in_wg 64..127 没有在这个 layout 中收到数据
+```
+
+这里必须区分两件事：
+
+```text
+TileLayout 数学上可以构造 rows=64
+硬件上实际参与数据搬运的 thread 数量由副本和 dispatch 决定
+```
+
+`wg_local_layout` 本身不做范围检查。`rows > 128` 时可以构造出
+`tid_in_wg=128` 这类坐标，但 warpgroup 中没有对应 thread，后续 lowering
+无法形成有效映射。
+
+#### `dtype`
+
+这个 API 没有 `dtype` 参数。
+
+因此 `m` 始终是 element 坐标：
+
+```text
+m=0 是第 0 个逻辑元素
+m=1 是第 1 个逻辑元素
+```
+
+至于两个 fp16 元素是否打包在同一个 32-bit register，需要通过其他
+layout 或 lowering 规则决定。
+
+这也是 `wg_local_layout` 和 `tcgen05_atom_layout` 的重要区别：
+
+```text
+wg_local_layout 描述通用 thread / local element 所有权
+tcgen05_atom_layout 描述 tcgen05.ld/st 的硬件 fragment mapping
+```
+
+### 完整可运行代码
+
+文件名：
+
+```text
+tirx_wg_local_layout.py
+```
+
+完整代码：
+
+```python
+from tvm.tirx.layout import tcgen05_atom_layout, wg_local_layout
+
+
+def show(label, layout, shape, coords):
+    print(f"{label}:")
+    print("  layout =", layout)
+    print("  shard  =", layout.shard)
+    for row, col in coords:
+        print(f"  ({row}, {col}) ->", layout.apply(row, col, shape=shape))
+
+
+def main():
+    rows, cols = 128, 8
+
+    layout = wg_local_layout(cols, rows=rows)
+    show(
+        "default rows=128",
+        layout,
+        [rows, cols],
+        [(0, 0), (1, 3), (31, 7), (32, 0), (64, 0), (127, 7)],
+    )
+
+    partial = wg_local_layout(cols, rows=64)
+    show(
+        "rows=64 partial",
+        partial,
+        [64, cols],
+        [(0, 0), (63, 7)],
+    )
+
+    atom = tcgen05_atom_layout("32x32b", (128, cols), "float32")
+    print("same shard as 32x32b:", layout.shard == atom.shard)
+    print("32x32b layout =", atom)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 逐段解释
+
+#### 默认布局
+
+```python
+layout = wg_local_layout(8, rows=128)
+```
+
+生成：
+
+```text
+T.TileLayout(
+  T.S[(128, 8) : (1 @ Axis.tid_in_wg, 1)]
+)
+```
+
+展开后的 shard：
+
+```text
+(
+  Iter(128, 1, "tid_in_wg"),
+  Iter(8, 1, "m"),
+)
+```
+
+含义是：
+
+```text
+128 个 row 对应 128 个 warpgroup thread
+每个 thread 有 8 个连续 local element
+```
+
+#### 部分布局
+
+```python
+partial = wg_local_layout(8, rows=64)
+```
+
+生成：
+
+```text
+rows 0..63 -> tid_in_wg 0..63
+```
+
+它不会自动复制到另外 64 个线程，也不会报错。若消费者期待完整的
+warpgroup tile，这个布局会表现为后一半线程没有数据。
+
+#### 与 `32x32b` atom 对比
+
+以下两个 shard 完全相同：
+
+```python
+wg_local_layout(8, rows=128).shard
+tcgen05_atom_layout("32x32b", (128, 8), "float32").shard
+```
+
+结果都是：
+
+```text
+(
+  Iter(128, 1, "tid_in_wg"),
+  Iter(8, 1, "m"),
+)
+```
+
+这也解释了前一个知识点：
+
+```text
+32x32b 的一个 warp 有 32 个 lane
+warpgroup 有 4 个 warp
+4 * 32 = 128 rows
+```
+
+所以 `32x32b` 和 `wg_local_layout(rows=128)` 都采用“一行一线程”的
+基础映射。
+
+区别在于：
+
+| API | 关注点 | 是否校验 atom | 是否处理 dtype packing |
+|---|---|---|---|
+| `wg_local_layout` | 通用 row / local-column 分配 | 否 | 否 |
+| `tcgen05_atom_layout` | `tcgen05.ld/st` fragment | 是 | 是 |
+
+### 具体坐标追踪
+
+使用：
+
+```python
+layout = wg_local_layout(8, rows=128)
+```
+
+追踪 `(1, 3)`：
+
+```text
+row=1
+-> tid_in_wg = 1
+-> wid_in_wg = 1 // 32 = 0
+-> laneid = 1 % 32 = 1
+
+col=3
+-> m = 3
+```
+
+结果是：
+
+```text
+(row=1, col=3)
+-> tid_in_wg=1, wid_in_wg=0, laneid=1, m=3
+```
+
+追踪 `(64, 5)`：
+
+```text
+row=64
+-> tid_in_wg = 64
+-> wid_in_wg = 64 // 32 = 2
+-> laneid = 64 % 32 = 0
+
+col=5
+-> m = 5
+```
+
+结果是：
+
+```text
+(row=64, col=5)
+-> tid_in_wg=64, wid_in_wg=2, laneid=0, m=5
+```
+
+完整 thread ownership：
+
+| logical rows | `tid_in_wg` | warp |
+|---|---:|---:|
+| `0..31` | `0..31` | warp 0 |
+| `32..63` | `32..63` | warp 1 |
+| `64..95` | `64..95` | warp 2 |
+| `96..127` | `96..127` | warp 3 |
+
+每个 thread 内保存对应 row 的：
+
+```text
+m = 0..cols-1
+```
+
+### 它不负责什么
+
+`wg_local_layout` 只描述数据所有权：
+
+| 问题 | 是否由它负责 |
+|---|---|
+| row 属于哪个 `tid_in_wg` | 是 |
+| column 属于哪个局部 `m` | 是 |
+| 数据从哪里 load/store | 否 |
+| 是否为 fp16 做 packing | 否 |
+| 是否发射 `tcgen05.ld/st` | 否 |
+| 是否分配 TMEM 或寄存器 | 否 |
+| producer / consumer 如何同步 | 否 |
+
+因此它经常作为目标 layout，与 copy、MMA 或 TIRx lowering 的其他部分配合。
+如果没有额外 copy 或 dispatch，layout 本身不会移动任何数据。
+
+### 常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 | 优先检查 |
+|---|---|---|---|
+| 把 `cols` 当成 `rows` | 第一个位置参数是 `cols` | 形状变成 `[128, expected_cols]` | 参数名和调用顺序 |
+| 把 `tid_in_wg` 当成 `laneid` | 前者跨整个 warpgroup | 跨 warp 的 row 发生重叠 | `tid_in_wg / wid_in_wg / laneid` 范围 |
+| 以为 `m` 一定是 register index | `m` 是 element 坐标 | fp16 的寄存器计数对不上 | dtype packing 由谁负责 |
+| `rows=64` 就认为 128 个线程都工作 | layout 只使用 tid 0..63 | 后 64 个线程结果为空或未定义 | 是否存在 partial warpgroup |
+| `rows>128` 仍交给完整 warpgroup | 不存在对应的 thread 坐标 | lowering 报无效 thread 或 index | rows 是否超过 128 |
+| 把 layout 当成 allocation | layout 不分配资源 | 没有寄存器或 TMEM 空间变化 | 是否还需要显式 allocation |
+| 把 shard mapping 当成同步 | shard 只描述位置 | 数据竞争或读到旧值 | copy 前后是否有 barrier |
+
+### 验证命令和预期输出
+
+运行：
+
+```bash
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python tirx_wg_local_layout.py
+```
+
+本机 TVM `0.26.dev246` 实测输出：
+
+```text
+default rows=128:
+  layout = T.TileLayout(T.S[(128, 8):(1 @ Axis.tid_in_wg, 1)])
+  shard  = (T.Iter(128, 1, "tid_in_wg"), T.Iter(8, 1, "m"))
+  (0, 0) -> {"m": 0, "tid_in_wg": 0}
+  (1, 3) -> {"m": 3, "tid_in_wg": 1}
+  (31, 7) -> {"m": 7, "tid_in_wg": 31}
+  (32, 0) -> {"m": 0, "tid_in_wg": 32}
+  (64, 0) -> {"m": 0, "tid_in_wg": 64}
+  (127, 7) -> {"m": 7, "tid_in_wg": 127}
+rows=64 partial:
+  layout = T.TileLayout(T.S[(64, 8):(1 @ Axis.tid_in_wg, 1)])
+  shard  = (T.Iter(64, 1, "tid_in_wg"), T.Iter(8, 1, "m"))
+  (0, 0) -> {"m": 0, "tid_in_wg": 0}
+  (63, 7) -> {"m": 7, "tid_in_wg": 63}
+same shard as 32x32b: True
+32x32b layout = T.TileLayout(T.S[(128, 8):(1 @ Axis.tid_in_wg, 1)])
+```
+
+本机运行边界：
+
+```text
+可以运行: layout 构造、shard 比较和逻辑坐标到 tid / m 的映射
+不能运行: 需要真实 warpgroup 执行的 kernel
+```
+
+### 本课结论
+
+`wg_local_layout` 的核心公式是：
+
+```text
+(row, col)
+-> (tid_in_wg=row, m=col)
+```
+
+默认配置是：
+
+```text
+rows=128
+每个 warpgroup thread 负责一行
+每行的 cols 个元素位于该线程的 local m 轴
+```
+
+它与 `32x32b` atom 具有相同的基础 thread-row mapping，但
+`wg_local_layout` 不校验 atom、不处理 dtype packing，也不发射硬件指令。
+
+### 自测题
+
+#### 1. `wg_local_layout(16, rows=128)` 中逻辑坐标 `(37, 5)` 映射到哪里？
+
+答：
+
+```text
+tid_in_wg = 37
+wid_in_wg = 37 // 32 = 1
+laneid    = 37 % 32 = 5
+m         = 5
+```
+
+所以结果包含 `tid_in_wg=37` 和 `m=5`。
+
+#### 2. 默认 `rows=128, cols=8` 时，每个 thread 保存多少个 `m` 槽位？
+
+答：8 个，`m=0..7`。一个 thread 负责一行，并连续保存该行的 8 个元素。
+
+#### 3. `wg_local_layout(8, rows=64)` 为什么可以让另外 64 个线程保持空闲？
+
+答：layout 只把 row 0..63 映射到 `tid_in_wg=0..63`，没有为
+`tid_in_wg=64..127` 生成数据坐标。是否允许这些线程空闲，要由该 kernel
+的使用方式和后续 dispatch 决定。
+
+#### 4. 为什么 `wg_local_layout(8, rows=128)` 和 `32x32b` 的 shard 可以相同？
+
+答：两者都使用 128 个 warpgroup thread，每个 thread 负责一行，列放在
+thread-local `m` 轴。`32x32b` 额外带有 atom 约束，但在 `M=128` 的
+基础映射上与该 local layout 相同。
+
+#### 5. `wg_local_layout` 能决定 fp16 的两个元素是否打包进一个寄存器吗？
+
+答：不能。它只描述 element 级的 `m` 坐标。fp16 packing 需要 dtype-aware
+的 layout 或 lowering，例如 `tcgen05_atom_layout` 所描述的 register mapping。
+
+## 十八、当前进度
 
 `chapter_tirx_layout_api` 的知识点：
 
@@ -4234,11 +4765,11 @@ PTX 没有 `.x3`，合法重复次数只能从表中的 `.x1, .x2, .x4, ...` 选
 [x] scale-factor layout 中的 replication
 [x] tmem_datapath_layout：D/F datapath
 [x] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
-[ ] wg_local_layout
+[x] wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前七项。已经覆盖：
+本篇目前完成前八项。已经覆盖：
 
 ```text
 TileLayout 可以表示 lane、warp、register、TMEM 等命名轴坐标
@@ -4304,11 +4835,19 @@ rep = K / per_rep_cols，rep 就是 tcgen05.ld/st 的 .xN
 rows=64 与 rows=128 的行数约束会随 instr_shape 改变
 合法 .xN 集合取决于 instr_shape，非法 rep 不能通过补零静默绕过
 layout 只描述 register mapping，不负责 tcgen05.ld/st 发射或 barrier 同步
+wg_local_layout 把逻辑 row 直接映射到 tid_in_wg，把 column 映射到局部 m
+默认 rows=128 时完整 warpgroup 的每个 thread 负责一行
+warp 0/1/2/3 分别负责 rows 0..31 / 32..63 / 64..95 / 96..127
+wg_local_layout 的 shard 与 32x32b、M=128、fp32 的 shard 相同
+wg_local_layout 不校验 atom，也不处理 fp16 register packing
+wg_local_layout(rows=64) 只使用 tid_in_wg 0..63，另外 64 个线程空闲
+wg_local_layout 不分配寄存器、不执行 copy、也不提供同步
+layout.shard 相同不代表 allocation、dispatch 和同步契约也相同
 ```
 
 下一知识点：
 
 ```text
 chapter_tirx_layout_api
--> wg_local_layout 的行到 tid_in_wg 映射
+-> ComposeLayout 与 shared-memory swizzle
 ```
