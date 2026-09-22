@@ -665,6 +665,153 @@ T.ptx.tcgen05.wait.ld()
 
 如果没等 `wait.ld()` 就读取 `Dreg`，可能读到旧 register 内容。
 
+#### 7.1 `Tx.wg.copy_async(Dreg_wg, tmem)` 的精确含义
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 1 步：顺序执行的单 Tile GEMM
+知识点：warpgroup 协作的 TMEM -> registers 异步读取
+上次：tcgen05.commit 与 mbarrier.try_wait 的 MMA 完成同步
+下次：第 2 步：K-Loop 累加与 MMA barrier phase
+PTX：tcgen05.ld、tcgen05.wait::ld
+```
+
+这一行可以按 API 的三层含义拆开：
+
+```text
+Tx           TIRx 的 tile primitive namespace
+wg           operation scope 是 warpgroup，本 kernel 中为 128 threads
+copy_async   在这些 threads 上协作执行异步 copy
+```
+
+因此它不是“一个 thread 把整块 TMEM 搬到自己的 registers”，而是：
+
+```text
+一个 warpgroup 共同发出一组 TMEM load
+每个 thread 根据 destination layout
+只接收属于自己的那一部分元素
+```
+
+完整相关代码仍然来自本节的 `hgemm_v1`：
+
+```python
+Dreg = T.alloc_local((BLK_N,), acc_type)
+Dreg_f16 = T.alloc_local((BLK_N,), d_type)
+Dreg_wg = Dreg.view(
+    128,
+    BLK_N,
+    layout=TileLayout(
+        S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+    ),
+)
+
+Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+T.ptx.tcgen05.wait.ld()
+Tx.cast(Dreg_f16[:], Dreg[:])
+```
+
+参数含义是：
+
+| 参数 | 角色 | 所在空间 | Layout |
+|---|---|---|---|
+| `Dreg_wg[:, :]` | copy destination | 每线程 registers 的分布式 view | row -> `tid_in_wg`，col -> register index |
+| `tmem[:, :BLK_N]` | copy source | TMEM | row -> `TLane`，col -> `TCol` |
+
+`Dreg` 本身只是每个 thread 私有的 128 个 fp32 registers。它的 shape 是
+`(BLK_N,)`，从单个 thread 的视角看没有 `128 x 128` 这个 tile 的含义。
+`Dreg_wg` 使用 `view` 给同一份 register storage 增加一个 warpgroup-wide
+tile layout，所以它没有创建第二份 register buffer。
+
+这个 destination layout 表示：
+
+```text
+logical row 0   -> tid_in_wg 0
+logical row 1   -> tid_in_wg 1
+...
+logical row 127 -> tid_in_wg 127
+
+logical col n   -> 该 thread 的 Dreg[n]
+```
+
+于是 `Tx.wg.copy_async` 建立的是下面的逐元素对应关系：
+
+```text
+tmem(TLane=m, TCol=n)
+-> Dreg_wg(row=m, col=n)
+-> thread tid_in_wg=m 的 Dreg[n]
+```
+
+具体追踪 `D[73, 91]`：
+
+| 步骤 | 结果 |
+|---|---|
+| 数学元素 | `D[73, 91]` |
+| TMEM source | `TLane=73, TCol=91` |
+| destination owner | `tid_in_wg=73` |
+| thread 73 的物理位置 | warp 2，lane 9 |
+| 落入的 register | `Dreg[91]` |
+
+这里最容易混淆的是“一个 warpgroup 共同执行”和“每个 thread 都持有整块
+tile”。真实情况是：
+
+```text
+warpgroup 共同执行这个 operation
+但每个 thread 只持有 layout 分配给它的元素
+
+thread 73 收到 row 73 的 128 个 columns
+并不会收到 row 72 或 row 74 的元素
+```
+
+`copy_async` 中的 async 表示 load 发出后，执行流可以继续向后走，register
+内容不一定已经就绪。因此必须在读取 `Dreg` 前执行：
+
+```python
+T.ptx.tcgen05.wait.ld()
+```
+
+否则后面的：
+
+```python
+Tx.cast(Dreg_f16[:], Dreg[:])
+```
+
+可能读到旧值或只完成了一部分的新值。
+
+它在概念上 lower 到 Blackwell 的 TMEM load path，例如
+`tcgen05.ld.sync.aligned.*` 形式；具体生成哪一种 atom 和 repeat 次数由
+source layout、destination layout、元素类型和 compiler lowering 决定。
+学习应该先掌握数据所有权，而不是背死某一条 lowering 后的 opcode。
+
+常见错误及症状：
+
+| 错误 | 可观察症状 |
+|---|---|
+| 只让一个 thread 执行 `wg.copy_async` | warpgroup copy 不完整，destination layout 无法按预期填充 |
+| destination layout 与 `m_thr` 不一致 | 整行数据落到错误 output row |
+| 漏掉 `tcgen05.wait.ld()` | 读到 stale registers 或部分旧数据 |
+| 把 `Dreg_wg` 当作额外缓冲区 | 误以为有第二份存储，后续更容易出现重复或漏写 |
+| copy 尚未完成就复用 `Dreg` | register RAW hazard，结果不稳定 |
+
+自测：
+
+1. `wg` 在 `Tx.wg.copy_async` 中是什么 scope？
+   答：warpgroup scope。本 kernel 中一个 warpgroup 有 128 threads。
+
+2. `Dreg_wg` 和 `Dreg` 是两份数据吗？
+   答：不是。`Dreg_wg` 是 `Dreg` 的 warpgroup-wide tile view，底层是同一份
+   每线程 register storage。
+
+3. `D[73, 91]` 最终落到哪个 thread 的哪个 register？
+   答：`tid_in_wg=73` 的 `Dreg[91]`。thread 73 位于 warp 2、lane 9。
+
+4. 为什么 copy 后必须执行 `tcgen05.wait.ld()`？
+   答：异步 TMEM load 可能尚未完成；不等待就读取 `Dreg` 会违反数据依赖。
+
+5. 为什么不能假设这个 primitive 的 lowering 固定是一条 `tcgen05.ld`？
+   答：它是 tile-level operation，具体 atom 和 repeat 次数由 types、layouts
+   与 compiler lowering 决定。
+
 ### 8. cast 与写回
 
 ```python
