@@ -5130,6 +5130,355 @@ q ^ i 把 row 编号混入 vector 编号
 这也是 swizzle 的核心：同一列在原本相隔 128 bytes 的不同行中，不再
 固定落到同一个 bank。
 
+### 逐位分解：以 `i=5, j=0` 为例
+
+#### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：ComposeLayout / Swizzle Transform / Choosing Swizzle Parameters
+知识点：XOR swizzle 公式的逐位分解与 `m=320` 地址追踪
+上次：ComposeLayout 的完整 XOR 公式
+下次：chapter_gemm_basics -> tiled GEMM 章节入口
+PTX：无固定指令；对应 TMA descriptor 与 shared-memory XOR swizzle 的地址语义
+```
+
+这一小节的唯一目标，是把下面五行代码从一个整体公式拆成可以手算的
+地址变换：
+
+```text
+x = m >> M
+low = m & ((1 << M) - 1)
+mask = (1 << B) - 1
+x2 = x ^ ((x >> S) & mask)
+addr = (x2 << M) | low
+```
+
+#### 先确定 `(8, 64)` tile 的位域
+
+对当前 fp16 tile，行优先线性地址是：
+
+```text
+m = 64 * i + j
+```
+
+当 `M=B=S=3` 时，可以把它看成三个 3-bit 字段：
+
+```text
+bits 8..6: row = i
+bits 5..3: q   = j // 8
+bits 2..0: low = j % 8
+```
+
+`row` 是 tile 的行号，`q` 是行内第几个 16-byte vector，`low` 是这个
+16-byte vector 内第几个 fp16 元素。
+
+选择：
+
+```text
+i = 5
+j = 0
+m = 64 * 5 + 0 = 320
+```
+
+`320` 的 9-bit 二进制是：
+
+```text
+320 = 101_000_000
+      \__/\___/\__/
+       row  q  low
+       101 000 000
+        5   0   0
+```
+
+#### 每个中间值的完整计算
+
+| 名称 | 十进制 | 二进制 | 含义 |
+|---|---:|---|---|
+| `m` | 320 | `101_000_000` | 原始线性 element address |
+| `low` | 0 | `000` | 16-byte vector 内偏移，保持不变 |
+| `x` | 40 | `101_000` | 去掉 `low` 后的 `row + q` |
+| `mask` | 7 | `111` | 只保留 3 bit |
+| `source` | 5 | `000_000_101` | 对齐并截出的 XOR 来源 |
+| `x2` | 45 | `000_101_101` | `q` 被 XOR 后的中间地址 |
+| `addr` | 360 | `101_101_000` | 重新拼回 `low` 的物理地址 |
+
+第一步，取三种字段：
+
+```text
+low = m & ((1 << M) - 1)
+    = 320 & ((1 << 3) - 1)
+    = 320 & 7
+    = 0
+    = 000
+
+x = m >> M
+  = 320 >> 3
+  = 40
+  = 101_000
+
+mask = (1 << B) - 1
+     = (1 << 3) - 1
+     = 7
+     = 111
+```
+
+这里 `x=101_000` 还不是物理地址。它的高三位 `101` 将来作为 XOR
+来源 `source`，低三位 `000` 是原来的 `q`。
+
+第二步，把高位来源搬到低三位：
+
+```text
+x >> S = 101_000 >> 3
+       = 101
+
+source = (x >> S) & mask
+       = 101 & 111
+       = 101
+       = 5
+```
+
+第三步，做 XOR：
+
+```text
+x      = 101_000
+source = 000_101
+----------------
+x2     = 101_101 = 45
+```
+
+这不是把整行地址和 `5` 相加，而是只翻转 `x` 的低三位，也就是原来
+的 `q` 字段：
+
+```text
+q' = q XOR source
+   = 0 XOR 5
+   = 5
+```
+
+高三位 `row=101` 没有被改掉。
+
+第四步，把保持不变的 `low` 拼回末尾：
+
+```text
+x2  = 101_101
+low = 000
+---------------
+addr = 101_101_000
+     = 360
+```
+
+用代码表示：
+
+```text
+x2 << M = 45 << 3
+        = 360
+
+addr = (45 << 3) | 0
+     = 360
+```
+
+这里 `low` 只占低三位，`x2 << M` 从 bit 3 开始，二者没有重叠，因此
+`OR` 等价于把两个互不相交的字段合并。不能因此认为任意情况下
+`|` 都可以替换成 `+`；这里的等价来自前面的 mask 和移位保证了字段
+不重叠。
+
+#### 为什么低位必须放在 XOR 外面
+
+`low` 表示连续 8 个 fp16 在一个 16-byte vector 内的位置。若把
+`low` 也参与 XOR，以下连续访问单元会被拆散：
+
+```text
+logical: [a0, a1, a2, a3, a4, a5, a6, a7]
+```
+
+可能被搬到多个不连续的地址区间。TMA、vector load、`ldmatrix` 和
+后续 MMA 读取都依赖这段连续元素保持成组。因此公式先：
+
+```text
+low = m & mask
+x   = m >> M
+```
+
+只对 `x` 中的字段做 swizzle，最后再：
+
+```text
+addr = (x2 << M) | low
+```
+
+把这段连续单元原样接回。
+
+#### 对 `(8, 64)` tile 的通用形式
+
+令：
+
+```text
+j = 8 * q + low
+0 <= q < 8
+0 <= low < 8
+```
+
+则：
+
+```text
+m = 64 * i + j
+  = 64 * i + 8 * q + low
+
+low = j & 7
+
+x = m >> 3
+  = 8 * i + q
+
+source = (x >> 3) & 7
+       = i
+
+x2 = (8 * i + q) ^ i
+   = 8 * i + (q ^ i)
+
+addr = 64 * i + 8 * (q ^ i) + low
+```
+
+这解释了 `j=0` 时为什么：
+
+```text
+q = 0
+low = 0
+
+addr = 64 * i + 8 * i
+     = 72 * i
+```
+
+fp16 的 bank 仍按每两个元素共享一个 4-byte bank word 计算：
+
+```text
+bank = floor(addr / 2) mod 32
+```
+
+对 `i=5`：
+
+```text
+addr = 360
+bank = floor(360 / 2) mod 32
+     = 180 mod 32
+     = 20
+```
+
+所以这次变换的完整路径是：
+
+```text
+m=320
+-> low=0
+-> x=40
+-> source=5
+-> x2=45
+-> addr=360
+-> bank 0 -> bank 20
+```
+
+#### 完整验证脚本
+
+下面这段代码不依赖 TVM，可以直接用 Python 3 运行，专门验证本节的
+逐位推导：
+
+```python
+M = B = S = 3
+COLS = 64
+
+
+def swizzle_address(row: int, col: int) -> tuple[int, int, int, int, int]:
+    linear = COLS * row + col
+    low = linear & ((1 << M) - 1)
+    x = linear >> M
+    mask = (1 << B) - 1
+    source = (x >> S) & mask
+    x2 = x ^ source
+    addr = (x2 << M) | low
+    return linear, low, x, source, x2, addr
+
+
+linear, low, x, source, x2, addr = swizzle_address(5, 0)
+bank = (addr // 2) % 32
+
+print(f"m      = {linear:3d} = {linear:09b}")
+print(f"low    = {low:3d} = {low:03b}")
+print(f"x      = {x:3d} = {x:06b}")
+print(f"source = {source:3d} = {source:06b}")
+print(f"x2     = {x2:3d} = {x2:06b}")
+print(f"addr   = {addr:3d} = {addr:09b}")
+print(f"bank   = {bank}")
+```
+
+预期输出：
+
+```text
+m      = 320 = 101000000
+low    =   0 = 000
+x      =  40 = 101000
+source =   5 = 000101
+x2     =  45 = 101101
+addr   = 360 = 101101000
+bank   = 20
+```
+
+#### 常见错误
+
+| 错误 | 结果 | 正确认识 |
+|---|---|---|
+| 把 `M=3` 当成 3 个字节 | 旧低位边界错误 | 它表示保留最低 3 bit address 字段 |
+| 先做 `x & mask` 再右移 | 截到错误字段 | 顺序必须是 `(x >> S) & mask` |
+| 让 `low` 参与 XOR | 16-byte vector 内元素被拆散 | `low` 只负责最后拼回 |
+| 把 `x` 当成最终地址 | 少乘回 `1 << M` 并漏掉 `low` | `x` 只是去低位后的中间值 |
+| 把 `q` 当成 `j` | `j` 含 vector 内偏移 | `q = j // 8`，`low = j % 8` |
+| 把 `(8,64)` 的 `q ^ i` 当成所有 swizzle 的通用形式 | 参数变化后来源字段不同 | 这里来自 `M=B=S=3` 的具体取值 |
+
+#### 小测
+
+1. `i=1, j=0` 时，`m`、`low`、`x`、`source`、`x2`、`addr` 和 bank 分别是多少？
+
+答：
+
+```text
+m = 64
+low = 0
+x = 8
+source = 1
+x2 = 9
+addr = 72
+bank = 4
+```
+
+2. `i=2, j=10` 时，`q`、`low`、`source`、`addr` 和 bank 分别是多少？
+
+答：
+
+```text
+q = 10 // 8 = 1
+low = 10 % 8 = 2
+source = 2
+addr = 64 * 2 + 8 * (1 ^ 2) + 2
+     = 128 + 24 + 2
+     = 154
+bank = (154 // 2) % 32
+     = 13
+```
+
+3. 为什么 `source` 要写 `(x >> S) & mask`，而不是只写 `x & mask`？
+
+答：先右移 `S` 才能把目标高位字段对齐到低 `B` bit，再用 mask 截取
+恰好 `B` bit。直接 `x & mask` 取到的是原来的最低 `B` bit，不是要
+XOR 的高位来源。
+
+4. 如果把 `low` 也 XOR 进去，最直接的结构问题是什么？
+
+答：原本连续的 16-byte vector 会被拆散，TMA / `ldmatrix` / vector
+访问不能再把 8 个相邻 fp16 当成一个连续单元处理。
+
+5. 为什么最后可以用 `| low` 拼回地址？
+
+答：因为 `x2 << M` 的低 `M` bit 全是 0，而 `low` 只占最低 `M` bit，
+两个字段互不重叠，所以 OR 等价于合并两个独立位域。
+
 ### 追踪 `j=0`
 
 `j=0` 时：

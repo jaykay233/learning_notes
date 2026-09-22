@@ -229,6 +229,10 @@ chapter_tirx_layout_api 第八个知识点完成：wg_local_layout
 ComposeLayout 将 affine TileLayout 与 XOR swizzle 组合起来
 M/B/S 是 bit count，不是 bytes
 (8,64) fp16 的 128B swizzle 使用 M=B=S=3
+low 不参与 XOR，保证连续 16-byte vector 保持成组
+x=m>>M，source=(x>>S)&mask，x2=x^source，addr=(x2<<M)|low
+(8,64)、i=5、j=0 的逐位路径为 320 -> 40 -> 5 -> 45 -> 360
+同一路径的 bank 从 0 变为 20
 j=0 时八行地址为 72*i，bank 为 0,4,8,...,28
 无 swizzle 时八行都落 bank 0
 chapter_tirx_layout_api 第九个知识点完成：ComposeLayout 与 shared-memory swizzle
