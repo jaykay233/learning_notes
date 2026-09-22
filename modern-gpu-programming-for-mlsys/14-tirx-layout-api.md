@@ -1,9 +1,9 @@
 # TIRx Layout API：`S[...]`、`R[...]`、offset 与命名轴
 
-这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前四个
+这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前五个
 知识点：`S[...] + R[...] + offset` 的语义与计算、命名轴的坐标空间，
 `apply()` 的三种输入形式，以及 `2 x 128 x 112` accumulator 的
-`TLane / TCol` 映射。先看：
+`TLane / TCol` 映射，还有 scale-factor atom 沿 `TLane` 的复制。先看：
 
 ```text
 S[...] + R[...] + offset
@@ -40,12 +40,12 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 [x] 命名轴：laneid / warpid / m / TLane / TCol
 [x] apply() 的三种输入形式与 flatten / decompose
 [x] TMEM accumulator layout 示例
-[ ] scale-factor layout 中的 replication
+[x] scale-factor layout 中的 replication
 [ ] tmem_datapath_layout / tcgen05_atom_layout / wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前四项。后续知识点会在同一章新的小节中继续展开。
+本篇目前完成前五项。后续知识点会在同一章新的小节中继续展开。
 
 ## 一、这个 API 要解决什么问题
 
@@ -2375,7 +2375,658 @@ column 区域大小，是否补齐取决于具体 kernel 的 allocator 和对齐
 allocation、基址和生命周期仍由 `tcgen05.alloc`、地址转换以及
 `tcgen05.dealloc` 等机制负责。
 
-## 十四、当前进度
+## 十四、Scale Factor 的 replication：`R[4 : 32@TLane]`
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：Scale Factor 布局
+知识点：32 x sf_per_mma atom 中 R[4 : 32@TLane] 的四份副本
+上次：2 x 128 x 112 accumulator 映射到 TLane / TCol
+下次：tmem_datapath_layout 的 datapath / rows / cols 参数
+PTX：tcgen05.cp.32x128b.warpx4 的目标布局；本课不讨论指令编码
+```
+
+上一课描述的是一个一对一的 accumulator layout：
+
+```text
+每个逻辑 accumulator 元素
+-> 一个 TLane / TCol 坐标
+```
+
+Scale factor 不是一对一。Block-scaled MMA 需要同一组逻辑 scale factors
+被多个 TMEM partition 看见，因此要把它的物理数据复制几份。本课只讲
+这个复制模式：
+
+```python
+scale = TileLayout(
+    S[(32, sf_per_mma) : (1@TLane, 1@TCol)]
+    + R[4 : 32@TLane]
+)
+```
+
+目标是回答：
+
+```text
+R[4 : 32@TLane] 到底复制几次？
+每个逻辑坐标会出现哪些物理 TLane？
+为什么 apply() 没有自动返回四份？
+```
+
+### 先建立心智模型
+
+先暂时只看 scale factor 的一个基础区域：
+
+```text
+32 行 scale
+x
+sf_per_mma 个连续的 8-bit scale 元素
+```
+
+设：
+
+```text
+SF_PER_MMA = 4
+```
+
+基础 shard 是：
+
+```text
+S[(32, 4) : (1@TLane, 1@TCol)]
+```
+
+它只覆盖：
+
+```text
+TLane = 0..31
+TCol  = 0..3
+```
+
+可以画成：
+
+```text
+partition 0
+TLane  0  [s0 s1 s2 s3]
+TLane  1  [s0 s1 s2 s3]
+...
+TLane 31  [s0 s1 s2 s3]
+```
+
+可是 TMEM 的 128 条 Lane 被分成四个 32-lane window：
+
+```text
+partition 0: TLane   0..31
+partition 1: TLane  32..63
+partition 2: TLane  64..95
+partition 3: TLane  96..127
+```
+
+如果 scale factor 只存在于 partition 0，其余三个 partition 在本地
+窗口里看不到它。解决方式是沿 `TLane` 再放置三份物理副本：
+
+```text
+copy 0: 原位置
+copy 1: TLane + 32
+copy 2: TLane + 64
+copy 3: TLane + 96
+```
+
+这就是：
+
+```python
+R[4 : 32@TLane]
+```
+
+要强调：
+
+```text
+逻辑上仍然只有一个 scale factor；
+物理 TMEM 中出现四份相同字节。
+```
+
+### 拆解 `R[4 : 32@TLane]`
+
+`R` 表示 replica。这个 iter 的语法是：
+
+```text
+R[extent : stride @ axis]
+```
+
+因此：
+
+| 部分 | 值 | 含义 |
+|---|---:|---|
+| extent | `4` | 枚举四个 `q` |
+| stride | `32` | 每次在目标轴上前进 32 |
+| axis | `TLane` | 复制沿 TMEM Lane 轴发生 |
+
+枚举结果是：
+
+```text
+q = 0 -> offset = 0 * 32 = 0
+q = 1 -> offset = 1 * 32 = 32
+q = 2 -> offset = 2 * 32 = 64
+q = 3 -> offset = 3 * 32 = 96
+```
+
+所以对于基础坐标：
+
+```text
+TLane = r
+TCol  = s
+```
+
+四份物理坐标是：
+
+```text
+TLane = r + 32 * q
+TCol  = s
+q     in {0, 1, 2, 3}
+```
+
+`q=0` 对应的就是 base 本身，因此总共是四份，不是“base 再加四份”。
+
+### 不要把重复出现的数字混成同一种含义
+
+当 `sf_per_mma=4` 时，layout 中会出现两组容易混淆的 `32` 和 `4`：
+
+```python
+S[(32, sf_per_mma) : (1@TLane, 1@TCol)] + R[4 : 32@TLane]
+     ^       ^                                     ^
+     |       |                                     |
+     |       +-- 每个 TLane 上的 4 个 TCol 元素    |
+     |                                             |
+     +-- 基础 shard 有 32 条 TLane                 |
+                                                   |
+                                                   +-- 四份物理副本
+```
+
+具体区分：
+
+| 数字 | 所在位置 | 作用 |
+|---:|---|---|
+| `32` | `S[...]` 第一个 extent | 基础 shard 的 `TLane` 行数 |
+| `4` | `S[...]` 第二个 extent | 每个 Lane 上的 `TCol` 元素数 |
+| `4` | `R[...]` 的 extent | replica 数量 |
+| `32` | `R[...]` 的 stride | 相邻副本在 `TLane` 上相隔多少 |
+
+它们恰好重复出现，但不是同一个维度的参数。
+
+### 完整可运行代码
+
+文件名：
+
+```text
+tirx_scale_factor_replication.py
+```
+
+完整代码：
+
+```python
+from tvm.tirx.layout import R, S, TCol, TileLayout, TLane
+
+SF_PER_MMA = 4
+
+
+def enumerate_scale_copies(layout, r, s):
+    """Enumerate the four physical copies for one logical (r, s)."""
+    base = dict(layout.apply(r, s))
+    replica = layout.replica[0]
+    axis = replica.axis.name
+    copies = []
+
+    for q in range(int(replica.extent)):
+        coord = dict(base)
+        coord[axis] += q * int(replica.stride)
+        copies.append((q, coord))
+
+    return base, copies
+
+
+def main():
+    layout = TileLayout(
+        S[(32, SF_PER_MMA) : (1 @ TLane, 1 @ TCol)]
+        + R[4 : 32 @ TLane]
+    )
+
+    print("layout:", layout)
+    print("shard:", layout.shard)
+    print("replica:", layout.replica)
+    print("size:", layout.size())
+    print("span TLane:", layout.span("TLane"))
+    print("span TCol:", layout.span("TCol"))
+
+    for r, s in [(0, 0), (3, 2), (31, 3)]:
+        base, copies = enumerate_scale_copies(layout, r, s)
+        print(f"logical ({r}, {s})")
+        print("  base:", base)
+        for q, coord in copies:
+            print(f"  q={q}:", coord)
+        print("  hardware:", {"TCol": s // 4, "byte": s % 4})
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 逐段解释
+
+#### 构造基础 shard
+
+```python
+S[(32, SF_PER_MMA) : (1 @ TLane, 1 @ TCol)]
+```
+
+两个 iter 是：
+
+```text
+(32, 1, TLane)
+(4,  1, TCol)
+```
+
+因此基础映射只回答：
+
+```text
+TLane = r
+TCol  = s
+```
+
+其中：
+
+```text
+r in [0, 32)
+s in [0, 4)
+```
+
+#### 添加 replica
+
+```python
+R[4 : 32 @ TLane]
+```
+
+它不依赖逻辑坐标 `(r, s)`，而是在基础坐标之外枚举额外物理位置。
+
+#### 查询 `layout.apply(r, s)`
+
+```python
+base = dict(layout.apply(r, s))
+```
+
+这里再次强调上一课的结论：
+
+```text
+layout.apply() 只返回 D(x) + O
+不会枚举 R
+```
+
+所以 `(3,2)` 的 `apply()` 返回：
+
+```text
+{"TCol": 2, "TLane": 3}
+```
+
+不是自动返回四个坐标。
+
+#### 读取 replica 描述
+
+```python
+replica = layout.replica[0]
+```
+
+打印结果是：
+
+```text
+T.Iter(4, 32, "TLane")
+```
+
+即：
+
+```text
+extent = 4
+stride = 32
+axis   = TLane
+```
+
+#### 枚举 `q`
+
+```python
+for q in range(int(replica.extent)):
+    coord = dict(base)
+    coord[axis] += q * int(replica.stride)
+```
+
+这一步只是教学代码中手工枚举 layout 声明的副本：
+
+```text
+coord[TLane] = r + q * 32
+```
+
+真实 tile 操作负责按 `layout.replica` 生成或搬运这些副本。`R` 本身
+不会在 Python 里自动修改数据。
+
+### 数值追踪：逻辑坐标 `(3, 2)`
+
+先算 base：
+
+```text
+TLane = r = 3
+TCol  = s = 2
+```
+
+再算四个副本：
+
+| q | TLane 计算 | TLane | TCol |
+|---:|---|---:|---:|
+| 0 | `3 + 32 * 0` | 3 | 2 |
+| 1 | `3 + 32 * 1` | 35 | 2 |
+| 2 | `3 + 32 * 2` | 67 | 2 |
+| 3 | `3 + 32 * 3` | 99 | 2 |
+
+对应 partition：
+
+```text
+TLane  3 -> partition 0
+TLane 35 -> partition 1
+TLane 67 -> partition 2
+TLane 99 -> partition 3
+```
+
+四个副本的 `TCol` 都保持为 `2`。Replica 只改变 `TLane`。
+
+### 边界追踪：逻辑坐标 `(31, 3)`
+
+这是基础 shard 中最后一个合法坐标：
+
+```text
+r = 31
+s = 3
+```
+
+四个副本是：
+
+```text
+q=0 -> TLane 31
+q=1 -> TLane 63
+q=2 -> TLane 95
+q=3 -> TLane 127
+```
+
+它们分别是四个 partition 的最后一个 Lane。结果没有越界：
+
+```text
+TLane 127 是合法坐标
+TLane 128 才是这个 layout 的越界位置
+```
+
+### 8-bit scale 的硬件打包
+
+课程在这里用了一个容易忽略的细节：
+
+```text
+TCol 仍然以 buffer element 为单位。
+```
+
+当 scale factor 是 8-bit 时，四个连续元素打包进一个 32-bit hardware
+TMEM cell：
+
+```text
+hardware TCol = s // 4
+byte position = s % 4
+```
+
+这里 `sf_per_mma=4`，所以 `s=0..3` 正好组成一个 hardware cell：
+
+| 逻辑 s | hardware TCol | byte |
+|---:|---:|---:|
+| 0 | 0 | 0 |
+| 1 | 0 | 1 |
+| 2 | 0 | 2 |
+| 3 | 0 | 3 |
+
+对于 `(3,2)`：
+
+```text
+TLane         = 3
+logical TCol  = 2
+hardware TCol = 2 // 4 = 0
+byte          = 2 % 4 = 2
+```
+
+复制后，同一个 byte 出现在：
+
+```text
+(TLane 3,  hardware TCol 0, byte 2)
+(TLane 35, hardware TCol 0, byte 2)
+(TLane 67, hardware TCol 0, byte 2)
+(TLane 99, hardware TCol 0, byte 2)
+```
+
+这就是 block-scaled MMA 能从四个本地 32-lane window 读取同一组 scale
+factor 的原因。
+
+### `size()` 和 `span()` 为什么都打印 128
+
+本课输出中：
+
+```text
+size: 128
+span TLane: 128
+```
+
+两个 `128` 的含义不同：
+
+```text
+size = 32 * 4 = 128
+       -> 逻辑元素数
+
+span TLane = 32 + 3 * 32 = 128
+           -> replica 后实际覆盖的 TLane 坐标范围
+```
+
+如果去掉 replica：
+
+```python
+TileLayout(S[(32, 4) : (1@TLane, 1@TCol)])
+```
+
+那么：
+
+```text
+size       = 128
+span TLane = 32
+TCol span  = 4
+```
+
+所以两个 `128` 相等只是本组参数造成的巧合，不代表 replica 没有增加
+物理坐标范围。
+
+### 数据路径与执行边界
+
+真实 block-scaled 路径可以概括为：
+
+```text
+scale factors:
+GMEM -> SMEM
+     -> tcgen05.cp.32x128b.warpx4
+     -> TMEM 四个 32-lane windows
+     -> block-scaled tcgen05.mma 从本地 partition 读取
+```
+
+这里有三层不同责任：
+
+| 层 | 负责什么 |
+|---|---|
+| `TileLayout + R[...]` | 描述基础位置和副本目标坐标 |
+| `tcgen05.cp ... .warpx4` | 实际把数据搬运并复制到 TMEM |
+| `tcgen05.mma` | 按 TMEM 地址读取 scale factors 并执行 MMA |
+
+`layout.apply()` 只完成第一层中的 base coordinate 查询。它不会：
+
+```text
+复制寄存器或 SMEM 数据
+发射 tcgen05.cp
+保证复制已经完成
+启动 block-scaled tcgen05.mma
+保证 MMA 的同步契约
+```
+
+具体 cp 的 payload 宽度由完整 tile layout 决定。本课这个
+`32 x sf_per_mma` atom 只描述复制模式，不等于整条硬件搬运指令的全部
+数据宽度。
+
+### 常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 | 优先检查 |
+|---|---|---|---|
+| 只用 `layout.apply(r,s)` | 它只返回 base coordinate | partition 1..3 读到零、旧数据或错误 scale | 是否枚举了 `layout.replica` |
+| 把 replica 数理解成 1 + 4 | `q=0` 已经是 base | 多发一份，目标可能越界或覆盖相邻数据 | `q in {0,1,2,3}` |
+| 枚举 `q=1..4` | 跳过了 base 并多出 `+128` | 第一份缺失，最后一份超出 128 Lane | replica extent 和 stride |
+| 将复制步长应用到 `TCol` | `R` 的 axis 是 `TLane` | scale 出现在错误列，四个 partition 仍没有本地副本 | `R[...]` 的 axis |
+| 认为四个逻辑 scale 就是四个 hardware columns | 8-bit 四个元素打包进一个 32-bit cell | TCol 被放大四倍，byte 地址错误 | `s // 4`、`s % 4` |
+| 认为 `span TLane = 128` 表示逻辑元素增加四倍 | `size()` 仍是 128 | 错误分配逻辑 buffer 或在 GMEM 中重复存四份 | `size()` 与 `span()` 的区别 |
+| 把 atom 当成整条 `.32x128b` payload | atom 只是局部复制模式 | cp 宽度、列数和外层布局不一致 | 外层 M / K-block iters |
+
+在量化推理 kernel 中，这类错误通常表现为：
+
+```text
+只有部分 warp partition 的 block-scaled GEMM 结果正确
+partition 1..3 的 scale 全部相同或为零
+FP8 / FP4 GEMM 的输出误差突然增大
+scale factor 跨 byte 边界打包，出现数量级错误
+tcgen05.mma 读到尚未完成的 tcgen05.cp 数据
+```
+
+### 验证命令和预期输出
+
+运行：
+
+```bash
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python tirx_scale_factor_replication.py
+```
+
+本机 TVM `0.26.dev246` 实测输出：
+
+```text
+layout: T.TileLayout(T.S[(32, 4):(1 @ Axis.TLane, 1 @ Axis.TCol)] + T.R[4:32 @ Axis.TLane])
+shard: (T.Iter(32, 1, "TLane"), T.Iter(4, 1, "TCol"))
+replica: (T.Iter(4, 32, "TLane"),)
+size: 128
+span TLane: 128
+span TCol: 4
+logical (0, 0)
+  base: {'TCol': 0, 'TLane': 0}
+  q=0: {'TCol': 0, 'TLane': 0}
+  q=1: {'TCol': 0, 'TLane': 32}
+  q=2: {'TCol': 0, 'TLane': 64}
+  q=3: {'TCol': 0, 'TLane': 96}
+  hardware: {'TCol': 0, 'byte': 0}
+logical (3, 2)
+  base: {'TCol': 2, 'TLane': 3}
+  q=0: {'TCol': 2, 'TLane': 3}
+  q=1: {'TCol': 2, 'TLane': 35}
+  q=2: {'TCol': 2, 'TLane': 67}
+  q=3: {'TCol': 2, 'TLane': 99}
+  hardware: {'TCol': 0, 'byte': 2}
+logical (31, 3)
+  base: {'TCol': 3, 'TLane': 31}
+  q=0: {'TCol': 3, 'TLane': 31}
+  q=1: {'TCol': 3, 'TLane': 63}
+  q=2: {'TCol': 3, 'TLane': 95}
+  q=3: {'TCol': 3, 'TLane': 127}
+  hardware: {'TCol': 0, 'byte': 3}
+```
+
+本机运行边界：
+
+```text
+可以运行: TileLayout / Iter 查询、apply()、手工 replica 枚举
+不能运行: tcgen05.cp、tcgen05.mma 以及需要 Blackwell 的实际 kernel
+```
+
+### 本课结论
+
+这一行：
+
+```python
+R[4 : 32@TLane]
+```
+
+完整含义是：
+
+```text
+生成四个副本
+副本编号 q = 0, 1, 2, 3
+每个副本在 TLane 上增加 q * 32
+TCol 不变
+q=0 就是 base 本身
+```
+
+最重要的工程结论是：
+
+```text
+布局声明 replica；
+tile 操作生成 replica；
+MMA 消费本地 partition 中的 replica。
+```
+
+### 自测题
+
+#### 1. `R[4 : 32@TLane]` 产生哪些偏移？
+
+答：
+
+```text
+q=0 -> 0
+q=1 -> 32
+q=2 -> 64
+q=3 -> 96
+```
+
+总共四份，其中偏移 0 是 base。
+
+#### 2. 逻辑坐标 `(3, 2)` 的四份物理坐标是什么？
+
+答：
+
+```text
+(TLane 3,  TCol 2)
+(TLane 35, TCol 2)
+(TLane 67, TCol 2)
+(TLane 99, TCol 2)
+```
+
+#### 3. 逻辑坐标 `(31, 3)` 为什么最后一份落在 `TLane 127`？
+
+答：
+
+```text
+TLane = 31 + 32 * 3
+      = 31 + 96
+      = 127
+```
+
+它正好是第四个 partition 的最后一个 Lane。
+
+#### 4. 8-bit scale 的逻辑 `s=2` 对应哪个 hardware TCol 和 byte？
+
+答：
+
+```text
+hardware TCol = 2 // 4 = 0
+byte          = 2 % 4 = 2
+```
+
+四个连续 8-bit element `s=0..3` 共用 `hardware TCol=0`。
+
+#### 5. 为什么 `layout.apply(3,2)` 没有返回四个坐标？
+
+答：`apply()` 只返回基础映射 `D(x)+O`，不枚举 replica。四份副本的
+描述保存在 `layout.replica` 中，由消费这个 layout 的 tile 操作负责
+生成或搬运。
+
+## 十五、当前进度
 
 `chapter_tirx_layout_api` 的知识点：
 
@@ -2384,12 +3035,12 @@ allocation、基址和生命周期仍由 `tcgen05.alloc`、地址转换以及
 [x] 命名轴：laneid / warpid / m / TLane / TCol
 [x] apply() 的三种输入形式与 flatten / decompose
 [x] TMEM accumulator layout 示例
-[ ] scale-factor layout 中的 replication
+[x] scale-factor layout 中的 replication
 [ ] tmem_datapath_layout / tcgen05_atom_layout / wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前四项。已经覆盖：
+本篇目前完成前五项。已经覆盖：
 
 ```text
 TileLayout 可以表示 lane、warp、register、TMEM 等命名轴坐标
@@ -2427,11 +3078,19 @@ outer region 的 112@TCol stride 产生 TCol = 112 * a + col
 TMEM layout 不要求 extent 是 2 的幂，112 column 区域无需补齐到 128
 layout.apply() 返回基础 TLane / TCol，不分配 TMEM，也不发射 tcgen05 指令
 layout 与 allocation / MMA / wait / tcgen05.ld 是四个独立契约
+scale-factor atom 使用 S[(32, sf_per_mma):(1@TLane,1@TCol)] 描述基础位置
+R[4 : 32@TLane] 枚举 q=0..3，偏移分别是 0、32、64、96
+q=0 就是 base 本身，因此总数是四份
+四个副本的 TLane 是 r + 32*q，TCol 保持 s 不变
+同一个 scale 出现在四个 32-lane TMEM partition 的本地窗口
+8-bit scale 的 logical TCol s 打包为 hardware TCol s//4 和 byte s%4
+layout.apply() 只返回 base，replica 保存在 layout.replica
+layout 描述复制目标，tcgen05.cp 执行数据搬运，MMA 消费本地副本
 ```
 
 下一知识点：
 
 ```text
 chapter_tirx_layout_api
--> scale-factor layout 中的 replication
+-> tmem_datapath_layout 的 datapath / rows / cols 参数
 ```

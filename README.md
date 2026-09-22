@@ -282,6 +282,12 @@ TLane 承载 128 个逻辑 M rows，TCol 覆盖 [0, 224)
 TCol = 112 * a + col，非 2 的幂 extent 112 无需补齐
 layout 只描述 TMEM 坐标，不负责 allocation、MMA 或 tcgen05.ld
 chapter_tirx_layout_api 第四个知识点完成：TMEM accumulator layout
+scale-factor atom 的 R[4 : 32@TLane] 在 TLane 上生成四份副本
+副本偏移为 0、32、64、96，q=0 就是 base 本身
+同一个 scale factor 位于四个 32-lane TMEM partition 的本地窗口
+8-bit logical TCol s 打包到 hardware TCol s//4 和 byte s%4
+layout.apply() 只返回 base，layout.replica 描述四份副本
+chapter_tirx_layout_api 第五个知识点完成：scale-factor replication
 ```
 
 完整文档索引、当前进度和硬件环境说明见
