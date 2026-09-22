@@ -499,6 +499,213 @@ operand allocation 移到 byte offset 1024，避免和前面区域重叠。
 Load 会按这个物理布局写 SMEM，后面的 `tcgen05.mma` 也按相同布局读取。
 如果两边不一致，地址本身可能合法，但 Tensor Core 会读到错位的元素。
 
+#### 2.1 `pool.commit()` 的精确含义
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 1 步：顺序执行的单 Tile GEMM
+知识点：T.SMEMPool 的 alloc / move_base_to / commit
+上次：mma_shared_layout 生成的 SWIZZLE_128B_ATOM
+下次：mbarrier 初始化与 tcgen05.alloc 的 TMEM 生命周期
+PTX：dynamic shared memory allocation、shared::cta
+```
+
+这里先建立一个心智模型：
+
+```text
+shared.dyn 是一整块连续内存
+SMEMPool 是编译期的 bump allocator
+alloc 负责“占位置并把 cursor 向后推”
+move_base_to 负责“把 cursor 移到指定位置”
+commit 负责“结束规划，报告整块 arena 的最终字节数”
+```
+
+因此，`pool.commit()` 不是运行时提交，也不是数据同步。它做的是：
+
+```text
+在 lowering 前冻结 allocator 的最终布局信息，
+把 pool 的 high-water mark 写成 tirx.pool_max_bytes，
+让后续 compiler 知道 shared.dyn 需要分配多少字节。
+```
+
+每个 API 的职责可以精确拆成：
+
+| API | 执行阶段 | 作用 | 是否生成 GPU 指令 |
+|---|---|---|---|
+| `T.SMEMPool()` | Python 解析 / IR 构建 | 创建一个共享内存 bump allocator | 否 |
+| `pool.alloc(...)` | Python 解析 / IR 构建 | 对齐 cursor、创建 buffer view、推进 cursor | 否 |
+| `pool.move_base_to(...)` | Python 解析 / IR 构建 | 把 cursor 移到绝对 byte offset | 否 |
+| `pool.commit()` | Python 解析 / IR 构建 | 结束规划并发出最终 size annotation | 否 |
+
+参数拆开看：
+
+| 表达式 | 含义 |
+|---|---|
+| `pool.alloc((1,), "uint32")` | 分配 4 bytes，并返回一个 `shared.dyn` view |
+| `align=8` | 先把 cursor 向上对齐到 8-byte 边界，再分配 |
+| `pool.move_base_to(1024)` | 把 cursor 直接设置为 byte offset 1024 |
+| `pool.commit()` | 使用 allocator 记录到的 maximum high-water mark 作为 arena 大小 |
+
+当前这段分配可以逐步追踪为：
+
+| 操作 | 分配起点 | 分配大小 | 操作后的 cursor |
+|---|---:|---:|---:|
+| `tmem_addr` | 0 | 4 bytes | 4 |
+| `mma_bar`，先做 8-byte 对齐 | 8 | 8 bytes | 16 |
+| `move_base_to(1024)` | 不分配 | 0 | 1024 |
+| `Asmem` | 1024 | `128 x 64 x 2 = 16384` bytes | 17408 |
+| `Bsmem` | 17408 | `128 x 64 x 2 = 16384` bytes | 33792 |
+| `pool.commit()` | 不分配 | 0 | high-water mark = 33792 |
+
+所以最终布局是：
+
+```text
+[0,       4)      tmem_addr
+[4,       8)      alignment padding
+[8,      16)      mma_bar
+[16,   1024)      reserved / alignment gap
+[1024, 17408)     Asmem, 16 KiB
+[17408,33792)     Bsmem, 16 KiB
+
+shared.dyn total = 33792 bytes = 33 KiB
+```
+
+`move_base_to(1024)` 很重要，因为后续两个 operand 需要满足 MMA/TMA
+descriptor 的 base alignment。把 cursor 直接移到 1024，可以让：
+
+```text
+Asmem base = 1024  bytes = 1 KiB 对齐
+Bsmem base = 17408 bytes = 17 KiB 对齐
+```
+
+这两个 offset 都能按 1024-byte 对齐。若不做这一步，`Asmem` 会直接接在
+`mma_bar` 后面，后续 base 不再满足预期的对齐约束。
+
+下面给出一个不依赖 GPU、可以在当前 Python/TIRx 环境执行的完整检查脚本。
+
+文件：`check_smem_pool_plan.py`
+
+```python
+from tvm.script import from_source, tirx as T
+
+
+SOURCE = """
+@T.prim_func
+def smem_pool_plan():
+    T.device_entry()
+    pool = T.SMEMPool()
+    tmem_addr = pool.alloc((1,), "uint32")
+    mma_bar = pool.alloc((1,), "uint64", align=8)
+    pool.move_base_to(1024)
+    Asmem = pool.alloc((128, 64), "float16")
+    Bsmem = pool.alloc((128, 64), "float16")
+    pool.commit()
+"""
+
+
+mod = from_source(SOURCE, {"T": T})
+print(mod.script())
+```
+
+运行：
+
+```bash
+./mlc/bin/python check_smem_pool_plan.py
+```
+
+本机实际打印出的关键 lowered IR 是：
+
+```text
+tmem_addr = T.decl_scalar(T.uint32, data=pool_buf.data, elem_offset=0,
+                          scope="shared.dyn")
+mma_bar = T.decl_buffer((1,), "uint64", data=pool_buf.data,
+                        elem_offset=1, scope="shared.dyn", align=8)
+Asmem = T.decl_buffer((128, 64), "float16", data=pool_buf.data,
+                      elem_offset=512, scope="shared.dyn")
+Bsmem = T.decl_buffer((128, 64), "float16", data=pool_buf.data,
+                      elem_offset=8704, scope="shared.dyn")
+with T.attr(pool_buf.data, "tirx.pool_max_bytes", 33792):
+    T.evaluate(0)
+```
+
+这里的 `elem_offset` 是“按各 buffer 的元素类型计数”，不是统一的 byte
+offset：
+
+```text
+mma_bar: uint64, 1 element  x 8 bytes = 8
+Asmem:   float16, 512 elems x 2 bytes = 1024
+Bsmem:   float16, 8704 elems x 2 bytes = 17408
+```
+
+`tirx.pool_max_bytes = 33792` 才是整个池最终的 byte size。
+
+这里必须区分三个名字相似的机制：
+
+| 写法 | 发生时间 | 含义 |
+|---|---|---|
+| `pool.commit()` | 编译期 | 结束 SMEM pool 规划，确定 `shared.dyn` 大小 |
+| `T.ptx.tcgen05.alloc(...)` | GPU 运行期 | 真正申请 TMEM columns，并写出 TMEM 地址 |
+| `T.ptx.tcgen05.commit(...)` | GPU 运行期 | 把异步 MMA 的完成事件关联到 mbarrier |
+
+它们的关系是：
+
+```text
+pool.commit()
+  只负责 SMEM 地址空间和大小，不碰 TMEM，也不等待任何任务。
+
+tcgen05.alloc(...)
+  才是在 GPU 上申请 TMEM。
+
+tcgen05.commit(...)
+  是异步 MMA completion 的同步协议，和 SMEM 分配完全不是一回事。
+```
+
+`pool.commit()` 也不是下列任何操作：
+
+```text
+不是 __syncthreads() 或 CTA barrier
+不是 __threadfence() 或 fence
+不是数据 flush
+不是 TMEM allocation
+不是 tcgen05.commit
+不是 kernel launch
+```
+
+几个容易踩坑的点：
+
+| 错误 | 可观察症状 |
+|---|---|
+| 忘记 `pool.commit()` | pool 没有正确的最终 size annotation，lowering/launch 可能得到错误 dynamic shared memory 大小 |
+| `commit()` 后继续 `pool.alloc()` | 新 allocation 没被最终 size 覆盖，可能越界、覆盖别的数据或污染 CUDA context |
+| 把 `commit()` 当同步 | 误删后面的 `cta_sync`/fence，MMA 读到未完成或不可见的 SMEM 数据 |
+| 把 `move_base_to()` 当 free | 向后移动不会减少 high-water mark，也不会自动结束旧 buffer 的生命周期 |
+| 反复 `commit()` | 把它当作允许的运行时操作，实际它是 IR 构建阶段的最终化协议 |
+
+其中“`commit()` 后继续 alloc”尤其要注意。`SMEMPool.commit()` 的契约是
+“必须在所有 `alloc()` 和 `move_base_to()` 之后调用”。错误的 allocation
+顺序通常不会得到友好的 Python 异常，而可能在运行阶段表现为随机错误、
+非法地址访问或 context poisoning。
+
+自测：
+
+1. `pool.commit()` 会生成哪条 GPU 指令？
+   答：不会生成。它只在编译期写入 pool 最终大小。
+
+2. 为什么 `tmem_addr` 占 4 bytes，却让下一个 buffer 从 offset 8 开始？
+   答：`mma_bar` 要求 `align=8`，所以 cursor 从 4 向上对齐到 8。
+
+3. 为什么最终大小是 33792 bytes？
+   答：`1024 + 128*64*2 + 128*64*2 = 1024 + 16384 + 16384 = 33792`。
+
+4. `pool.commit()` 和 `tcgen05.commit(...)` 是同一个东西吗？
+   答：不是。前者结束 SMEM 编译期分配；后者关联异步 MMA 完成事件与
+   mbarrier。
+
+5. 在 `pool.commit()` 后再调用 `pool.alloc()`，还能保证正确吗？
+   答：不能。`commit()` 已经把最终大小固定，后续 allocation 不在这个
+   大小契约内。
+
 ### 3. mbarrier 与 TMEM 初始化
 
 ```python
@@ -1120,6 +1327,8 @@ tcgen05.commit 把 MMA 完成事件关联到 mbarrier
 mbarrier.try_wait 等到本轮 MMA 完成后才能读取 TMEM
 K=64 的 tile operation 会 lower 成 4 个 K=16 的 MMA
 accum=False 表示 tile operation 不继承更早的 TMEM accumulator
+T.SMEMPool 的 alloc 推进 cursor，move_base_to 控制后续 base offset
+pool.commit 确定 shared.dyn 的最终 high-water-mark 大小，它不是运行时 barrier
 Dreg_wg 用 tid_in_wg 将 128 个输出 rows 映射到一个 warpgroup 的 128 threads
 Tx.wg.copy_async 读取 TMEM，tcgen05.wait.ld 等待 register load 完成
 每个 thread 将自己的 fp32 row cast 为 fp16，再写回 GMEM
