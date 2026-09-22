@@ -1019,6 +1019,269 @@ source layout、destination layout、元素类型和 compiler lowering 决定。
    答：它是 tile-level operation，具体 atom 和 repeat 次数由 types、layouts
    与 compiler lowering 决定。
 
+#### 7.2 `tcgen05.wait.ld()`：等待异步 TMEM load 真正完成
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 1 步：顺序执行的单 Tile GEMM
+知识点：tcgen05.ld 的完成等待与 register 可见性
+上次：Tx.wg.copy_async 的分布式 destination layout
+下次：第 2 步：K-Loop 累加与 MMA barrier phase
+PTX：9.7.18.8.5 Tensorcore 5th Generation Instructions: tcgen05.wait
+```
+
+上一节已经知道：
+
+```python
+Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+```
+
+会发出从 TMEM 到 registers 的异步 `tcgen05.ld`。这里的“异步”表示：
+
+```text
+发出 load
+!=
+load 已经完成
+!=
+destination registers 已经可以安全读取或复用
+```
+
+`T.ptx.tcgen05.wait.ld()` 补上的就是这个完成点：
+
+```text
+copy_async 发出 TMEM load
+    |
+    | load 还在进行
+    v
+T.ptx.tcgen05.wait.ld()
+    |
+    | 当前线程等待自己此前发出的所有 tcgen05.ld 完成
+    v
+Dreg 中的 destination registers 可以安全消费
+```
+
+可以把整个 writeback 想成下面的顺序：
+
+```text
+第一句：把 TMEM 数据订回来，但包裹还在路上
+wait.ld：等当前线程订的所有包裹都送到
+cast：现在才打开 register 里的包裹
+```
+
+它在 TVM 中最终 lower 到：
+
+```cpp
+asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+```
+
+逐个 token 解释：
+
+| token | 含义 |
+|---|---|
+| `tcgen05` | Blackwell 第五代 Tensor Core / Tensor Memory 相关指令族 |
+| `wait` | 完成等待，不发起新的数据搬运 |
+| `::ld` | 只等待此前异步发出的 `tcgen05.ld` |
+| `.sync` | 同一个 warp 中的 threads 都要执行这条 wait，然后才能一起继续 |
+| `.aligned` | 同一 warp 的所有 threads 必须执行相同的 wait instruction |
+| `"memory"` clobber | 告诉 C++ compiler 这条 asm 会改变内存可见性，不能随意挪动或优化掉 |
+
+最重要、也最容易误解的 scope 是：
+
+```text
+tcgen05.wait::ld
+-> 等待执行这条指令的 thread 此前发出的所有 tcgen05.ld
+-> 不等待其他 thread 发出的 load
+-> 不等待 tcgen05.mma
+-> 不是 CTA barrier
+-> 不是 warpgroup-wide barrier
+```
+
+PTX 对 `.sync` 的规定是：执行 wait 的 thread 先等待自己的 prior loads 完成，
+然后再等同一个 warp 中的所有 threads 都执行到同一条 wait，之后整段代码才
+继续。因此它同时包含两层作用：
+
+```text
+thread-local completion：本 thread 的 loads 已完成
+warp rendezvous：同一个 warp 的所有 lanes 都到达 wait
+```
+
+它不是：
+
+```text
+warp 0 等 warp 1 / warp 2 / warp 3
+也不是 128-thread warpgroup barrier
+```
+
+本 kernel 中四个 warps 都执行：
+
+```python
+T.ptx.tcgen05.wait.ld()
+```
+
+每个 warp 独立完成自己的 `.sync.aligned` 等待。128 个线程都执行到 wait
+以后，各自负责的 register fragment 才是可消费状态。
+
+完整相关代码是：
+
+```python
+Dreg = T.alloc_local((BLK_N,), acc_type)
+Dreg_f16 = T.alloc_local((BLK_N,), d_type)
+Dreg_wg = Dreg.view(
+    128,
+    BLK_N,
+    layout=TileLayout(
+        S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+    ),
+)
+
+Tx.wg.copy_async(
+    Dreg_wg[:, :],
+    tmem[:, :BLK_N],
+)
+T.ptx.tcgen05.wait.ld()
+
+Tx.cast(Dreg_f16[:], Dreg[:])
+Tx.copy(
+    D[m_st + warp_id * 32 + lane_id, n_st : n_st + BLK_N],
+    Dreg_f16[:],
+)
+```
+
+这里的顺序不能交换：
+
+```text
+correct:
+    copy_async
+    wait.ld
+    cast
+
+wrong:
+    copy_async
+    cast
+    wait.ld
+```
+
+第二种顺序把 wait 放得太晚。即使某次执行碰巧能读到正确值，也依赖 timing，
+不是正确的同步契约。
+
+把 `D[73, 91]` 代入：
+
+| 阶段 | 状态 |
+|---|---|
+| `Tx.wg.copy_async(...)` | 发出到 `TMEM[TLane=73, TCol=91]` 的异步 load |
+| load pending | thread 73 的 `Dreg[91]` 尚不能作为完成后数据使用 |
+| `wait.ld()` | thread 73 等待自己的 prior loads 完成；warp 2 内部汇合 |
+| wait 返回 | thread 73 的 `Dreg[91]` 达到可消费状态 |
+| `Tx.cast(...)` | 从 `Dreg[91]` 读取并转换为 fp16 |
+| 后续 `Tx.copy(...)` | 将结果写到 `D[m_thr, 91]`，其中 `m_thr=73` |
+
+需要特别区分三类同步：
+
+| 机制 | 等待什么 | Scope | 典型用途 |
+|---|---|---|---|
+| `tcgen05.commit` + `mbarrier.try_wait` | `tcgen05.mma` / `cp` / `shift` 的完成事件 | 通过 mbarrier 跨 thread 观察 | 确保 MMA 结果可供后续 consumer 读取 |
+| `tcgen05.wait::ld` | 当前 thread 此前发出的 `tcgen05.ld` | thread + warp `.sync.aligned` | 确保 TMEM -> register load 完成 |
+| `cta_sync` | CTA 内 thread 到达同步点 | CTA threads | 建立 thread 间控制同步；不会自动等待 async load 完成 |
+
+因此下面这种替代是错的：
+
+```python
+Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+T.cuda.cta_sync()  # 错：它不会替你等待这个 thread 的 tcgen05.ld
+Tx.cast(Dreg_f16[:], Dreg[:])
+```
+
+`cta_sync` 只能说明 threads 到达了某个执行点，不能替代 `tcgen05.ld` 的完成
+协议。
+
+下面是一个不依赖 GPU 的完成语义模拟，用来区分“发出 load”和“load 完成”：
+
+文件：`check_wait_ld_semantics.py`
+
+```python
+OLD_VALUE = 0
+NEW_VALUE = 7
+
+
+class AsyncRegister:
+    def __init__(self, value):
+        self.value = value
+        self.pending_value = None
+        self.pending = False
+
+    def issue_ld(self, value):
+        self.pending_value = value
+        self.pending = True
+
+    def wait_ld(self):
+        if self.pending:
+            self.value = self.pending_value
+            self.pending_value = None
+            self.pending = False
+
+    def read(self):
+        if self.pending:
+            return f"unsafe-before-wait(value={self.value}, pending=True)"
+        return f"ready(value={self.value}, pending=False)"
+
+
+reg = AsyncRegister(OLD_VALUE)
+reg.issue_ld(NEW_VALUE)
+print(f"after issue: {reg.read()}")
+
+reg.wait_ld()
+print(f"after wait:  {reg.read()}")
+```
+
+运行：
+
+```bash
+python3 check_wait_ld_semantics.py
+```
+
+预期输出：
+
+```text
+after issue: unsafe-before-wait(value=0, pending=True)
+after wait:  ready(value=7, pending=False)
+```
+
+这个脚本只模拟 API 的完成顺序，不模拟真实 GPU timing。真实 `tcgen05.ld`
+只能在没有分歧的 warp 中执行对应的 `tcgen05.wait::ld`，并且必须运行在
+支持该指令的 Blackwell GPU 上。
+
+常见错误和症状：
+
+| 错误 | 可观察症状 |
+|---|---|
+| 把 `copy_async` 当成同步 copy | 还没完成就读取 `Dreg`，结果依赖 timing |
+| 用 `cta_sync` 代替 `wait.ld` | CTA 的线程同步了，但 TMEM load 仍可能 pending |
+| 用 `wait.st` 代替 `wait.ld` | 等待了错误的指令类别，不能建立本 load 的完成 |
+| 只在部分 lanes 执行 wait | 违反 `.sync.aligned` 的整体执行要求，行为未定义 |
+| 提前复用 `Dreg` | 新值可能覆盖尚未完成的旧 load destination，产生 anti-dependency hazard |
+| 以为 wait 会等待其他 warps 的 loads | 错误假设跨 warp 已完成；实际每 warp 只负责自己的同步约定 |
+
+自测：
+
+1. `tcgen05.wait.ld()` 等待的是哪一类操作？
+   答：当前 thread 此前发出的所有异步 `tcgen05.ld` 操作。
+
+2. 它会不会等待 `tcgen05.mma` 完成？
+   答：不会。MMA 的完成通常通过 `tcgen05.commit` 关联到的 mbarrier
+   来等待。
+
+3. `.sync.aligned` 的同步范围是整个 CTA 吗？
+   答：不是。它约束的是同一个 warp；它不会替代 CTA barrier 或
+   warpgroup barrier。
+
+4. 把 `cta_sync()` 放在 load 后、cast 前，能不能保证 `Dreg` 已完成？
+   答：不能。`cta_sync` 同步 thread 到达，不负责等待异步 TMEM load。
+
+5. 为什么 `wait.ld()` 必须在 `cast` 之前？
+   答：因为 `cast` 要消费 TMEM load 写入的 registers，必须等 prior loads
+   完成，建立正确的数据依赖。
+
 ### 8. cast 与写回
 
 ```python
@@ -1879,6 +2142,9 @@ Dreg_wg 是同一份 local storage 的 warpgroup distributed view，不分配也
 Dreg_wg 用 tid_in_wg 将 128 个逻辑 rows 映射到 warpgroup 的 128 个 owner threads
 view 的 row 决定 owner thread，col 决定该线程的 local register index
 Tx.wg.copy_async 读取 TMEM，tcgen05.wait.ld 等待 register load 完成
+tcgen05.ld 是异步的，tcgen05.wait::ld 等待当前 thread 的 prior loads 完成
+wait::ld.sync.aligned 只做 warp 内汇合，不是 CTA 或 warpgroup barrier
+cta_sync 不能替代 wait.ld，因为 thread 到达不等于 TMEM load 已完成
 writeback 由 wait.ld、fp32-to-fp16 cast 和按 m_thr 写回 GMEM 组成
 每个 thread 将自己的 fp32 row cast 为 fp16，再写回 GMEM
 TMEM 必须先 cta_sync，再 relinquish permit 和 dealloc
