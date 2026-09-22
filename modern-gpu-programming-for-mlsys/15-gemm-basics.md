@@ -2427,7 +2427,639 @@ D[73, 91]
 `(TLane=73, TCol=91)`。这一步还没有 device-side K-loop；K 的拆分发生在
 一次 `Tx.gemm_async` tile operation 的 lowering 内部。
 
-## 十一、当前进度
+## 十一、`hgemm_v2` 与 `hgemm_v3` 的核心区别
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：从 K-Loop 扩展到 Spatial Tiling
+知识点：hgemm_v2 与 hgemm_v3 的区别
+上次：m_thr 如何把线程映射到全局输出行
+下次：第 2 步：K-Loop 累加与 MMA barrier phase
+PTX：global load、global store、tcgen05.mma、mbarrier.try_wait
+```
+
+先用一句话区分两个版本：
+
+```text
+hgemm_v2 增加 K 方向的 loop
+hgemm_v3 在 v2 的基础上，增加 M/N 方向的 CTA spatial tiling
+```
+
+它们不是两个互不相关的版本。演进关系是：
+
+```text
+v1: 一个 CTA 计算一个 128 x 128 output tile，K 最大为 64
+     |
+     +-- v2 增加 K-loop，让 K 可以大于 64
+              |
+              +-- v3 增加 M/N grid，让一个 CTA 负责多个 output tiles 之一
+```
+
+因此，从 `v2` 到 `v3` 新增的关键机制只有：
+
+```text
+CTA 不再固定处理全局 D 的 (0:128, 0:128)
+
+CTA (bx, by) 负责：
+D[bx*BLK_M : (bx+1)*BLK_M,
+  by*BLK_N : (by+1)*BLK_N]
+```
+
+### 11.1 最关键的代码差异
+
+`v2` 的 load 永远从 A、B 的完整 leading dimension 开始：
+
+```python
+Tx.cta.copy(Asmem[:, :], A[:, i*BLK_K:(i+1)*BLK_K])
+Tx.cta.copy(Bsmem[:, :], B[:, i*BLK_K:(i+1)*BLK_K])
+```
+
+这隐含了：
+
+```text
+A.shape[0] == BLK_M
+B.shape[0] == BLK_N
+```
+
+因此 `v2` 只适合 `M=N=128` 的单 output tile。它虽然写了 `bx, by`，但
+grid 的实际 shape 是 `1 x 1`，所以 `m_st=n_st=0`。
+
+`v3` 的 load 增加了当前 CTA tile 的行起点：
+
+```python
+Tx.cta.copy(
+    Asmem[:, :],
+    A[m_st:m_st+BLK_M, i*BLK_K:(i+1)*BLK_K],
+)
+Tx.cta.copy(
+    Bsmem[:, :],
+    B[n_st:n_st+BLK_N, i*BLK_K:(i+1)*BLK_K],
+)
+```
+
+其中：
+
+```text
+m_st = bx * BLK_M
+n_st = by * BLK_N
+```
+
+这正是 `v3` 相对 `v2` 的本质变化。其他核心结构，包括 SMEM 分配、
+`tcgen05.mma`、MMA barrier、TMEM layout、writeback 和线程映射，基本不变。
+
+### 11.2 两个版本的完整代码
+
+公共 imports 如下：
+
+```python
+import tvm
+from tvm.script import tirx as T
+from tvm.script.tirx import tile as Tx
+from tvm.backend.cuda.tile_primitive.tma_utils import (
+    mma_shared_layout,
+    SwizzleMode,
+)
+from tvm.tirx.layout import TileLayout, S, TLane, TCol, tid_in_wg
+```
+
+#### `hgemm_v2`：加入 K-loop
+
+```python
+def hgemm_v2(M, N, K):
+    a_type = tvm.DataType("float16")
+    b_type = tvm.DataType("float16")
+    d_type = tvm.DataType("float16")
+    acc_type = tvm.DataType("float32")
+
+    BLK_M, BLK_N, BLK_K = 128, 128, 64
+    K_TILES = K // BLK_K
+
+    A_layout = mma_shared_layout(
+        a_type,
+        SwizzleMode.SWIZZLE_128B_ATOM,
+        (BLK_M, BLK_K),
+    )
+    B_layout = mma_shared_layout(
+        b_type,
+        SwizzleMode.SWIZZLE_128B_ATOM,
+        (BLK_N, BLK_K),
+    )
+
+    @T.prim_func
+    def kernel(
+        A: T.Buffer((M, K), a_type),
+        B: T.Buffer((N, K), b_type),
+        D: T.Buffer((M, N), d_type),
+    ):
+        T.device_entry()
+
+        bx, by = T.cta_id([M // BLK_M, N // BLK_N])
+        wg_id = T.warpgroup_id([1])
+        warp_id = T.warp_id_in_wg([4])
+        lane_id = T.lane_id([32])
+
+        pool = T.SMEMPool()
+        tmem_addr = pool.alloc((1,), "uint32")
+        mma_bar = pool.alloc((1,), "uint64", align=8)
+        pool.move_base_to(1024)
+        Asmem = pool.alloc(
+            (BLK_M, BLK_K),
+            a_type,
+            layout=A_layout,
+        )
+        Bsmem = pool.alloc(
+            (BLK_N, BLK_K),
+            b_type,
+            layout=B_layout,
+        )
+        pool.commit()
+
+        if warp_id == 0:
+            if lane_id == 0:
+                T.ptx.mbarrier.init(mma_bar.ptr_to([0]), 1)
+            T.ptx.tcgen05.alloc(
+                T.address_of(tmem_addr),
+                n_cols=512,
+                cta_group=1,
+            )
+
+        T.ptx.fence.proxy_async("shared::cta")
+        T.ptx.fence.mbarrier_init()
+        T.cuda.cta_sync()
+
+        tmem = T.decl_buffer(
+            (128, 512),
+            "float32",
+            scope="tmem",
+            allocated_addr=tmem_addr[0],
+            layout=TileLayout(
+                S[(128, 512) : (1 @ TLane, 1 @ TCol)]
+            ),
+        )
+
+        phase_mma: T.int32 = 0
+        m_st = T.meta_var(bx * BLK_M)
+        n_st = T.meta_var(by * BLK_N)
+
+        for i in T.serial(K_TILES):
+            Tx.cta.copy(
+                Asmem[:, :],
+                A[:, i * BLK_K : (i + 1) * BLK_K],
+            )
+            Tx.cta.copy(
+                Bsmem[:, :],
+                B[:, i * BLK_K : (i + 1) * BLK_K],
+            )
+
+            T.cuda.cta_sync()
+
+            if warp_id == 0:
+                if T.ptx.elect_sync():
+                    Tx.gemm_async(
+                        tmem[:, :BLK_N],
+                        Asmem[:, :],
+                        Bsmem[:, :],
+                        accum=(i != 0),
+                        dispatch="tcgen05",
+                        cta_group=1,
+                    )
+                    T.ptx.tcgen05.commit(
+                        mma_bar.ptr_to([0]),
+                        cta_group=1,
+                    )
+
+            T.ptx.mbarrier.try_wait(
+                mma_bar.ptr_to([0]),
+                phase_mma,
+            )
+            phase_mma ^= 1
+
+        Dreg = T.alloc_local((BLK_N,), acc_type)
+        Dreg_f16 = T.alloc_local((BLK_N,), d_type)
+        Dreg_wg = Dreg.view(
+            128,
+            BLK_N,
+            layout=TileLayout(
+                S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+            ),
+        )
+
+        Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+        T.ptx.tcgen05.wait.ld()
+        Tx.cast(Dreg_f16[:], Dreg[:])
+
+        m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+        Tx.copy(
+            D[m_thr, n_st : n_st + BLK_N],
+            Dreg_f16[:],
+        )
+
+        T.cuda.cta_sync()
+        if warp_id == 0:
+            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
+            T.ptx.tcgen05.dealloc(
+                tmem_addr[0],
+                n_cols=512,
+                cta_group=1,
+            )
+
+    return kernel
+```
+
+`hgemm_v2` 的合法运行边界是：
+
+```text
+M == 128
+N == 128
+K >= 64
+K % 64 == 0
+```
+
+#### `hgemm_v3`：加入 M/N spatial tiling
+
+```python
+def hgemm_v3(M, N, K):
+    a_type = tvm.DataType("float16")
+    b_type = tvm.DataType("float16")
+    d_type = tvm.DataType("float16")
+    acc_type = tvm.DataType("float32")
+
+    BLK_M, BLK_N, BLK_K = 128, 128, 64
+    K_TILES = K // BLK_K
+
+    A_layout = mma_shared_layout(
+        a_type,
+        SwizzleMode.SWIZZLE_128B_ATOM,
+        (BLK_M, BLK_K),
+    )
+    B_layout = mma_shared_layout(
+        b_type,
+        SwizzleMode.SWIZZLE_128B_ATOM,
+        (BLK_N, BLK_K),
+    )
+
+    @T.prim_func
+    def kernel(
+        A: T.Buffer((M, K), a_type),
+        B: T.Buffer((N, K), b_type),
+        D: T.Buffer((M, N), d_type),
+    ):
+        T.device_entry()
+
+        bx, by = T.cta_id([M // BLK_M, N // BLK_N])
+        wg_id = T.warpgroup_id([1])
+        warp_id = T.warp_id_in_wg([4])
+        lane_id = T.lane_id([32])
+
+        pool = T.SMEMPool()
+        tmem_addr = pool.alloc((1,), "uint32")
+        mma_bar = pool.alloc((1,), "uint64", align=8)
+        pool.move_base_to(1024)
+        Asmem = pool.alloc(
+            (BLK_M, BLK_K),
+            a_type,
+            layout=A_layout,
+        )
+        Bsmem = pool.alloc(
+            (BLK_N, BLK_K),
+            b_type,
+            layout=B_layout,
+        )
+        pool.commit()
+
+        if warp_id == 0:
+            if lane_id == 0:
+                T.ptx.mbarrier.init(mma_bar.ptr_to([0]), 1)
+            T.ptx.tcgen05.alloc(
+                T.address_of(tmem_addr),
+                n_cols=512,
+                cta_group=1,
+            )
+
+        T.ptx.fence.proxy_async("shared::cta")
+        T.ptx.fence.mbarrier_init()
+        T.cuda.cta_sync()
+
+        tmem = T.decl_buffer(
+            (128, 512),
+            "float32",
+            scope="tmem",
+            allocated_addr=tmem_addr[0],
+            layout=TileLayout(
+                S[(128, 512) : (1 @ TLane, 1 @ TCol)]
+            ),
+        )
+
+        phase_mma: T.int32 = 0
+        m_st = T.meta_var(bx * BLK_M)
+        n_st = T.meta_var(by * BLK_N)
+
+        for i in T.serial(K_TILES):
+            Tx.cta.copy(
+                Asmem[:, :],
+                A[
+                    m_st : m_st + BLK_M,
+                    i * BLK_K : (i + 1) * BLK_K,
+                ],
+            )
+            Tx.cta.copy(
+                Bsmem[:, :],
+                B[
+                    n_st : n_st + BLK_N,
+                    i * BLK_K : (i + 1) * BLK_K,
+                ],
+            )
+
+            T.cuda.cta_sync()
+
+            if warp_id == 0:
+                if T.ptx.elect_sync():
+                    Tx.gemm_async(
+                        tmem[:, :BLK_N],
+                        Asmem[:, :],
+                        Bsmem[:, :],
+                        accum=(i != 0),
+                        dispatch="tcgen05",
+                        cta_group=1,
+                    )
+                    T.ptx.tcgen05.commit(
+                        mma_bar.ptr_to([0]),
+                        cta_group=1,
+                    )
+
+            T.ptx.mbarrier.try_wait(
+                mma_bar.ptr_to([0]),
+                phase_mma,
+            )
+            phase_mma ^= 1
+
+        Dreg = T.alloc_local((BLK_N,), acc_type)
+        Dreg_f16 = T.alloc_local((BLK_N,), d_type)
+        Dreg_wg = Dreg.view(
+            128,
+            BLK_N,
+            layout=TileLayout(
+                S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+            ),
+        )
+
+        Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+        T.ptx.tcgen05.wait.ld()
+        Tx.cast(Dreg_f16[:], Dreg[:])
+
+        m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+        Tx.copy(
+            D[m_thr, n_st : n_st + BLK_N],
+            Dreg_f16[:],
+        )
+
+        T.cuda.cta_sync()
+        if warp_id == 0:
+            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
+            T.ptx.tcgen05.dealloc(
+                tmem_addr[0],
+                n_cols=512,
+                cta_group=1,
+            )
+
+    return kernel
+```
+
+`hgemm_v3` 的合法运行边界是：
+
+```text
+M % 128 == 0
+N % 128 == 0
+K >= 64
+K % 64 == 0
+```
+
+如果通过 Python 构造两个 TIRx kernel：
+
+```python
+kernel_v2 = hgemm_v2(128, 128, 128)
+kernel_v3 = hgemm_v3(256, 256, 128)
+```
+
+`kernel_v2` 的 grid 是 `1 x 1`，`kernel_v3` 的 grid 是 `2 x 2`。
+当前机器没有 Blackwell GPU，因此只能做 TIRx 构造和静态检查，不能真实
+执行 `tcgen05.mma`。
+
+### 11.3 逐项比较
+
+| 项目 | `hgemm_v2` | `hgemm_v3` |
+|---|---|---|
+| 新增机制 | K 方向 loop | M/N 方向 spatial tiling |
+| 解决的问题 | `K > 64` | `M > 128` 或 `N > 128` |
+| CTA grid | 实际为 1 个 output tile | 每个 CTA 一个 output tile |
+| A load | `A[:, k_chunk]` | `A[m_st:m_st+BLK_M, k_chunk]` |
+| B load | `B[:, k_chunk]` | `B[n_st:n_st+BLK_N, k_chunk]` |
+| `m_st` 使用位置 | 只用于 writeback，实际为 0 | load 和 writeback 都使用 |
+| `n_st` 使用位置 | 只用于 writeback，实际为 0 | load 和 writeback 都使用 |
+| K 累加 | 有 | 有，沿用 v2 |
+| TMEM accumulator | 每个 K chunk 都更新同一个 TMEM tile | 每个 CTA 有独立 TMEM accumulator |
+| MMA 与 barrier 协议 | 相同 | 相同 |
+| writeback 公式 | 相同 | 相同 |
+| 主要限制 | 只支持 `M=N=128` | 要求 M、N 都能被 128 整除 |
+
+可以用一句话记忆：
+
+```text
+v2 遍历 K，重复使用当前 output tile 的 accumulator。
+v3 遍历 CTA grid，让不同 CTA 计算不同 output tile。
+```
+
+### 11.4 用一个具体坐标追踪
+
+取：
+
+```text
+M = 256
+N = 256
+K = 128
+BLK_M = 128
+BLK_N = 128
+BLK_K = 64
+```
+
+此时：
+
+```text
+grid = [M / BLK_M, N / BLK_N]
+     = [256 / 128, 256 / 128]
+     = [2, 2]
+
+K_TILES = K / BLK_K
+        = 128 / 64
+        = 2
+```
+
+这个 shape 不能由 `hgemm_v2` 正确处理，因为它会尝试把完整的
+`A[:, k_chunk]` 和 `B[:, k_chunk]` 复制到只有 `128 x 64` 的 SMEM tile。
+
+对于 `hgemm_v3` 的：
+
+```text
+bx = 1
+by = 1
+i = 1
+```
+
+先算 CTA tile offset：
+
+```text
+m_st = bx * BLK_M
+     = 1 * 128
+     = 128
+
+n_st = by * BLK_N
+     = 1 * 128
+     = 128
+```
+
+第二个 K chunk 的 K 区间是：
+
+```text
+k_start = i * BLK_K
+        = 1 * 64
+        = 64
+
+k_end = (i + 1) * BLK_K
+      = 2 * 64
+      = 128
+```
+
+于是 load 对应：
+
+```text
+Asmem[:, :] <- A[128:256, 64:128]
+Bsmem[:, :] <- B[128:256, 64:128]
+```
+
+对线程 `warp_id=2, lane_id=9`：
+
+```text
+m_thr = m_st + warp_id * 32 + lane_id
+      = 128 + 2 * 32 + 9
+      = 201
+```
+
+最终写回：
+
+```text
+D[201, 128:256] <- Dreg_f16[0:128]
+```
+
+如果 `v3` 漏掉 A、B load 中的 `m_st`/`n_st`，它会错误地读取全局 tile
+`(0, 0)`；如果只给 load 加 offset、writeback 仍使用旧的 `m_thr`，它又会
+把计算结果写到错误 output tile。
+
+下面是一个不依赖 GPU 的 offset 检查脚本，分别模拟单 tile K-loop 和
+multi-CTA spatial tiling：
+
+文件：`check_v2_v3_tile_offsets.py`
+
+```python
+BLK_M = 128
+BLK_N = 128
+BLK_K = 64
+
+
+def v2_load_slice(bx, by, i):
+    m_st = bx * BLK_M
+    n_st = by * BLK_N
+    return {
+        "m_st": m_st,
+        "n_st": n_st,
+        "A": (slice(None), slice(i * BLK_K, (i + 1) * BLK_K)),
+        "B": (slice(None), slice(i * BLK_K, (i + 1) * BLK_K)),
+    }
+
+
+def v3_load_slice(bx, by, i):
+    m_st = bx * BLK_M
+    n_st = by * BLK_N
+    return {
+        "m_st": m_st,
+        "n_st": n_st,
+        "A": (
+            slice(m_st, m_st + BLK_M),
+            slice(i * BLK_K, (i + 1) * BLK_K),
+        ),
+        "B": (
+            slice(n_st, n_st + BLK_N),
+            slice(i * BLK_K, (i + 1) * BLK_K),
+        ),
+    }
+
+
+for name, load in [
+    ("v2", v2_load_slice(0, 0, 1)),
+    ("v3", v3_load_slice(1, 1, 1)),
+]:
+    print(
+        f"{name}: m_st={load['m_st']}, n_st={load['n_st']}, "
+        f"A={load['A']}, B={load['B']}"
+    )
+
+load = v3_load_slice(1, 1, 1)
+warp_id = 2
+lane_id = 9
+m_thr = load["m_st"] + warp_id * 32 + lane_id
+print(f"v3 writeback: D[{m_thr}, 128:256]")
+
+assert load["m_st"] == 128
+assert load["n_st"] == 128
+assert m_thr == 201
+```
+
+运行：
+
+```bash
+python3 check_v2_v3_tile_offsets.py
+```
+
+预期输出：
+
+```text
+v2: m_st=0, n_st=0, A=(slice(None, None, None), slice(64, 128, None)), B=(slice(None, None, None), slice(64, 128, None))
+v3: m_st=128, n_st=128, A=(slice(128, 256, None), slice(64, 128, None)), B=(slice(128, 256, None), slice(64, 128, None))
+v3 writeback: D[201, 128:256]
+```
+
+### 11.5 常见错误及症状
+
+| 错误 | 可观察症状 |
+|---|---|
+| 把 `v3` 的改动理解成又加了一层 K-loop | 重复处理 K，数值被重复累加 |
+| `v3` 的 A load 漏掉 `m_st` | 所有 CTA 都读取 A 的前 128 行 |
+| `v3` 的 B load 漏掉 `n_st` | 所有 CTA 都读取 B 的前 128 行 |
+| `m_st`/`n_st` 只用于 load，不用于 writeback | 多个 CTA 把结果写到同一个 output tile |
+| writeback 只加 `m_st`，漏掉 `n_st` | row 正确但 output columns 都属于第一列 tile |
+| 把 `bx` 和 `by` 互换 | M/N tile 完成转置式搬运，边界合法但结果错误 |
+| `v2` 直接拿 `M=256` 运行 | A/B 的 source tile shape 与 `Asmem/Bsmem` 不匹配 |
+| 没有 tail 处理却使用非整除 M/N/K | 最后一个 tile 越界或结果不完整 |
+
+自测：
+
+1. 从 `hgemm_v2` 到 `hgemm_v3`，新增的是 K 方向还是 M/N 方向？
+   答：新增 M/N 方向的 spatial tiling；K-loop 在 `v2` 中已经存在。
+
+2. `v2` 和 `v3` 最直接的 load 代码差异是什么？
+   答：`v3` 在 A、B slice 中分别加入 `m_st` 和 `n_st`，`v2` 没有。
+
+3. 当 `bx=1, by=1, BLK_M=BLK_N=128` 时，`m_st` 和 `n_st` 是多少？
+   答：`m_st=128`，`n_st=128`。
+
+4. `v3` 中 `warp_id=2, lane_id=9, m_st=128` 时，写回哪一行？
+   答：`m_thr = 128 + 2*32 + 9 = 201`，写回 `D[201, ...]`。
+
+5. 为什么 `v3` 的 MMA 和 barrier 协议可以沿用 `v2`？
+   答：Spatial tiling 改变的是每个 CTA 读取和写回的全局地址；在一个 CTA
+   内部，K 累加和 TMEM accumulator 的生命周期没有改变。
+
+## 十二、当前进度
 
 `chapter_gemm_basics` 的知识点：
 
@@ -2469,6 +3101,11 @@ m_thr = m_st + warp_id * 32 + lane_id 选择当前 thread 的全局 output row
 T.meta_var 将 m_thr 绑定为 parser-time 表达式别名，不生成额外运行期指令
 TMEM 必须先 cta_sync，再 relinquish permit 和 dealloc
 第 1 步的限制是 K<=64、M=N=128、同步 copy、搬运与计算不重叠
+hgemm_v2 通过 K_TILES serial loop 允许 K 大于 BLK_K
+hgemm_v3 在 v2 的 K-loop 上加入 M/N 二维 CTA tiling
+v2 只在 writeback 使用 m_st/n_st，实际 tile 仍是 0
+v3 在 A/B load 和 writeback 中都使用 m_st/n_st
+从 v2 到 v3 不改变 CTA 内部的 MMA 与 mbarrier 协议
 chapter_gemm_basics 第 1 个知识点完成：单 Tile Baseline
 ```
 
