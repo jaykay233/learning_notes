@@ -27,7 +27,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
 | [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
 | [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
-| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica，以及 `tmem_datapath_layout` 的 D/F row mapping |
+| [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica、`tmem_datapath_layout` 的 D/F row mapping，以及 `tcgen05_atom_layout` 的 atom / rep / register mapping |
 
 ## 当前进度
 
@@ -214,13 +214,18 @@ datapath=F 使用 rows=64，四个 16-row slab 分散到 Lane 0/32/64/96
 F 的公式 TLane=32*(row//16)+row%16，不复制逻辑数据
 F 只使用 64 条 active Lane，span TLane=112 来自最高 Lane 111
 chapter_tirx_layout_api 第六个知识点完成：tmem_datapath_layout D/F
+tcgen05_atom_layout 将 TMEM fragment 的搬运形状映射到线程寄存器
+instr_shape 是 lane x bits 的 atom，tensor_shape 和 dtype 推导 .xN
+16x128b 的 fp32 K=128 与 fp16 K=256 都使用 .x32
+fp16 的两个相邻元素打包进一个 32-bit register 的低半和高半
+chapter_tirx_layout_api 第七个知识点完成：tcgen05_atom_layout
 ```
 
 ## 下一知识点
 
 ```text
 chapter_tirx_layout_api
--> tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+-> wg_local_layout 的行到 tid_in_wg 映射
 ```
 
 ## 核心主线

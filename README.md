@@ -294,6 +294,11 @@ datapath=F 使用 rows=64，四个 16-row slab 分散到 Lane 0/32/64/96
 F 的公式 TLane=32*(row//16)+row%16，不复制逻辑数据
 F 只使用 64 条 active Lane，span TLane=112 来自最高 Lane 111
 chapter_tirx_layout_api 第六个知识点完成：tmem_datapath_layout D/F
+tcgen05_atom_layout 将 TMEM fragment 的搬运形状映射到线程寄存器
+instr_shape 是 lane x bits 的 atom，tensor_shape 和 dtype 推导 .xN
+16x128b 的 fp32 K=128 与 fp16 K=256 都使用 .x32
+fp16 的两个相邻元素打包进一个 32-bit register 的低半和高半
+chapter_tirx_layout_api 第七个知识点完成：tcgen05_atom_layout
 ```
 
 完整文档索引、当前进度和硬件环境说明见

@@ -1,10 +1,12 @@
 # TIRx Layout API：`S[...]`、`R[...]`、offset 与命名轴
 
-这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前六个
+这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前七个
 知识点：`S[...] + R[...] + offset` 的语义与计算、命名轴的坐标空间，
 `apply()` 的三种输入形式，以及 `2 x 128 x 112` accumulator 的
 `TLane / TCol` 映射、scale-factor atom 沿 `TLane` 的复制，以及
-`tcgen05.mma` D/F datapath 的 row 到 Lane 映射。先看：
+`tcgen05.mma` D/F datapath 的 row 到 Lane 映射，最后通过
+`tcgen05_atom_layout` 把 TMEM fragment 分布到 warpgroup 的线程寄存器。
+先看：
 
 ```text
 S[...] + R[...] + offset
@@ -43,12 +45,12 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 [x] TMEM accumulator layout 示例
 [x] scale-factor layout 中的 replication
 [x] tmem_datapath_layout：D/F datapath
-[ ] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+[x] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
 [ ] wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前六项。后续知识点会在同一章新的小节中继续展开。
+本篇目前完成前七项。后续知识点会在同一章新的小节中继续展开。
 
 ## 一、这个 API 要解决什么问题
 
@@ -3590,7 +3592,637 @@ TLane = 32 * 2 + 13 = 77
 答：F 的内部 shard 有三个 iter，而两个参数只提供两个坐标。应传逻辑
 shape，例如 `f.apply(16, 9, shape=[64, 112])`。
 
-## 十六、当前进度
+## 十六、`tcgen05_atom_layout`：从 TMEM atom 到线程寄存器
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：常用 Layout 构造函数
+知识点：tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+上次：tmem_datapath_layout 的 D/F datapath
+下次：wg_local_layout 的行到 tid_in_wg 映射
+PTX：PTX ISA §9.7.18.2.3 Data Movement Shape / §9.7.18.8.3 tcgen05.ld
+```
+
+上一课描述的是生产者端：
+
+```text
+tcgen05.mma
+-> 按 datapath D/F 把 accumulator 写入 TMEM
+```
+
+本课描述消费者端的一半：
+
+```text
+tcgen05.ld
+-> 把一个 TMEM fragment 搬到 warpgroup 的寄存器
+```
+
+`tcgen05_atom_layout` 返回的 `TileLayout` 不是 TMEM 地址，而是寄存器侧的
+分布。它回答：
+
+```text
+逻辑坐标 (row, col)
+由哪个 warp、哪个 lane 的哪个局部元素位置持有？
+```
+
+### 先建立心智模型
+
+`tcgen05.ld` 和 `tcgen05.st` 不是由单个线程搬运整个矩阵，而是由 warp
+执行 collective data movement：
+
+```text
+每个 warp 操作自己可见的一部分 TMEM lanes
+每个 lane 从若干连续 TMEM columns 读取数据
+读出的 b32 值进入该 lane 的寄存器
+```
+
+PTX 用两个 qualifier 描述一次搬运：
+
+```text
+.shape  一次 atom 的基础形状
+.num    沿 column 方向重复多少次
+```
+
+例如：
+
+```text
+tcgen05.ld.sync.aligned.16x128b.x4.b32
+```
+
+可以拆成：
+
+```text
+.16x128b  基础 atom: 16 lanes x 128 bits
+.x4       重复 4 次
+.b32      每个寄存器是 32-bit
+```
+
+`tcgen05_atom_layout()` 接收逻辑 fragment 形状后，会反推出应当使用的
+`.xN`，并在 `TileLayout` 中描述结果如何分布到 `wid_in_wg / laneid / m`。
+
+### 三个参数分别控制什么
+
+```python
+tcgen05_atom_layout(instr_shape, tensor_shape, dtype)
+```
+
+#### `instr_shape`
+
+它是一个 PTX data-movement atom 的基础形状，格式为：
+
+```text
+lane x size-in-bits
+```
+
+当前 TIRx 支持：
+
+| `instr_shape` | 每个 warp 访问的 lanes | 每个 lane 每次搬运的 bits |
+|---|---:|---:|
+| `"32x32b"` | 32 | 32 |
+| `"16x64b"` | 16 | 64 |
+| `"16x128b"` | 16 | 128 |
+| `"16x256b"` | 16 | 256 |
+
+`instr_shape` 不表示整个矩阵的 M、N，也不表示最终 `.xN`。它只定义一次
+基础搬运的粒度。
+
+#### `tensor_shape`
+
+它是逻辑 register fragment 的完整形状，单位为 **buffer element**：
+
+```text
+tensor_shape = (rows, K)
+```
+
+当前实现允许：
+
+| `instr_shape` | 允许的 `rows` |
+|---|---|
+| `"32x32b"` | 128 |
+| `"16x64b"` | 64 或 128 |
+| `"16x128b"` | 64 或 128 |
+| `"16x256b"` | 64 或 128 |
+
+`K` 是每行有多少个逻辑元素。函数会根据 `K` 推导 `.xN`，而不是由调用方
+直接传 `.xN`。
+
+#### `dtype`
+
+`dtype` 决定一个 32-bit TMEM cell 或寄存器中能容纳多少元素：
+
+```text
+32-bit dtype: 1 element per 32-bit cell
+16-bit dtype: 2 elements per 32-bit cell
+```
+
+当前只接受 16-bit 或 32-bit 类型，例如：
+
+```text
+float32, float16, bfloat16
+```
+
+因此相同 `instr_shape` 下，fp16 的 `K` 可以是 fp32 的两倍，二者仍使用
+相同的 `.xN`。
+
+### `.xN` 如何从 `tensor_shape` 和 `dtype` 推导
+
+定义：
+
+```text
+elem_per_32b = 32 / dtype_bits
+```
+
+于是：
+
+```text
+fp32: elem_per_32b = 1
+fp16: elem_per_32b = 2
+bf16: elem_per_32b = 2
+```
+
+每个 atom repetition 覆盖的 column factor 是：
+
+| `instr_shape` | fp32 column factor | fp16/bf16 column factor |
+|---|---:|---:|
+| `"32x32b"` | 1 | 2 |
+| `"16x64b"` | 2 | 4 |
+| `"16x128b"` | 4 | 8 |
+| `"16x256b"` | 8 | 16 |
+
+然后：
+
+```text
+rep = K / per_rep_column_factor
+```
+
+这里的 `rep` 就是 PTX 指令中的 `.xN`。
+
+例如：
+
+```text
+16x128b, fp32, K=128
+
+elem_per_32b = 1
+per_rep_cols = 4 * 1 = 4
+rep = 128 / 4 = 32
+-> .16x128b.x32
+```
+
+```text
+16x128b, fp16, K=256
+
+elem_per_32b = 2
+per_rep_cols = 4 * 2 = 8
+rep = 256 / 8 = 32
+-> .16x128b.x32
+```
+
+两者都对应：
+
+```text
+tcgen05.ld.sync.aligned.16x128b.x32.b32
+```
+
+不同的是，fp16 的两个相邻逻辑 column 可以进入同一个 32-bit 寄存器。
+
+### 合法 `.xN`
+
+推导出的 `rep` 必须属于 PTX 允许的集合：
+
+| `instr_shape` | 允许的 `.xN` |
+|---|---|
+| `"32x32b"` | `1, 2, 4, 8, 16, 32, 64, 128` |
+| `"16x64b"` | `1, 2, 4, 8, 16, 32, 64, 128` |
+| `"16x128b"` | `1, 2, 4, 8, 16, 32, 64` |
+| `"16x256b"` | `1, 2, 4, 8, 16, 32` |
+
+所以下面的构思不成立：
+
+```text
+K=12, instr_shape="16x128b", fp32
+per_rep_cols = 4
+rep = 3
+```
+
+虽然 12 能被 4 整除，但 PTX 没有 `.x3`，构造函数会直接拒绝。
+
+### 完整可运行代码
+
+文件名：
+
+```text
+tirx_tcgen05_atom_layout.py
+```
+
+完整代码：
+
+```python
+from tvm.tirx.layout import tcgen05_atom_layout
+
+
+def show(label, instr_shape, tensor_shape, dtype, coords):
+    layout = tcgen05_atom_layout(instr_shape, tensor_shape, dtype)
+    print(f"{label} shape={tensor_shape} dtype={dtype}")
+    print("  layout =", layout)
+    print("  shard  =", layout.shard)
+    for row, col in coords:
+        print(f"  ({row}, {col}) ->", layout.apply(row, col, shape=tensor_shape))
+
+
+def expect_error(label, instr_shape, tensor_shape, dtype):
+    try:
+        tcgen05_atom_layout(instr_shape, tensor_shape, dtype)
+    except ValueError as exc:
+        print(f"  error {label}: {exc}")
+
+
+def main():
+    show(
+        "fp32",
+        "16x128b",
+        (64, 128),
+        "float32",
+        [(0, 0), (1, 1), (15, 15), (19, 101), (63, 127)],
+    )
+    show(
+        "fp16",
+        "16x128b",
+        (64, 256),
+        "float16",
+        [(0, 0), (1, 2), (15, 30), (19, 202), (63, 254)],
+    )
+
+    print("parameter checks:")
+    expect_error("32x32b rows=64", "32x32b", (64, 32), "float32")
+    expect_error("bad K", "16x128b", (64, 129), "float32")
+    expect_error("unsupported rep", "16x128b", (64, 12), "float32")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 逐段解释
+
+#### fp32 调用
+
+```python
+tcgen05_atom_layout("16x128b", (64, 128), "float32")
+```
+
+参数含义是：
+
+```text
+基础 atom: 16 lanes x 128 bits
+逻辑 fragment: 64 rows x 128 fp32 columns
+```
+
+推导：
+
+```text
+elem_per_32b = 32 / 32 = 1
+per_rep_cols = 4 * 1 = 4
+rep = 128 / 4 = 32
+```
+
+因此这是一个 `.16x128b.x32` fragment。
+
+返回的 shard 是：
+
+```text
+(4, 2, 8, 32, 4)
+:(1 @ wid_in_wg, 1, 4 @ laneid, 2, 1 @ laneid)
+```
+
+重要 axes：
+
+```text
+wid_in_wg  逻辑 row 属于哪个 warp
+laneid     warp 内哪个 lane 持有该 row
+m          该 lane 的局部寄存器或元素槽位
+```
+
+#### fp16 调用
+
+```python
+tcgen05_atom_layout("16x128b", (64, 256), "float16")
+```
+
+参数含义是：
+
+```text
+基础 atom: 16 lanes x 128 bits
+逻辑 fragment: 64 rows x 256 fp16 columns
+```
+
+推导：
+
+```text
+elem_per_32b = 32 / 16 = 2
+per_rep_cols = 4 * 2 = 8
+rep = 256 / 8 = 32
+```
+
+它同样使用 `.16x128b.x32`。
+
+返回的 shard 在 fp32 版本末尾多了一层：
+
+```text
+(4, 2, 8, 32, 4, 2)
+:(1 @ wid_in_wg, 2, 4 @ laneid, 4, 1 @ laneid, 1)
+```
+
+最后这个：
+
+```text
+(2, 1, m)
+```
+
+表示两个相邻 fp16 元素打包进一个 32-bit 寄存器。
+
+### 用 `16x128b` 追踪一个真实坐标
+
+先定义 fp32 视角的 column：
+
+```text
+q = col // elem_per_32b
+```
+
+对于 fp32：
+
+```text
+q = col
+```
+
+对于 fp16：
+
+```text
+q = col // 2
+half = col % 2
+```
+
+`16x128b` 的映射公式是：
+
+```text
+wid    = row // 16
+lane   = 4 * (row % 8) + (q % 4)
+reg32  = ((row // 8) % 2) + 2 * (q // 4)
+```
+
+#### 追踪 `(19, 101)`，fp32
+
+```text
+wid  = 19 // 16
+     = 1
+
+q    = 101
+
+lane = 4 * (19 % 8) + (101 % 4)
+     = 4 * 3 + 1
+     = 13
+
+reg32 = ((19 // 8) % 2) + 2 * (101 // 4)
+      = (2 % 2) + 2 * 25
+      = 0 + 50
+      = 50
+```
+
+结果是：
+
+```text
+(row=19, col=101)
+-> wid_in_wg=1, laneid=13, m=50
+```
+
+这正好解释前面打印出的：
+
+```python
+{"laneid": 13, "m": 50, "wid_in_wg": 1}
+```
+
+#### 追踪 `(19, 202)`，fp16
+
+```text
+wid  = 1
+
+q    = 202 // 2
+     = 101
+
+half = 202 % 2
+     = 0
+
+lane = 4 * (19 % 8) + (101 % 4)
+     = 13
+
+reg32 = ((19 // 8) % 2) + 2 * (101 // 4)
+      = 50
+
+m = 2 * reg32 + half
+  = 100
+```
+
+所以：
+
+```text
+(row=19, col=202)
+-> wid_in_wg=1, laneid=13, m=100
+```
+
+如果读取下一个 fp16 元素：
+
+```text
+(row=19, col=203)
+-> wid_in_wg=1, laneid=13, m=101
+```
+
+这里：
+
+```text
+m=100 和 m=101
+```
+
+对应同一个 32-bit register 的低半和高半。
+
+### `32x32b` 为什么特殊
+
+`"32x32b"` 的返回路径不同：
+
+```python
+TileLayout(S[(128, cols) : (1 @ tid_in_wg, 1@m)])
+```
+
+它表示：
+
+```text
+128 个 warpgroup 线程各自负责一行
+每个线程持有该行的 cols 个元素
+```
+
+因此它不显式使用：
+
+```text
+wid_in_wg + laneid
+```
+
+而是直接使用：
+
+```text
+tid_in_wg
+```
+
+这也说明 `instr_shape` 选的不只是“每次读多少 bit”，还会选择对应的
+thread fragment 组织。
+
+### 与 datapath layout 的关系
+
+本课的 atom layout 和上一课的 datapath layout 位于数据路径的不同阶段：
+
+| 阶段 | API | 描述对象 |
+|---|---|---|
+| MMA 写 TMEM | `tmem_datapath_layout` | 逻辑 row 到 TMEM `TLane` |
+| ld/st 搬运 | `tcgen05_atom_layout` | TMEM fragment 到线程寄存器 |
+
+生产中必须保证：
+
+```text
+MMA 写入的 datapath
++ TMEM buffer 的 TileLayout
++ tcgen05.ld/st atom 的读取形状
+```
+
+三者相容。atom layout 本身不会重新排列 MMA 写下来的 TMEM rows，也不会
+执行 `tcgen05.ld`；它只描述寄存器结果应如何分布。
+
+### 常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 | 优先检查 |
+|---|---|---|---|
+| 把 `rows` 当成整个 CTA 的 M | fragment rows 由 atom 类型约束 | `32x32b` rows=64 直接报错 | 是否应使用 `.16x*b` |
+| 把 `K` 写成 byte 数 | API 的 column 是 element 数 | 推导出的 rep 大一倍或小一倍 | dtype 和 element 单位 |
+| 把 fp16 的 K 写成 fp32 的值 | fp16 每个 cell 容纳两个元素 | 寄存器数量少一半，后半列丢失 | `elem_per_32b` |
+| K 不能被 per-rep factor 整除 | 无法形成整数次 atom repeat | 构造函数抛出不可整除错误 | `per_rep_cols` |
+| rep 不在 PTX 表中 | PTX 没有任意 `.xN` | 抛出 unsupported rep | 合法 `.xN` 集合 |
+| 把 `m` 当成物理 TMEM Col | `m` 是线程局部槽位 | 寄存器索引与 TMEM 地址混淆 | `TLane / TCol` 与 `m` |
+| atom shape 与 datapath 不匹配 | 两侧 row/lane 契约不同 | readback 错位、16-row slab 错 | datapath 与 atom 组合 |
+| 忘记 16-bit packing 顺序 | 低半和高半顺序错误 | 相邻两列交换或数值拼接错误 | `col // 2`、`col % 2` |
+
+### 验证命令和预期输出
+
+运行：
+
+```bash
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python tirx_tcgen05_atom_layout.py
+```
+
+本机 TVM `0.26.dev246` 实测输出：
+
+```text
+fp32 shape=(64, 128) dtype=float32
+  layout = T.TileLayout(T.S[(4, 2, 8, 32, 4):(1 @ Axis.wid_in_wg, 1, 4 @ Axis.laneid, 2, 1 @ Axis.laneid)])
+  shard  = (T.Iter(4, 1, "wid_in_wg"), T.Iter(2, 1, "m"), T.Iter(8, 4, "laneid"), T.Iter(32, 2, "m"), T.Iter(4, 1, "laneid"))
+  (0, 0) -> {"laneid": 0, "m": 0, "wid_in_wg": 0}
+  (1, 1) -> {"laneid": 5, "m": 0, "wid_in_wg": 0}
+  (15, 15) -> {"laneid": 31, "m": 7, "wid_in_wg": 0}
+  (19, 101) -> {"laneid": 13, "m": 50, "wid_in_wg": 1}
+  (63, 127) -> {"laneid": 31, "m": 63, "wid_in_wg": 3}
+fp16 shape=(64, 256) dtype=float16
+  layout = T.TileLayout(T.S[(4, 2, 8, 32, 4, 2):(1 @ Axis.wid_in_wg, 2, 4 @ Axis.laneid, 4, 1 @ Axis.laneid, 1)])
+  shard  = (T.Iter(4, 1, "wid_in_wg"), T.Iter(2, 2, "m"), T.Iter(8, 4, "laneid"), T.Iter(32, 4, "m"), T.Iter(4, 1, "laneid"), T.Iter(2, 1, "m"))
+  (0, 0) -> {"laneid": 0, "m": 0, "wid_in_wg": 0}
+  (1, 2) -> {"laneid": 5, "m": 0, "wid_in_wg": 0}
+  (15, 30) -> {"laneid": 31, "m": 14, "wid_in_wg": 0}
+  (19, 202) -> {"laneid": 13, "m": 100, "wid_in_wg": 1}
+  (63, 254) -> {"laneid": 31, "m": 126, "wid_in_wg": 3}
+parameter checks:
+  error 32x32b rows=64: tcgen05_atom_layout '32x32b' expects rows ∈ (128,), got 64
+  error bad K: tcgen05_atom_layout cols=129 not divisible by the per-rep column factor 4 for instr_shape='16x128b' dtype=float32; valid cols are k * 4 for k in (1, 2, 4, 8, 16, 32, 64)
+  error unsupported rep: tcgen05_atom_layout inferred rep=3 (from cols=12) is not in the PTX Table 49 supported set for 16x128b: (1, 2, 4, 8, 16, 32, 64)
+```
+
+本机运行边界：
+
+```text
+可以运行: atom layout 构造、rep 推导、register coordinate 查询和参数校验
+不能运行: 真实 tcgen05.ld/st 及需要 Blackwell 的 kernel
+```
+
+### 本课结论
+
+固定公式：
+
+```text
+elem_per_32b = 32 / dtype_bits
+per_rep_cols = instr_column_factor * elem_per_32b
+rep = K / per_rep_cols
+```
+
+固定边界：
+
+```text
+instr_shape 定义 atom 粒度
+tensor_shape 定义逻辑 fragment 的 rows 和 element columns
+dtype 决定 16-bit packing
+rep 是推导结果，不是输入参数
+```
+
+最重要的区别是：
+
+```text
+TMEM TLane / TCol 描述数据在 Tensor Memory 中的位置
+atom layout 的 wid_in_wg / laneid / m 描述数据在线程寄存器中的位置
+```
+
+### 自测题
+
+#### 1. `tcgen05_atom_layout("16x128b", (64, 256), "float16")` 的 `.xN` 是多少？
+
+答：
+
+```text
+elem_per_32b = 32 / 16 = 2
+per_rep_cols = 4 * 2 = 8
+rep = 256 / 8 = 32
+```
+
+所以是 `.16x128b.x32`。
+
+#### 2. 为什么 fp16 的 `K=256` 和 fp32 的 `K=128` 可以使用同一个 `.x32`？
+
+答：因为 fp16 每个 32-bit 位置容纳两个元素，每个 repetition 覆盖 8 个
+fp16 columns；fp32 每个位置只容纳一个元素，每个 repetition 覆盖 4 个
+fp32 columns。两者的 column 数是 2:1，但 rep 都是 32。
+
+#### 3. `tensor_shape` 的 rows 在 `"32x32b"` 下为什么只能是 128？
+
+答：`"32x32b"` 对应的 thread-row 组织要求一个 warpgroup 的 128 个线程
+各负责一行。因此逻辑 fragment 的 rows 必须是 128。
+
+#### 4. `m=100` 和 `m=101` 在 fp16 下一定属于不同寄存器吗？
+
+答：不一定。`m` 是 element 级局部坐标。对 fp16：
+
+```text
+register = m // 2
+half     = m % 2
+```
+
+`m=100` 和 `m=101` 对应同一个 register 的低半和高半。
+
+#### 5. 为什么 `K=12`、`"16x128b"`、`"float32"` 不合法？
+
+答：
+
+```text
+per_rep_cols = 4
+rep = 12 / 4 = 3
+```
+
+PTX 没有 `.x3`，合法重复次数只能从表中的 `.x1, .x2, .x4, ...` 选择。
+
+## 十七、当前进度
 
 `chapter_tirx_layout_api` 的知识点：
 
@@ -3601,12 +4233,12 @@ shape，例如 `f.apply(16, 9, shape=[64, 112])`。
 [x] TMEM accumulator layout 示例
 [x] scale-factor layout 中的 replication
 [x] tmem_datapath_layout：D/F datapath
-[ ] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+[x] tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
 [ ] wg_local_layout
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇目前完成前六项。已经覆盖：
+本篇目前完成前七项。已经覆盖：
 
 ```text
 TileLayout 可以表示 lane、warp、register、TMEM 等命名轴坐标
@@ -3659,11 +4291,24 @@ F 的 TLane=32*(row//16)+row%16，映射不是复制
 F 使用 64 条 active Lane，但 span TLane 是 112，因为 111 是最高 Lane
 F.apply(row,col) 需要 shape=[64,cols]，因为内部 shard 有三个 iter
 datapath 必须同时匹配 MMA 写入形式和 tcgen05.ld atom 的读取映射
+tcgen05_atom_layout 将 TMEM fragment 的搬运形状映射到线程寄存器
+instr_shape 是 lane x bits 的 PTX data-movement atom
+tensor_shape 与 dtype 共同决定每个 32-bit cell 容纳多少元素
+per_rep_cols = instr_column_factor * (32 / dtype_bits)
+rep = K / per_rep_cols，rep 就是 tcgen05.ld/st 的 .xN
+16x128b 的 fp32 K=128 与 fp16 K=256 都使用 .x32
+16x128b 的 fp16 把相邻两个元素打包进一个 32-bit register
+16x128b 的 lane 不直接等于行号，映射按 row group 和 32-bit word 选择
+16x128b 的 reg32 = ((row // 8) % 2) + 2 * (q // 4)
+16x128b 的 fp16 half = col % 2，决定低半或高半
+rows=64 与 rows=128 的行数约束会随 instr_shape 改变
+合法 .xN 集合取决于 instr_shape，非法 rep 不能通过补零静默绕过
+layout 只描述 register mapping，不负责 tcgen05.ld/st 发射或 barrier 同步
 ```
 
 下一知识点：
 
 ```text
 chapter_tirx_layout_api
--> tcgen05_atom_layout 的 instr_shape / tensor_shape / dtype
+-> wg_local_layout 的行到 tid_in_wg 映射
 ```
