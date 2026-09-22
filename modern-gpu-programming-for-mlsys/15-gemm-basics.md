@@ -1039,6 +1039,254 @@ warp 2: rows 64..95
 warp 3: rows 96..127
 ```
 
+#### 8.1 Writeback 全链路：TMEM -> RF -> GMEM
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 1 步：顺序执行的单 Tile GEMM
+知识点：TMEM -> per-thread registers -> cast -> GMEM writeback
+上次：某一行 TMEM load 如何映射到 thread 和 register
+下次：TMEM dealloc 前的 cta_sync 与 allocation lifetime
+PTX：tcgen05.ld、tcgen05.wait::ld、global store
+```
+
+7.1 已经解释了 `Tx.wg.copy_async` 如何把 TMEM 的每个元素分配给
+warpgroup 中的线程。这里把整段 writeback 连起来：
+
+```text
+TMEM accumulator
+    |
+    | Tx.wg.copy_async + tcgen05.wait.ld
+    v
+每线程 fp32 registers: Dreg[0:BLK_N]
+    |
+    | Tx.cast
+    v
+每线程 fp16 registers: Dreg_f16[0:BLK_N]
+    |
+    | m_thr 选择全局 row，Tx.copy 写一行列区间
+    v
+GMEM D[m_thr, n_st:n_st+BLK_N]
+```
+
+完整代码块是：
+
+```python
+# --- Writeback：TMEM -> RF -> GMEM ---
+Dreg = T.alloc_local((BLK_N,), acc_type)
+Dreg_f16 = T.alloc_local((BLK_N,), d_type)
+Dreg_wg = Dreg.view(
+    128,
+    BLK_N,
+    layout=TileLayout(
+        S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+    ),
+)
+Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+T.ptx.tcgen05.wait.ld()
+Tx.cast(Dreg_f16[:], Dreg[:])
+m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+Tx.copy(D[m_thr, n_st : n_st + BLK_N], Dreg_f16[:])
+```
+
+逐行含义如下。
+
+| 代码 | 作用 | Scope | 数据位置 |
+|---|---|---|---|
+| `T.alloc_local((BLK_N,), acc_type)` | 每个线程分配 128 个 fp32 accumulator slots | 单 thread | registers，必要时也可能 spill |
+| `T.alloc_local((BLK_N,), d_type)` | 每个线程分配 128 个 fp16 output slots | 单 thread | registers |
+| `Dreg.view(...)` | 把每线程的局部数组解释成 warpgroup-wide tile | 不执行 | 同一份 register storage |
+| `Tx.wg.copy_async(...)` | 异步把 TMEM 元素加载到对应线程的 `Dreg` | warpgroup，128 threads | TMEM -> registers |
+| `tcgen05.wait.ld()` | 等待本线程此前发出的 TMEM loads 完成 | 单 thread | register dependency |
+| `Tx.cast(...)` | 逐元素 fp32 -> fp16 | 每个线程处理自己的 128 个元素 | registers |
+| `m_thr = ...` | 计算当前线程负责的全局 output row | 单 thread | 标量坐标 |
+| `Tx.copy(...)` | 把当前线程的 128 个 fp16 写到 GMEM 一行 | 单 thread 一条 row，整体构成 128x128 tile | registers -> GMEM |
+
+`Dreg` 本身是“一个线程的 128 个元素”：
+
+```text
+Dreg shape = (128,)
+```
+
+它不是整块 `128 x 128` tile。`Dreg_wg` 不分配新存储，而是给同一组 registers
+增加一个分布式布局：
+
+```text
+logical row -> tid_in_wg
+logical col -> 当前线程的 Dreg index
+```
+
+因此对于某个逻辑坐标 `(row, col)`：
+
+```text
+Dreg_wg[row, col]
+-> owner thread = tid_in_wg
+-> owner thread 的 Dreg[col]
+```
+
+`tmem[:, :BLK_N]` 的 accumulator layout 是：
+
+```text
+TLane = row
+TCol  = col
+```
+
+两边连起来，`Tx.wg.copy_async` 完成的是：
+
+```text
+TMEM[TLane, TCol]
+-> Dreg_wg[TLane, TCol]
+-> thread tid_in_wg=TLane 的 Dreg[TCol]
+```
+
+这里的 `async` 只表示 load 已发出，不表示 register 已经可以读取。
+`tcgen05.wait.ld()` 是后续 `cast` 能安全读取 `Dreg` 的必要条件：
+
+```text
+copy_async 发出 load
+    |
+    | 此时 Dreg 可能还没有完整的新值
+    v
+wait.ld()
+    |
+    | 保证本线程的 TMEM load 已完成
+    v
+cast 读取 Dreg
+```
+
+`Tx.cast(Dreg_f16[:], Dreg[:])` 只改变寄存器中的数值表示：
+
+```text
+Dreg[i]     fp32 accumulator
+Dreg_f16[i] fp16 output
+```
+
+它不写 TMEM，也不写 GMEM。
+
+最后两行决定每个线程把数据写到哪里：
+
+```python
+m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+Tx.copy(D[m_thr, n_st : n_st + BLK_N], Dreg_f16[:])
+```
+
+线程编号也可以写成：
+
+```text
+tid_in_wg = warp_id * 32 + lane_id
+```
+
+所以：
+
+```text
+m_thr = m_st + tid_in_wg
+```
+
+当前 grid 只有一个 tile，`m_st = 0`、`n_st = 0`，于是：
+
+| `tid_in_wg` | `warp_id` | `lane_id` | `m_thr` | 写往 GMEM |
+|---:|---:|---:|---:|---|
+| 0 | 0 | 0 | 0 | `D[0, 0:128]` |
+| 31 | 0 | 31 | 31 | `D[31, 0:128]` |
+| 32 | 1 | 0 | 32 | `D[32, 0:128]` |
+| 73 | 2 | 9 | 73 | `D[73, 0:128]` |
+| 127 | 3 | 31 | 127 | `D[127, 0:128]` |
+
+以 `D[73, 91]` 为例，完整执行追踪是：
+
+| 阶段 | 坐标或结果 |
+|---|---|
+| 数学元素 | `D[73, 91]` |
+| TMEM source | `TLane=73, TCol=91` |
+| owning thread | `tid_in_wg=73` |
+| thread 73 的 warp / lane | `warp_id=2, lane_id=9` |
+| fp32 register | `Dreg[91]` |
+| cast 后 | `Dreg_f16[91]` |
+| `m_thr` | `0 + 2*32 + 9 = 73` |
+| GMEM destination | `D[73, 91]` |
+| 该线程整行写回 | `D[73, 0:128] <- Dreg_f16[0:128]` |
+
+下面是一个不依赖 GPU 的完整坐标检查脚本，用来验证 row ownership 和
+register index：
+
+文件：`check_writeback_mapping.py`
+
+```python
+BLK_N = 128
+m_st = 0
+n_st = 0
+
+target_row = 73
+target_col = 91
+
+tid_in_wg = target_row
+warp_id = tid_in_wg // 32
+lane_id = tid_in_wg % 32
+register_index = target_col
+m_thr = m_st + warp_id * 32 + lane_id
+
+print(f"tid_in_wg={tid_in_wg}")
+print(f"warp_id={warp_id}")
+print(f"lane_id={lane_id}")
+print(f"register_index={register_index}")
+print(f"m_thr={m_thr}")
+print(f"destination=D[{m_thr}, {n_st + register_index}]")
+print(f"row_write=D[{m_thr}, {n_st}:{n_st + BLK_N}]")
+```
+
+运行：
+
+```bash
+python3 check_writeback_mapping.py
+```
+
+预期输出：
+
+```text
+tid_in_wg=73
+warp_id=2
+lane_id=9
+register_index=91
+m_thr=73
+destination=D[73, 91]
+row_write=D[73, 0:128]
+```
+
+这个脚本只验证坐标，不执行 `tcgen05`。当前 M5 Pro 没有 NVIDIA
+Blackwell GPU，因此不能在本机做真实 TMEM load 或 GMEM writeback 的运行期
+验证。
+
+常见错误及症状：
+
+| 错误 | 可观察症状 |
+|---|---|
+| 漏掉 `tcgen05.wait.ld()` | `Dreg` 读到旧值或只完成一部分的新值 |
+| `Dreg_wg` 的 row layout 与 `m_thr` 不匹配 | 输出行被置换，部分 row 重复或丢失 |
+| 把 `Dreg` 当成整块 tile | 误以为每个线程持有 `128 x 128` 元素，thread 映射完全错 |
+| `Dreg_f16` 与 `D` 的 dtype 不一致 | value 被错误解释，lowering 失败或输出编码错误 |
+| `n_st` 或 `m_st` 算错 | 合法地址上写入错误 output tile |
+| 在 `wait.ld()` 前复用 `Dreg` | register RAW hazard，结果不稳定 |
+| 在非整 tile 边界沿用 `n_st + BLK_N` | 最后一次 GMEM store 越界 |
+
+自测：
+
+1. `Dreg` 和 `Dreg_wg` 是两份存储吗？
+   答：不是。`Dreg_wg` 是 `Dreg` 的分布式 tile view。
+
+2. `D[73, 91]` 由哪个线程、从哪个 register 写出？
+   答：`tid_in_wg=73` 的线程从 `Dreg_f16[91]` 写出。
+
+3. 为什么 `tcgen05.wait.ld()` 必须在 cast 前？
+   答：TMEM load 是异步的，不等待就可能读取未完成的 `Dreg`。
+
+4. `Tx.cast` 是否把结果写回 TMEM？
+   答：不会。它只在 registers 中把 fp32 转成 fp16。
+
+5. 当前线程的 `Tx.copy` 为什么只写一行？
+   答：每个 `tid_in_wg` 通过 layout 拥有一个输出 row，但持有该 row 的
+   `BLK_N` 个列元素。
+
 ### 9. 释放 TMEM
 
 ```python
@@ -1331,6 +1579,7 @@ T.SMEMPool 的 alloc 推进 cursor，move_base_to 控制后续 base offset
 pool.commit 确定 shared.dyn 的最终 high-water-mark 大小，它不是运行时 barrier
 Dreg_wg 用 tid_in_wg 将 128 个输出 rows 映射到一个 warpgroup 的 128 threads
 Tx.wg.copy_async 读取 TMEM，tcgen05.wait.ld 等待 register load 完成
+writeback 由 wait.ld、fp32-to-fp16 cast 和按 m_thr 写回 GMEM 组成
 每个 thread 将自己的 fp32 row cast 为 fp16，再写回 GMEM
 TMEM 必须先 cta_sync，再 relinquish permit 和 dealloc
 第 1 步的限制是 K<=64、M=N=128、同步 copy、搬运与计算不重叠
