@@ -1287,6 +1287,303 @@ Blackwell GPU，因此不能在本机做真实 TMEM load 或 GMEM writeback 的�
    答：每个 `tid_in_wg` 通过 layout 拥有一个输出 row，但持有该 row 的
    `BLK_N` 个列元素。
 
+#### 8.2 `Dreg.view` 为什么能表示一个分布式 tile
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 1 步：顺序执行的单 Tile GEMM
+知识点：local buffer 的 warpgroup distributed view 与 TileLayout
+上次：TMEM -> RF -> GMEM writeback 全链路
+下次：第 2 步：K-Loop 累加与 MMA barrier phase
+PTX：tcgen05.ld 的 register destination distribution
+```
+
+前面已经知道 `Dreg.view` 后的 `Dreg_wg` 能表示一个 `128 x BLK_N` tile，
+但这里最容易卡住的是：
+
+```text
+每个 thread 明明只分配了 Dreg[0:BLK_N]
+为什么 view 以后会变成一个 128 x BLK_N 的二维 buffer？
+```
+
+答案是：`Dreg_wg` 不是一个 thread 私有的 `128 x BLK_N` 连续数组。
+它描述的是整个 warpgroup 中 128 个线程共同组成的分布式逻辑 tile。
+
+先建立一个类比：
+
+```text
+Dreg
+= 一个学生自己的 BLK_N 格答题纸
+
+Dreg_wg
+= 老师看到的 128 个学生 x BLK_N 格的成绩册视图
+
+Dreg_wg[row, col]
+= 第 row 个学生的第 col 格答案
+```
+
+老师没有另造一本包含全部答案的纸；`Dreg_wg` 只是把 128 个学生的本地答题纸
+按 row 编号组织成一个二维逻辑视图。
+
+代码是：
+
+```python
+Dreg = T.alloc_local((BLK_N,), acc_type)
+
+Dreg_wg = Dreg.view(
+    128,
+    BLK_N,
+    layout=TileLayout(
+        S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+    ),
+)
+```
+
+这里同时存在两个 scope：
+
+| 名称 | 看到的 shape | 实际位置 | 含义 |
+|---|---:|---|---|
+| `Dreg` | `(BLK_N,)` | 每个 thread 自己的一份 local storage | 当前线程的 `BLK_N` 个 register slots |
+| `Dreg_wg` | `(128, BLK_N)` | 同一个 warpgroup 的 128 份 `Dreg` | 128 个线程共同组成的逻辑 tile |
+
+因此：
+
+```text
+Dreg_wg 的逻辑元素总数
+= 128 * BLK_N
+
+每个 thread 实际持有的元素数
+= (128 * BLK_N) / 128
+= BLK_N
+```
+
+这正好对应：
+
+```text
+Dreg.shape = (BLK_N,)
+```
+
+`view` 不分配新的 registers，也不复制数据。它只给同一份 local storage
+增加一层逻辑 shape 和 layout，告诉后续 tile-level operation：
+
+```text
+哪个逻辑元素应该由哪个 thread 持有
+该元素又落在那个 thread 的哪个 local index
+```
+
+最重要的 layout 是：
+
+```python
+S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+```
+
+可以逐项拆成：
+
+| item | extent | stride | layout axis | 作用 |
+|---|---:|---:|---|---|
+| logical row | `128` | `1 @ tid_in_wg` | thread axis `tid_in_wg` | row 决定 owner thread |
+| logical col | `BLK_N` | `1` | 默认 local/register axis | col 决定 owner thread 的 `Dreg` index |
+
+于是坐标为 `(row, col)` 的元素满足：
+
+```text
+owner thread = row
+local register index = col
+```
+
+也就是：
+
+```text
+Dreg_wg[row, col]
+-> tid_in_wg = row 的线程
+-> 该线程的 Dreg[col]
+```
+
+举三个具体坐标：
+
+| `Dreg_wg` 坐标 | owner `tid_in_wg` | owner 的 warp / lane | physical register |
+|---|---|---|---|
+| `[0, 0]` | 0 | warp 0, lane 0 | `Dreg[0]` |
+| `[73, 91]` | 73 | warp 2, lane 9 | `Dreg[91]` |
+| `[127, 127]` | 127 | warp 3, lane 31 | `Dreg[127]` |
+
+以 `(73, 91)` 为例：
+
+```text
+logical row = 73
+logical col = 91
+
+73 * (1 @ tid_in_wg) -> tid_in_wg = 73
+91 * 1               -> local register = Dreg[91]
+```
+
+所以：
+
+```text
+线程 73:
+    不持有整个 128 x BLK_N tile
+    只持有属于自己 row 的 BLK_N 个元素
+    Dreg_wg[73, 0:BLK_N] -> Dreg[0:BLK_N]
+```
+
+反过来，线程 0 也不会持有 `row=1` 的数据。如果某个操作需要跨 row
+访问，必须有 warpgroup scope 的协作机制来路由元素，不能把它当成每线程
+都能直接访问的一块连续 memory。
+
+再看它与 TMEM copy 的连接：
+
+```python
+Tx.wg.copy_async(
+    Dreg_wg[:, :],
+    tmem[:, :BLK_N],
+)
+```
+
+source TMEM 的 layout 是：
+
+```text
+TLane = row
+TCol  = col
+```
+
+destination `Dreg_wg` 的 layout 是：
+
+```text
+tid_in_wg = row
+register  = col
+```
+
+所以 copy 的元素级映射是：
+
+```text
+TMEM[TLane, TCol]
+-> Dreg_wg[TLane, TCol]
+-> thread tid_in_wg=TLane 的 Dreg[TCol]
+```
+
+例如：
+
+```text
+TMEM[73, 91]
+-> Dreg_wg[73, 91]
+-> thread 73 的 Dreg[91]
+```
+
+`Tx.wg.copy_async` 的 `wg` 很重要。这里的 producer 和 consumer 都是同一个
+warpgroup 的 128 个线程：
+
+```text
+128 个线程共同发出一次 warpgroup copy
+每个线程根据 destination layout 接收自己的元素
+thread row 只接收 row=thread row 的那一行
+```
+
+这里的 `view` 是编译期抽象的 shape/layout 转换，不会生成一条运行时
+`view` 指令。真正执行搬运和路由的是后面的 `Tx.wg.copy_async`；
+`view` 提供的是它必须知道的 destination ownership。
+
+下面是一个完整、不依赖 GPU 的语义模拟脚本。它把 128 个线程的本地
+`Dreg` 真实存成 128 个一维数组，再通过 layout 规则访问二维逻辑视图。
+
+文件：`check_dreg_distributed_view.py`
+
+```python
+ROWS = 128
+BLK_N = 128
+WARPGROUP_THREADS = ROWS
+
+# 物理存储：每个 thread 只有 BLK_N 个 local slots。
+regs = [
+    [thread_id * 1000 + col for col in range(BLK_N)]
+    for thread_id in range(WARPGROUP_THREADS)
+]
+
+
+def view_read(row, col):
+    tid_in_wg = row
+    register_index = col
+    return regs[tid_in_wg][register_index]
+
+
+def view_write(row, col, value):
+    tid_in_wg = row
+    register_index = col
+    regs[tid_in_wg][register_index] = value
+
+
+row = 73
+col = 91
+
+print(f"view shape=({ROWS}, {BLK_N})")
+print(f"per-thread local shape=({BLK_N},)")
+print(f"Dreg_wg[{row}, {col}]={view_read(row, col)}")
+
+view_write(row, col, 123456)
+print(f"after write: Dreg_wg[{row}, {col}]={view_read(row, col)}")
+print(f"physical owner: regs[{row}][{col}]={regs[row][col]}")
+```
+
+运行：
+
+```bash
+python3 check_dreg_distributed_view.py
+```
+
+预期输出：
+
+```text
+view shape=(128, 128)
+per-thread local shape=(128,)
+Dreg_wg[73, 91]=73091
+after write: Dreg_wg[73, 91]=123456
+physical owner: regs[73][91]=123456
+```
+
+这个脚本模拟的是 ownership 和索引，不执行 `tcgen05.ld`。它的目的是验证：
+`Dreg_wg` 的二维坐标最终一定落到“某个 owner thread 的一个 local index”。
+
+常见错误和症状：
+
+| 错误 | 实际发生的错误 | 可观察症状 |
+|---|---|---|
+| 认为 `Dreg_wg` 是每个线程另分配的 `128 x BLK_N` 数组 | 把分布式 view 当成单线程私有 buffer | register 数量被高估，thread mapping 全错 |
+| 认为每个线程拥有完整 tile | 忽略了 128 个 row 分给 128 个线程 | 后续 GMEM writeback 重复写或只写一行 |
+| 把 `1 @ tid_in_wg` 写成普通 `1` | row 不再选择 owner thread | 所有逻辑 row 落到同一个 thread 的 register |
+| row/col stride 互换 | row 去选 register，col 去选 thread | 输出发生转置、行错位或地址非法 |
+| 在 warpgroup 外按 `Dreg_wg` 访问 | 参与操作的 thread set 与 layout 不一致 | copy 不完整或结果未定义 |
+| `Dreg_wg` 的 row owner 与 `m_thr` 不一致 | producer 和 consumer 使用不同的 row 映射 | 输出整行互换或有规律缺失 |
+
+最后记成一句话：
+
+```text
+Dreg 是“每个线程本地的一行寄存器”
+Dreg_wg 是“128 个线程的这些本地行共同组成的分布式二维 tile”
+1 @ tid_in_wg 负责选 row owner
+后面的 1 负责选该线程的 register index
+```
+
+自测：
+
+1. `Dreg` 和 `Dreg_wg` 的 shape 分别是什么？
+   答：`Dreg.shape=(BLK_N,)`，`Dreg_wg` 的逻辑 shape 是
+   `(128, BLK_N)`；后者是 warpgroup-wide distributed view。
+
+2. `Dreg_wg[73, 91]` 最终落在哪里？
+   答：`tid_in_wg=73` 的线程的 `Dreg[91]`。该线程是 warp 2、lane 9。
+
+3. 为什么不能把 `Dreg_wg` 当成每个线程都有的 `128 x BLK_N` buffer？
+   答：整个 tile 的元素分散在 128 个线程中。每个线程只持有 `BLK_N`
+   个元素，所有线程的本地 storage 合起来才是完整的 `128 x BLK_N`。
+
+4. `1 @ tid_in_wg` 中的 `tid_in_wg` 表示什么？
+   答：它标识 warpgroup 内的 owner thread，范围是 0 到 127。logical row
+   通过这个轴决定应由哪个线程持有。
+
+5. `view` 是否会生成一条运行时指令来搬运数据？
+   答：不会。`view` 是编译期 shape/layout 转换；真正搬运和按 layout
+   路由数据的是后面的 `Tx.wg.copy_async`。
+
 ### 9. 释放 TMEM
 
 ```python
@@ -1577,7 +1874,10 @@ K=64 的 tile operation 会 lower 成 4 个 K=16 的 MMA
 accum=False 表示 tile operation 不继承更早的 TMEM accumulator
 T.SMEMPool 的 alloc 推进 cursor，move_base_to 控制后续 base offset
 pool.commit 确定 shared.dyn 的最终 high-water-mark 大小，它不是运行时 barrier
-Dreg_wg 用 tid_in_wg 将 128 个输出 rows 映射到一个 warpgroup 的 128 threads
+Dreg 是每个 thread 的 (BLK_N,) local storage，分配时不会出现每线程 128 x BLK_N
+Dreg_wg 是同一份 local storage 的 warpgroup distributed view，不分配也不复制数据
+Dreg_wg 用 tid_in_wg 将 128 个逻辑 rows 映射到 warpgroup 的 128 个 owner threads
+view 的 row 决定 owner thread，col 决定该线程的 local register index
 Tx.wg.copy_async 读取 TMEM，tcgen05.wait.ld 等待 register load 完成
 writeback 由 wait.ld、fp32-to-fp16 cast 和按 m_thr 写回 GMEM 组成
 每个 thread 将自己的 fp32 row cast 为 fp16，再写回 GMEM
