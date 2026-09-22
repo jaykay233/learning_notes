@@ -1310,7 +1310,7 @@ warp 3: rows 96..127
 小节：第 1 步：顺序执行的单 Tile GEMM
 知识点：TMEM -> per-thread registers -> cast -> GMEM writeback
 上次：某一行 TMEM load 如何映射到 thread 和 register
-下次：TMEM dealloc 前的 cta_sync 与 allocation lifetime
+下次：Dreg.view 如何表示 warpgroup distributed tile
 PTX：tcgen05.ld、tcgen05.wait::ld、global store
 ```
 
@@ -1558,7 +1558,7 @@ Blackwell GPU，因此不能在本机做真实 TMEM load 或 GMEM writeback 的�
 小节：第 1 步：顺序执行的单 Tile GEMM
 知识点：local buffer 的 warpgroup distributed view 与 TileLayout
 上次：TMEM -> RF -> GMEM writeback 全链路
-下次：第 2 步：K-Loop 累加与 MMA barrier phase
+下次：m_thr 如何把线程映射到全局输出行
 PTX：tcgen05.ld 的 register destination distribution
 ```
 
@@ -1846,6 +1846,323 @@ Dreg_wg 是“128 个线程的这些本地行共同组成的分布式二维 tile
 5. `view` 是否会生成一条运行时指令来搬运数据？
    答：不会。`view` 是编译期 shape/layout 转换；真正搬运和按 layout
    路由数据的是后面的 `Tx.wg.copy_async`。
+
+#### 8.3 `m_thr` 如何把线程映射到全局输出行
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 1 步：顺序执行的单 Tile GEMM
+知识点：thread id 到 global output row 的 writeback 映射
+上次：Dreg_wg 的 warpgroup distributed view
+下次：第 2 步：K-Loop 累加与 MMA barrier phase
+PTX：global store / vectorized store path
+```
+
+先建立一个整行写回的心智模型：
+
+```text
+每个 thread 手里有一行结果
+-> Dreg_f16[0:BLK_N]
+
+每个 thread 需要知道：
+这行结果属于全局 D 的第几行
+
+Tx.copy 负责：
+把这一行写到那个全局 row 的连续列区间
+```
+
+因此这两行的核心不是重新排列 register，而是回答“当前线程负责哪一行”：
+
+```python
+m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+Tx.copy(D[m_thr, n_st : n_st + BLK_N], Dreg_f16[:])
+```
+
+完整上下文仍然是：
+
+```python
+Dreg = T.alloc_local((BLK_N,), acc_type)
+Dreg_f16 = T.alloc_local((BLK_N,), d_type)
+Dreg_wg = Dreg.view(
+    128,
+    BLK_N,
+    layout=TileLayout(
+        S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+    ),
+)
+
+Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+T.ptx.tcgen05.wait.ld()
+Tx.cast(Dreg_f16[:], Dreg[:])
+
+m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+Tx.copy(D[m_thr, n_st : n_st + BLK_N], Dreg_f16[:])
+```
+
+五个名字分别表示：
+
+| 名字 | 范围或公式 | 含义 |
+|---|---|---|
+| `warp_id` | `0..3` | 当前 thread 在 warpgroup 中的 warp 编号 |
+| `lane_id` | `0..31` | 当前 thread 在 warp 中的 lane 编号 |
+| `tid_in_wg` | `warp_id * 32 + lane_id` | 当前 thread 在 128-thread warpgroup 中的编号 |
+| `m_st` | `bx * BLK_M` | 当前 CTA output tile 在全局 D 中的起始 row |
+| `n_st` | `by * BLK_N` | 当前 CTA output tile 在全局 D 中的起始 column |
+| `m_thr` | `m_st + warp_id * 32 + lane_id` | 当前 thread 负责写回的全局 output row |
+
+先看 `tid_in_wg` 的展开：
+
+```text
+warp 0, lane 0  -> tid_in_wg = 0 * 32 + 0  = 0
+warp 0, lane 31 -> tid_in_wg = 0 * 32 + 31 = 31
+warp 1, lane 0  -> tid_in_wg = 1 * 32 + 0  = 32
+warp 2, lane 9  -> tid_in_wg = 2 * 32 + 9  = 73
+warp 3, lane 31 -> tid_in_wg = 3 * 32 + 31 = 127
+```
+
+所以：
+
+```text
+m_thr = m_st + tid_in_wg
+```
+
+它只是在 `tid_in_wg` 上增加当前 CTA tile 的 row offset：
+
+```text
+tile-local row = tid_in_wg
+global row     = m_st + tile-local row
+```
+
+当前 baseline 只有一个 tile：
+
+```text
+bx = 0
+by = 0
+m_st = 0
+n_st = 0
+BLK_N = 128
+```
+
+此时 `m_thr` 与 `tid_in_wg` 数值相同：
+
+| `warp_id` | `lane_id` | `tid_in_wg` | `m_thr` | 当前线程写回 |
+|---:|---:|---:|---:|---|
+| 0 | 0 | 0 | 0 | `D[0, 0:128] <- Dreg_f16[0:128]` |
+| 0 | 31 | 31 | 31 | `D[31, 0:128] <- Dreg_f16[0:128]` |
+| 2 | 9 | 73 | 73 | `D[73, 0:128] <- Dreg_f16[0:128]` |
+| 3 | 31 | 127 | 127 | `D[127, 0:128] <- Dreg_f16[0:128]` |
+
+关键点是这行代码由 warpgroup 的 128 个线程一起执行，但每个线程算出的
+`m_thr` 不同：
+
+```text
+thread 0   -> m_thr = 0
+thread 1   -> m_thr = 1
+...
+thread 127 -> m_thr = 127
+```
+
+因此一条源码语句最终形成 128 个有效的 row store：
+
+```text
+thread 0   : D[0,   n_st:n_st+BLK_N]
+thread 1   : D[1,   n_st:n_st+BLK_N]
+...
+thread 127 : D[127, n_st:n_st+BLK_N]
+```
+
+128 个线程合起来，正好覆盖整个 `128 x BLK_N` output tile：
+
+```text
+128 rows
+x
+每个线程持有的 BLK_N 个 fp16 columns
+=
+128 x BLK_N output elements
+```
+
+destination 和 source 的形状也需要对应：
+
+| 表达式 | 含义 | shape |
+|---|---|---|
+| `D[m_thr, n_st:n_st+BLK_N]` | 全局输出中的一行列区间 | `(BLK_N,)` |
+| `Dreg_f16[:]` | 当前线程已经 cast 的整行输出 | `(BLK_N,)` |
+
+这里的 `D[...]` 只固定第一个维度 `m_thr`，第二个维度仍然是连续的列区间。
+所以它不是每个线程写一个单独元素，而是每个线程写自己那一行的
+`BLK_N` 个元素。
+
+再看多 tile 的情况。假设：
+
+```text
+BLK_M = 128
+BLK_N = 128
+bx = 1
+by = 2
+warp_id = 2
+lane_id = 9
+```
+
+计算过程是：
+
+```text
+m_st = bx * BLK_M
+     = 1 * 128
+     = 128
+
+tid_in_wg = warp_id * 32 + lane_id
+          = 2 * 32 + 9
+          = 73
+
+m_thr = m_st + tid_in_wg
+      = 128 + 73
+      = 201
+
+n_st = by * BLK_N
+     = 2 * 128
+     = 256
+```
+
+因此这个线程执行的是：
+
+```text
+D[201, 256:384] <- Dreg_f16[0:128]
+```
+
+它不再写 `D[73, ...]`，而是写全局 output tile `(bx=1, by=2)` 内部的第
+73 行。少乘或多乘 `BLK_M` 都会表现出“局部结果正确，但落到错误 CTA
+tile”的地址上。
+
+##### `T.meta_var` 在这里做什么
+
+`T.meta_var(...)` 是 TIRx script parser 的元值标记。它表示：
+
+```text
+m_thr 这个名字在解析脚本时直接绑定到后面的表达式
+而不是额外创建一个可变的 local scalar
+```
+
+对应源码中的处理是：
+
+```python
+if isinstance(value, I.meta_var):
+    return value.value
+```
+
+所以它不会：
+
+```text
+不会生成一条 GPU arithmetic 指令
+不会把 warp_id 或 lane_id 变成编译期常量
+不会改变 m_st + warp_id * 32 + lane_id 的运行期语义
+不会把地址计算变成 per-thread 之外的共享操作
+```
+
+使用它之后，`m_thr` 更像一个编译期别名；在
+`D[m_thr, n_st:n_st+BLK_N]` 出现的位置，会直接使用等价的表达式。
+
+如果去掉 `T.meta_var`，写成：
+
+```python
+m_thr = m_st + warp_id * 32 + lane_id
+```
+
+通常仍然能得到相同的结果；区别是 parser 会按普通的 scalar 赋值建立
+TIRx 的局部标量绑定。对于这段代码，`T.meta_var` 主要让语义保持为
+标量表达式别名，并避免产生没有必要的临时 scalar binding。
+
+下面的完整脚本不依赖 GPU，直接模拟 128 个线程如何覆盖 128 个 output
+rows，并检查 `m_thr` 的边界：
+
+文件：`check_m_thr_row_mapping.py`
+
+```python
+BLK_M = 128
+BLK_N = 128
+
+bx = 0
+by = 0
+m_st = bx * BLK_M
+n_st = by * BLK_N
+
+seen_rows = []
+
+for warp_id in range(4):
+    for lane_id in range(32):
+        tid_in_wg = warp_id * 32 + lane_id
+        m_thr = m_st + tid_in_wg
+        seen_rows.append(m_thr)
+
+        if (warp_id, lane_id) in {(0, 0), (0, 31), (2, 9), (3, 31)}:
+            print(
+                f"warp_id={warp_id}, lane_id={lane_id}, "
+                f"tid_in_wg={tid_in_wg}, m_thr={m_thr}, "
+                f"row=D[{m_thr}, {n_st}:{n_st + BLK_N}]"
+            )
+
+assert len(seen_rows) == 128
+assert len(set(seen_rows)) == 128
+assert min(seen_rows) == m_st
+assert max(seen_rows) == m_st + BLK_M - 1
+
+print(f"written output rows: {m_st}..{m_st + BLK_M - 1}")
+print("all 128 rows are covered exactly once")
+```
+
+运行：
+
+```bash
+python3 check_m_thr_row_mapping.py
+```
+
+预期输出：
+
+```text
+warp_id=0, lane_id=0, tid_in_wg=0, m_thr=0, row=D[0, 0:128]
+warp_id=0, lane_id=31, tid_in_wg=31, m_thr=31, row=D[31, 0:128]
+warp_id=2, lane_id=9, tid_in_wg=73, m_thr=73, row=D[73, 0:128]
+warp_id=3, lane_id=31, tid_in_wg=127, m_thr=127, row=D[127, 0:128]
+written output rows: 0..127
+all 128 rows are covered exactly once
+```
+
+这个脚本验证的是 row ownership 和覆盖范围，不执行真实的 `Tx.copy`。真实
+GMEM store 还需要满足 `D` 的 shape、dtype、地址对齐和边界条件。
+
+常见错误及症状：
+
+| 错误 | 可观察症状 |
+|---|---|
+| 只写 `lane_id`，漏掉 `warp_id * 32` | warp 0 和 warp 1 都写 `D[0:32]`，后写覆盖先写，结果只保留部分行 |
+| 漏掉 `m_st` | 多 CTA 时所有 tile 都写回全局 `D[0:128]`，不同 CTA 互相覆盖 |
+| `m_st` 使用错误 tile 起点 | 每个局部 tile 数值可能正确，但整体输出呈现 tile 整体错位 |
+| `m_thr` 的 row owner 与 `Dreg_wg` 不一致 | 行内容互换、重复行或有规律缺失 |
+| `n_st` 计算错误 | 写入了合法地址但列区间属于相邻 output tile |
+| 直接写 `n_st + BLK_N` 而不检查边界 | 当 `N` 不是 `BLK_N` 的整数倍时越界 |
+| 让单个线程执行整句 `Tx.copy` | 只覆盖一行，不能形成完整的 128-row tile |
+
+自测：
+
+1. `m_thr` 的完整公式是什么？
+   答：`m_thr = m_st + warp_id * 32 + lane_id`，也可写成
+   `m_thr = m_st + tid_in_wg`。
+
+2. 当 `m_st=128`、`warp_id=2`、`lane_id=9` 时，`m_thr` 是多少？
+   答：`128 + 2*32 + 9 = 201`。
+
+3. 为什么 128 个线程合起来能写完一个 `128 x BLK_N` tile？
+   答：每个线程拥有一个 output row 的 `BLK_N` 个 columns；128 个线程
+   分别负责 128 个不同的 row。
+
+4. `T.meta_var` 会把 `m_thr` 变成运行期寄存器或指令吗？
+   答：不会。它标记 parser-time meta value，让名字直接绑定表达式；运行期
+   地址计算仍然由表达式本身描述。
+
+5. 如果第 1 个 warp 和第 2 个 warp 都只使用 `lane_id` 计算 row，会出现
+   什么症状？
+   答：两个 warp 的 lane 会映射到相同 rows，产生重复写入和错误覆盖，
+   最终 output 只有部分 row 来自正确 warp。
 
 ### 9. 释放 TMEM
 
@@ -2147,6 +2464,9 @@ wait::ld.sync.aligned 只做 warp 内汇合，不是 CTA 或 warpgroup barrier
 cta_sync 不能替代 wait.ld，因为 thread 到达不等于 TMEM load 已完成
 writeback 由 wait.ld、fp32-to-fp16 cast 和按 m_thr 写回 GMEM 组成
 每个 thread 将自己的 fp32 row cast 为 fp16，再写回 GMEM
+m_thr = m_st + warp_id * 32 + lane_id 选择当前 thread 的全局 output row
+一个 thread 写一整行的 BLK_N 个 columns，128 个 threads 合起来覆盖 output tile
+T.meta_var 将 m_thr 绑定为 parser-time 表达式别名，不生成额外运行期指令
 TMEM 必须先 cta_sync，再 relinquish permit 和 dealloc
 第 1 步的限制是 K<=64、M=N=128、同步 copy、搬运与计算不重叠
 chapter_gemm_basics 第 1 个知识点完成：单 Tile Baseline
