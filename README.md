@@ -267,6 +267,10 @@ offset 的整体平移但不增加副本
 apply() 只返回 D(x) + O
 (1, 3)、shape [8, 16] 的 flatten、decompose 与坐标推导
 chapter_tirx_layout_api 第一个知识点完成：S[...]、R[...] 与 offset
+命名轴 laneid / warpid / m / TLane / TCol
+不同 axis 是不同坐标空间，相同整数值不能直接合并
+m 的语义由 buffer scope 决定，TLane / TCol 描述 TMEM 存储坐标
+chapter_tirx_layout_api 第二个知识点完成：命名轴
 ```
 
 完整文档索引、当前进度和硬件环境说明见

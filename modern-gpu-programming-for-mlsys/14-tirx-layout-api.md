@@ -1,6 +1,6 @@
-# TIRx Layout API：`S[...]`、`R[...]` 与 offset
+# TIRx Layout API：`S[...]`、`R[...]`、offset 与命名轴
 
-这篇笔记开始学习 `chapter_tirx_layout_api`。本篇只完整讲清第一个
+这篇笔记开始学习 `chapter_tirx_layout_api`。目前完整讲清前两个
 知识点：如何读取和计算：
 
 ```text
@@ -35,7 +35,7 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 
 ```text
 [x] TileLayout 的 S[...]、R[...] 与 offset
-[ ] 命名轴：laneid / warpid / m / TLane / TCol
+[x] 命名轴：laneid / warpid / m / TLane / TCol
 [ ] apply() 的三种输入形式与 flatten / decompose
 [ ] TMEM accumulator layout 示例
 [ ] scale-factor layout 中的 replication
@@ -43,7 +43,7 @@ TileLayout(S[(128, BLK_N) : (1@tid_in_wg, 1)])
 [ ] ComposeLayout 与 shared-memory swizzle
 ```
 
-本篇只完成第一项。后续知识点会在同一章新的小节中继续展开。
+本篇目前完成前两项。后续知识点会在同一章新的小节中继续展开。
 
 ## 一、这个 API 要解决什么问题
 
@@ -651,13 +651,484 @@ Replica 再枚举 `0@warpid` 和 `4@warpid`，因此完整副本位置是：
 5 + 4 = 9
 ```
 
-## 十一、当前进度
+## 十一、命名轴：`laneid`、`warpid`、`m`、`TLane`、`TCol`
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_tirx_layout_api
+小节：命名轴
+知识点：laneid / warpid / m / TLane / TCol 分别表示什么
+上次：TileLayout 的 S[...]、R[...] 与 offset
+下次：apply() 的三种输入形式与 flatten / decompose
+PTX：无直接 PTX 指令；这些轴分别对应 thread、warp、线性存储与 TMEM 坐标
+```
+
+上一课已经知道 `S[...]` 的每个 iter 都由：
+
+```text
+(extent, stride, axis)
+```
+
+组成。现在要解决一个更基础的问题：
+
+```text
+axis 只是一个名字，还是实际代表不同的硬件资源？
+为什么 laneid=5 和 TLane=5 不能视为同一个位置？
+为什么默认轴 m 有时表示地址，有时表示 register slot？
+```
+
+答案是：**axis 是坐标空间的名字，不是普通的维度标签。**
+
+### 心智模型
+
+普通 shape-stride 最终只产生一个线性地址：
+
+```text
+地址 = 16 * row + col
+```
+
+命名轴 layout 产生的是一组坐标：
+
+```text
+{
+    laneid: 5,
+    warpid: 2,
+    m: 1,
+}
+```
+
+同一个整数 `5` 只有在 axis 也相同时才表示同一个物理位置：
+
+```text
+laneid=5  != TLane=5
+warpid=5  != laneid=5
+m=5       != TCol=5
+```
+
+可以把它想成多维坐标：
+
+```text
+(laneid=5, warpid=2, m=1)
+```
+
+和普通坐标 `(x=5, y=2)` 一样，坐标值和坐标轴必须一起看。
+
+### 本节重点轴
+
+| Axis | 坐标含义 | 典型范围或单位 |
+|---|---|---|
+| `laneid` | thread 在当前 warp 中的 lane ID | `[0, 32)` |
+| `warpid` | warp 在当前 CTA 中的编号 | 由当前 CTA 的 warp 数决定 |
+| `m` | 默认线性物理轴 | 单位由 buffer scope 决定 |
+| `TLane` | TMEM 的硬件 Lane 坐标 | `[0, 128)` |
+| `TCol` | TMEM 的 Column 坐标 | 以 buffer element 计，不一定等于 hardware Col |
+
+它们回答的是不同层级的位置：
+
+```text
+laneid / warpid
+-> thread 和 warp 拥有哪份数据
+
+m
+-> 在某种线性存储中位于哪个 element 或 local slot
+
+TLane / TCol
+-> 在 TMEM 的二维存储坐标中位于哪里
+```
+
+### `m` 的语义由 buffer scope 决定
+
+`m` 不是固定等于 global address，也不是固定等于 register slot。
+
+| Buffer scope | `m` 的常见含义 |
+|---|---|
+| global memory | 线性 element 下标 |
+| shared memory | shared memory 内的线性 element 下标，swizzle 前的基础地址 |
+| register-backed local buffer | 当前 thread 自己的局部线性位置或 fragment slot |
+
+例如：
+
+```python
+S[(8, 16) : (16 @ m, 1 @ m)]
+```
+
+对逻辑坐标 `(1, 3)` 产生：
+
+```text
+m = 1 * 16 + 3 * 1 = 19
+```
+
+这里的 `m=19` 是普通 row-major 线性位置。它最终是全局地址、shared memory
+地址，还是某个 thread 的 register slot，由绑定 layout 的 buffer scope
+决定。
+
+### `laneid` 和 `TLane` 不是一回事
+
+```text
+laneid
+-> 执行线程的 lane 身份
+
+TLane
+-> TMEM 的存储 Lane 坐标
+```
+
+一个 warp 有 32 个执行 lane：
+
+```text
+laneid in [0, 32)
+```
+
+TMEM 有 128 条硬件 Lane：
+
+```text
+TLane in [0, 128)
+```
+
+所以 `laneid=5` 描述“第 5 个线程 lane 拥有或处理这个元素”，而 `TLane=5`
+描述“这个元素存放在 TMEM 的第 5 条 Lane”。编译器可以让 thread lane 5
+读取 TMEM Lane 5，但两个 axis 的身份并没有被合并。
+
+同理，`warpid` 是 CTA 范围内的 warp 编号；`wid_in_wg` 才是 warp 在
+warpgroup 内的相对编号。二者不能因为数值相同而互换。
+
+### `TCol` 的单位
+
+`TCol` 的 stride 以 buffer element 为单位。一个 32-bit hardware Col
+能容纳多少个元素，取决于 dtype：
+
+| dtype 宽度 | 每个 32-bit hardware Col 的元素数 | `TCol=3` 对应的 hardware Col |
+|---:|---:|---:|
+| 32-bit | 1 | 3 |
+| 16-bit | 2 | `3 // 2 = 1` |
+| 8-bit | 4 | `3 // 4 = 0` |
+
+因此在 fp16 或 fp8 scale-factor buffer 中：
+
+```text
+TCol=3
+```
+
+不代表 hardware Col 编号一定是 3。必须结合 dtype 计算元素打包关系。
+
+### 完整可运行代码
+
+下面的脚本只构造和查询 layout，不 launch CUDA kernel，可以在当前 macOS
+环境运行。
+
+文件名：
+
+```text
+tirx_named_axes.py
+```
+
+完整代码：
+
+```python
+from tvm.tirx.layout import S, TileLayout, laneid, warpid, m, TLane, TCol
+
+
+def main():
+    frag = TileLayout(
+        S[(8, 2, 4, 2) : (4 @ laneid, 1 @ warpid, 1 @ laneid, 1)]
+    )
+    tmem = TileLayout(
+        S[(128, 256) : (1 @ TLane, 1 @ TCol)]
+    )
+    linear = TileLayout(
+        S[(8, 16) : (16 @ m, 1 @ m)]
+    )
+
+    print("frag shard:", frag.shard)
+    print("tmem shard:", tmem.shard)
+    print("linear shard:", linear.shard)
+
+    frag_coord = frag.apply(1, 3, shape=[8, 16])
+    tmem_coord = tmem.apply(17, 130, shape=[128, 256])
+    linear_coord = linear.apply(1, 3, shape=[8, 16])
+
+    print("frag (1, 3):", frag_coord)
+    print("tmem (17, 130):", tmem_coord)
+    print("linear (1, 3):", linear_coord)
+
+    print("frag laneid:", frag_coord["laneid"])
+    print("frag warpid:", frag_coord["warpid"])
+    print("frag m:", frag_coord["m"])
+    print("tmem TLane:", tmem_coord["TLane"])
+    print("tmem TCol:", tmem_coord["TCol"])
+    print("linear m:", linear_coord["m"])
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 代码逐段解释
+
+第一组 layout：
+
+```python
+frag = TileLayout(
+    S[(8, 2, 4, 2) : (4 @ laneid, 1 @ warpid, 1 @ laneid, 1)]
+)
+```
+
+它描述一个 register fragment：
+
+```text
+第一个 iter: 4 @ laneid
+第二个 iter: 1 @ warpid
+第三个 iter: 1 @ laneid
+第四个 iter: 1，默认 axis=m
+```
+
+前两个 laneid iter 属于同一个 axis，所以它们的贡献必须相加：
+
+```text
+laneid_total = c0 * 4 + c2 * 1
+```
+
+第二组 layout：
+
+```python
+tmem = TileLayout(
+    S[(128, 256) : (1 @ TLane, 1 @ TCol)]
+)
+```
+
+它描述 TMEM 中的二维 tile：
+
+```text
+logical row    -> TLane
+logical column -> TCol
+```
+
+这里的 axis 是存储坐标，不表示线程 ownership。
+
+第三组 layout：
+
+```python
+linear = TileLayout(
+    S[(8, 16) : (16 @ m, 1 @ m)]
+)
+```
+
+它描述普通 row-major 线性布局：
+
+```text
+逻辑 row    -> m 上 stride 16
+逻辑 column -> m 上 stride 1
+```
+
+此时：
+
+```text
+m(1, 3) = 1 * 16 + 3 * 1 = 19
+```
+
+### 完整数值执行追踪
+
+#### 1. Register fragment：`(1, 3)`
+
+逻辑 shape：
+
+```text
+[8, 16]
+```
+
+先 flatten：
+
+```text
+flat = 1 * 16 + 3 = 19
+```
+
+再按 shard extents `(8, 2, 4, 2)` 分解：
+
+```text
+(c0, c1, c2, c3) = (1, 0, 1, 1)
+```
+
+逐项乘 stride：
+
+| Iter | Coordinate | Stride | Axis | Contribution |
+|---:|---:|---:|---|---|
+| 0 | 1 | 4 | `laneid` | `4 @ laneid` |
+| 1 | 0 | 1 | `warpid` | `0 @ warpid` |
+| 2 | 1 | 1 | `laneid` | `1 @ laneid` |
+| 3 | 1 | 1 | `m` | `1 @ m` |
+
+合并同一个 axis 的贡献：
+
+```text
+laneid = 4 + 1 = 5
+warpid = 0
+m      = 1
+```
+
+结果为：
+
+```text
+{"m": 1, "warpid": 0, "laneid": 5}
+```
+
+#### 2. TMEM layout：`(17, 130)`
+
+逻辑 shape 和 shard extents 都是 `(128, 256)`，因此先 flatten：
+
+```text
+flat = 17 * 256 + 130
+     = 4352 + 130
+     = 4482
+```
+
+再拆回：
+
+```text
+4482 = 17 * 256 + 130
+```
+
+所以：
+
+```text
+TLane = 17
+TCol  = 130
+```
+
+结果为：
+
+```text
+{"TCol": 130, "TLane": 17}
+```
+
+这里 `TCol=130` 是 buffer element 坐标。若 dtype 是 fp16，它对应的
+hardware Col 和元素内位置还需要按 2 个元素/Col 计算。
+
+#### 3. 普通线性 layout：`(1, 3)`
+
+```text
+m = 1 * 16 + 3 * 1
+  = 19
+```
+
+结果为：
+
+```text
+{"m": 19}
+```
+
+同样是 `m` 轴，如果这个 buffer 在当前 thread 的 local scope 中，那么
+`19` 是该 thread 的局部位置；如果 buffer 在 shared 或 global scope
+中，那么 `19` 是线性 element 下标。
+
+### 常见错误与可观察症状
+
+| 错误 | 可观察症状 | 优先检查 |
+|---|---|---|
+| 认为 `laneid=5` 和 `TLane=5` 是同一位置 | layout 查询看似正常，实际读错线程数据或 TMEM 区域 | axis 名称是否一致 |
+| 把 `warpid` 当作 warpgroup 内编号 | warpgroup 中第二个 warp 被错误解释为全局 warp 编号 | 应使用 `wid_in_wg` 时是否误用了 `warpid` |
+| 把 `TCol` 当作 byte offset | 8-bit、16-bit buffer 出现 2 倍或 4 倍地址偏差 | dtype、elements per hardware Col |
+| 把 `m` 固定理解成 global address | local fragment 的 register slot 被错误映射 | buffer scope |
+| 同一个 axis 的多个贡献只保留最后一个 | lane 或 warp 映射呈规律性错位 | 同轴贡献是否全部相加 |
+| 修改 axis 名但数值没变 | 编译可能通过，producer 与 consumer 读错位置 | 两侧 layout 的 axis 名称和取值是否一致 |
+
+在推理 kernel 中，典型表现是：
+
+```text
+GEMM fragment 中某些 lane 拿到错误元素
+TMEM accumulator 的 row 或 column 整块错位
+scale-factor 读取到相邻元素或错误 byte
+epilogue 写回时 warpgroup 内的 ownership 不一致
+```
+
+### 验证命令和预期输出
+
+运行：
+
+```bash
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python tirx_named_axes.py
+```
+
+当前环境实测输出：
+
+```text
+frag shard: (T.Iter(8, 4, "laneid"), T.Iter(2, 1, "warpid"), T.Iter(4, 1, "laneid"), T.Iter(2, 1, "m"))
+tmem shard: (T.Iter(128, 1, "TLane"), T.Iter(256, 1, "TCol"))
+linear shard: (T.Iter(8, 16, "m"), T.Iter(16, 1, "m"))
+frag (1, 3): {"m": 1, "warpid": 0, "laneid": 5}
+tmem (17, 130): {"TCol": 130, "TLane": 17}
+linear (1, 3): {"m": 19}
+frag laneid: 5
+frag warpid: 0
+frag m: 1
+tmem TLane: 17
+tmem TCol: 130
+linear m: 19
+```
+
+本机运行边界：
+
+```text
+可以运行: TileLayout 构造、axis 查询、apply() 坐标计算
+不能运行: 需要 Blackwell TMEM / tcgen05 硬件执行的 kernel
+```
+
+### 自测题
+
+#### 1. 为什么 `laneid=5` 和 `TLane=5` 不是同一个位置？
+
+答：`laneid` 是 warp 内执行 thread 的坐标，`TLane` 是 TMEM
+存储 Lane 的坐标。二者属于不同坐标空间，只有 axis 名称相同才表示同一位置。
+
+#### 2. `m` 表示 global memory address 吗？
+
+答：不一定。`m` 是默认线性物理轴；具体含义由 buffer scope 决定：
+
+```text
+global  -> 线性 element 下标
+shared  -> shared memory 线性 element 下标
+register-backed local -> 当前 thread 的局部 slot
+```
+
+#### 3. 同一个 `laneid` 在 shard 中出现两次，应该相加还是覆盖？
+
+答：相加。每个 iter 都产生一个贡献：
+
+```text
+laneid = c_first * stride_first + c_second * stride_second
+```
+
+当前例子中：
+
+```text
+laneid = 1 * 4 + 1 * 1 = 5
+```
+
+#### 4. fp16 的 `TCol=3` 能不能直接当作 hardware Col 3？
+
+答：不能。fp16 每个 32-bit hardware Col 容纳 2 个元素，因此：
+
+```text
+hardware_col = TCol // 2
+```
+
+`TCol=3` 位于 hardware Col 1 中。
+
+#### 5. 逻辑坐标 `(1, 3)` 在 `S[(8, 16) : (16@m, 1@m)]` 中得到的 `m` 是多少？
+
+答：
+
+```text
+m = 1 * 16 + 3 * 1 = 19
+```
+
+## 十二、当前进度
 
 `chapter_tirx_layout_api` 的知识点：
 
 ```text
 [x] TileLayout 的 S[...]、R[...] 与 offset
-[ ] 命名轴：laneid / warpid / m / TLane / TCol
+[x] 命名轴：laneid / warpid / m / TLane / TCol
 [ ] apply() 的三种输入形式与 flatten / decompose
 [ ] TMEM accumulator layout 示例
 [ ] scale-factor layout 中的 replication
@@ -678,11 +1149,19 @@ apply() 只返回 D(x) + O，不枚举 replica
 layout.shard / layout.replica / layout.offset 暴露三个组成部分
 用 (1, 3)、shape [8, 16] 完整追踪了 flatten、decompose 和坐标合成
 R[2 : 4@warpid] 为示例元素生成 warpid 5 和 9 两个位置
+axis 是坐标空间名称，不同 axis 上的相同整数不是同一物理位置
+laneid 表示 warp 内执行 thread 的 lane ID
+warpid 表示 CTA 内 warp ID，和 warpgroup 内的 wid_in_wg 不同
+m 是默认线性轴，其含义由 global / shared / register-backed local scope 决定
+TLane 表示 TMEM 的硬件 Lane 坐标
+TCol 以 buffer element 为单位，dtype 决定多少个元素打包进 hardware Col
+同一个 axis 的多个 shard iter 贡献必须相加
+用 frag、TMEM 和普通 m layout 对比了三种坐标空间
 ```
 
 下一知识点：
 
 ```text
 chapter_tirx_layout_api
--> 命名轴：laneid / warpid / m / TLane / TCol
+-> apply() 的三种输入形式与 flatten / decompose
 ```
