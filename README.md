@@ -323,6 +323,9 @@ chapter_gemm_basics 第 1 个知识点完成：单 Tile Baseline
 K-loop 按 BLK_K 切分 K，并用 accum=False / True 控制 TMEM 首轮覆写与后续累加
 tcgen05.commit 关联异步 MMA 完成，mbarrier phase 每轮翻转
 chapter_gemm_basics 第 2 个知识点完成：K-Loop 累加与 MMA barrier phase
+spatial tiling 用 M/N 二维 grid 把输出切成多个 CTA-owned tiles
+每个 CTA 以 m_st / n_st 选择 A/B rows 和 D columns，K-loop 与 spatial tiling 正交
+chapter_gemm_basics 第 3 个知识点完成：空间 Tiling（Multi-CTA）
 ```
 
 完整文档索引、当前进度和硬件环境说明见

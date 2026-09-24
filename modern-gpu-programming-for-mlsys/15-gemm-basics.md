@@ -35,7 +35,7 @@ PTX：tcgen05.alloc、tcgen05.mma、tcgen05.commit、tcgen05.ld、mbarrier.try_w
 [x] GEMM 的 shape 约定与 Blackwell 数据路径
 [x] 第 1 步：顺序执行的单 Tile GEMM
 [x] 第 2 步：K-Loop 累加
-[ ] 第 3 步：空间 Tiling（Multi-CTA）
+[x] 第 3 步：空间 Tiling（Multi-CTA）
 ```
 
 ## 一、这一章为什么要先做慢版本
@@ -3439,7 +3439,468 @@ phase ^= 1    -> 把软件期望推进到下一轮 parity
    答：`cta_sync` 只表示相关线程到达同步点，不能证明已发出的异步
    `tcgen05.mma` 已完成，因此也就不能保证 TMEM 结果已经可读。
 
-## 十三、当前进度
+## 十四、第 3 步：空间 Tiling（Multi-CTA）
+
+本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 3 步：空间 Tiling（Multi-CTA）
+知识点：把 M/N 输出空间切成多个 CTA-owned output tiles
+上次：K-Loop 累加与 MMA barrier phase
+下次：chapter_gemm_basics 完成，进入异步搬运与 software pipeline
+PTX：tcgen05.mma、tcgen05.commit、mbarrier.try_wait.parity
+```
+
+### 14.1 为什么 K-loop 还不能覆盖完整 GEMM
+
+第 2 步的 K-loop 解决的是：
+
+```text
+K > BLK_K
+```
+
+但是 `hgemm_v2` 仍然只计算一个 output tile：
+
+```text
+M = 128
+N = 128
+```
+
+如果实际问题是：
+
+```text
+M = 256
+N = 256
+K = 128
+```
+
+那么 `D` 一共有 `256 x 256` 个元素。一个 `128 x 128` output tile 只能
+覆盖其中四分之一。此时不能靠 K-loop 解决，因为 K-loop 改变的是
+contraction 维度的遍历方式，不改变输出 tile 的数量。
+
+两种切分是正交的：
+
+| 机制 | 切分的维度 | 作用 |
+|---|---|---|
+| K-loop | K | 把多个 partial sum 累加到同一个 output tile |
+| Spatial tiling | M/N | 用多个 CTA 计算不同的 output tile |
+
+一个帮助记忆的图：
+
+```text
+              N
+        +--------+--------+
+        | CTA    | CTA    |
+        | (0, 0) | (0, 1) |
+   M    +--------+--------+
+        | CTA    | CTA    |
+        | (1, 0) | (1, 1) |
+        +--------+--------+
+
+每个 CTA 内部:
+    K = 0..127
+    -> K-loop 产生并累加 partial sums
+```
+
+### 14.2 CTA tile 的坐标和偏移
+
+课程代码使用的逻辑 grid 是：
+
+```python
+bx, by = T.cta_id([M // BLK_M, N // BLK_N])
+```
+
+这里：
+
+```text
+bx:
+    M 方向的 output tile 编号
+
+by:
+    N 方向的 output tile 编号
+```
+
+当前 CTA 的全局起点是：
+
+```text
+m_st = bx * BLK_M
+n_st = by * BLK_N
+```
+
+它负责的 output region 是：
+
+```text
+D[
+    m_st : m_st + BLK_M,
+    n_st : n_st + BLK_N,
+]
+```
+
+它读取的 A/B tile 是：
+
+```text
+A[
+    m_st : m_st + BLK_M,
+    i * BLK_K : (i + 1) * BLK_K,
+]
+
+B[
+    n_st : n_st + BLK_N,
+    i * BLK_K : (i + 1) * BLK_K,
+]
+```
+
+因为题目约定是：
+
+```text
+D = A @ B^T
+```
+
+所以 B 的 column 数量是 `N`，而 B 的 contraction 维度同样是 `K`。B 的
+`n_st` 对应 output 的 column 起点。
+
+### 14.3 `hgemm_v3` 的四个关键位置
+
+完整 kernel 在 `11.2`。下面只标出 spatial tiling 必需的四个位置。
+
+第一，生成 M/N 二维 grid：
+
+```python
+bx, by = T.cta_id([M // BLK_M, N // BLK_N])
+```
+
+第二，计算当前 CTA 的全局 tile offset：
+
+```python
+m_st = T.meta_var(bx * BLK_M)
+n_st = T.meta_var(by * BLK_N)
+```
+
+`T.meta_var` 只把这些值绑定成 parser-time 表达式别名，不额外生成运行期
+赋值指令。
+
+第三，A/B load 使用各自的 offset：
+
+```python
+Tx.cta.copy(
+    Asmem[:, :],
+    A[
+        m_st : m_st + BLK_M,
+        i * BLK_K : (i + 1) * BLK_K,
+    ],
+)
+Tx.cta.copy(
+    Bsmem[:, :],
+    B[
+        n_st : n_st + BLK_N,
+        i * BLK_K : (i + 1) * BLK_K,
+    ],
+)
+```
+
+第四，writeback 同时使用 `m_st` 和 `n_st`：
+
+```python
+m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+Tx.copy(
+    D[m_thr, n_st : n_st + BLK_N],
+    Dreg_f16[:],
+)
+```
+
+`m_thr` 选择 output row，`n_st + 0 .. n_st + BLK_N - 1` 选择 output
+columns。只修改 load 而忘记修改 writeback，会让多个 CTA 计算正确但写到
+同一个位置，最终结果仍会错误。
+
+### 14.4 每个 CTA 的完整数据路径
+
+以 `bx=1, by=1` 为例：
+
+```text
+m_st = 128
+n_st = 128
+```
+
+这个 CTA 的数据路径是：
+
+```text
+GMEM A[128:256, i*64:(i+1)*64]
+        |
+        v
+SMEM Asmem
+
+GMEM B[128:256, i*64:(i+1)*64]
+        |
+        v
+SMEM Bsmem
+
+Asmem + Bsmem
+        |
+        v
+当前 CTA 的 tcgen05.mma
+        |
+        v
+当前 CTA 的 TMEM accumulator
+        |
+        v
+registers
+        |
+        v
+GMEM D[128:256, 128:256]
+```
+
+这个 CTA 的 MMA 仍然使用：
+
+```python
+cta_group=1
+```
+
+原因是：spatial grid 中虽然有很多 CTA，但每个 CTA 都独立计算自己的
+output tile。`cta_group=1` 表示每次 `tcgen05.mma` 只使用当前 CTA 的
+SMEM 和 TMEM。它不是“grid 中 CTA 的数量”，也不表示必须把多个 CTA
+配成 pair。
+
+只有当两个相邻 CTA 通过一次 pair-wide MMA 协作计算同一块逻辑 tile 时，
+才需要使用 `cta_group=2`。
+
+### 14.5 一个 CTA 内的线程写回映射
+
+仍然取：
+
+```text
+M = 256
+N = 256
+bx = 1
+by = 1
+BLK_M = BLK_N = 128
+```
+
+则：
+
+```text
+m_st = bx * BLK_M = 1 * 128 = 128
+n_st = by * BLK_N = 1 * 128 = 128
+```
+
+取：
+
+```text
+warp_id = 2
+lane_id = 9
+```
+
+这个 thread 负责的全局 row 是：
+
+```text
+m_thr = m_st + warp_id * 32 + lane_id
+      = 128 + 2 * 32 + 9
+      = 128 + 64 + 9
+      = 201
+```
+
+它写回：
+
+```text
+D[201, 128:256]
+```
+
+在这个 CTA 内：
+
+```text
+row_in_tile = warp_id * 32 + lane_id
+```
+
+128 个 warpgroup threads 分别覆盖：
+
+```text
+row_in_tile = 0..127
+```
+
+再加上：
+
+```text
+m_st = 128
+```
+
+得到全局 rows：
+
+```text
+128..255
+```
+
+### 14.6 完整可运行模拟：覆盖、唯一性和 CTA 映射
+
+下面脚本不需要 GPU，只验证 spatial tiling 的坐标逻辑。它模拟每个 CTA
+负责的 A/B rows、D tile，以及所有 output cells 是否恰好覆盖一次。
+
+文件：`simulate_multi_cta_spatial_tiling.py`
+
+```python
+from __future__ import annotations
+
+
+M = 256
+N = 256
+BLK_M = 128
+BLK_N = 128
+
+GRID_M = M // BLK_M
+GRID_N = N // BLK_N
+
+
+def tile_for(bx: int, by: int) -> dict[str, int]:
+    m_st = bx * BLK_M
+    n_st = by * BLK_N
+    return {
+        "bx": bx,
+        "by": by,
+        "m_st": m_st,
+        "n_st": n_st,
+        "m_end": m_st + BLK_M,
+        "n_end": n_st + BLK_N,
+    }
+
+
+def main() -> None:
+    written_cells: set[tuple[int, int]] = set()
+    tiles: list[dict[str, int]] = []
+
+    for by in range(GRID_N):
+        for bx in range(GRID_M):
+            tile = tile_for(bx, by)
+            tiles.append(tile)
+
+            print(
+                f"bx={bx}, by={by}: "
+                f"A rows=[{tile['m_st']},{tile['m_end']}), "
+                f"B rows=[{tile['n_st']},{tile['n_end']}), "
+                f"D rows=[{tile['m_st']},{tile['m_end']}), "
+                f"D cols=[{tile['n_st']},{tile['n_end']})"
+            )
+
+            for row in range(tile["m_st"], tile["m_end"]):
+                for col in range(tile["n_st"], tile["n_end"]):
+                    assert (row, col) not in written_cells
+                    written_cells.add((row, col))
+
+    expected_cells = M * N
+    print(f"tile_count={len(tiles)}")
+    print(f"distinct_output_cells={len(written_cells)}")
+    print(f"expected_output_cells={expected_cells}")
+    print(f"coverage_ok={len(written_cells) == expected_cells}")
+
+    target = tile_for(1, 1)
+    assert target["m_st"] == 128
+    assert target["n_st"] == 128
+    assert len(tiles) == 4
+    assert len(written_cells) == expected_cells
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python3 simulate_multi_cta_spatial_tiling.py
+```
+
+预期输出：
+
+```text
+bx=0, by=0: A rows=[0,128), B rows=[0,128), D rows=[0,128), D cols=[0,128)
+bx=1, by=0: A rows=[128,256), B rows=[0,128), D rows=[128,256), D cols=[0,128)
+bx=0, by=1: A rows=[0,128), B rows=[128,256), D rows=[0,128), D cols=[128,256)
+bx=1, by=1: A rows=[128,256), B rows=[128,256), D rows=[128,256), D cols=[128,256)
+tile_count=4
+distinct_output_cells=65536
+expected_output_cells=65536
+coverage_ok=True
+```
+
+这个结果说明：
+
+```text
+4 个 CTA
+每个 CTA 计算 128 x 128
+总覆盖 256 x 256
+没有重复写同一个 output cell
+```
+
+当前机器没有 Blackwell GPU，因此这里验证的是 Python 映射和静态代码逻辑，
+不是 `tcgen05.mma` 的真实运行结果。
+
+### 14.7 为什么 spatial tiling 适合推理负载
+
+在一个 Linear 或 projection GEMM 中，可以把维度理解为：
+
+```text
+M: batch * sequence tokens
+N: output channels
+K: input channels 或 hidden size
+```
+
+M/N spatial tiling 的作用是增加并行工作单元：
+
+```text
+更多 CTA tiles
+-> 填满更多 SM
+-> 降低单个 CTA 需要串行处理的 output 数量
+```
+
+K-loop 则留在每个 CTA 内部，负责完成完整的 contraction：
+
+```text
+CTA 负责一个 output tile
+    for K tile in K_TILES:
+        load A/B chunk
+        MMA
+        wait completion
+```
+
+所以 spatial tiling 改变的是“谁负责哪一块输出”，K-loop 改变的是
+“一块输出如何沿 K 累加”。
+
+### 14.8 常见错误和症状
+
+| 错误 | 发生原因 | 可观察症状 |
+|---|---|---|
+| 把 `bx` 和 `by` 互换 | M/N 方向映射颠倒 | tile 数量可能正确，但 D 的 tile 被转置式覆盖 |
+| A load 漏掉 `m_st` | 所有 M 方向 CTA 读取相同 A rows | 大矩阵的多行结果重复或错误 |
+| B load 漏掉 `n_st` | 所有 N 方向 CTA 读取相同 B rows | 大矩阵的多列结果重复或错误 |
+| load 有 offset，writeback 没有 | 计算与写回目标不一致 | 多个 CTA 覆盖同一 output tile，最终结果被覆盖 |
+| writeback 只有 `m_st`，漏掉 `n_st` | output columns 总从 0 开始 | rows 可能正确，但所有 CTA 写到第一组 columns |
+| grid 使用 `K // BLK_K` | 把 contraction 和 output tiling 混淆 | tile 数量与 M/N 不匹配，部分 D 没有 CTA 负责 |
+| 多个 CTA 共享同一个 TMEM accumulator | 把跨 CTA 调度误解为共享 TMEM | 必然发生竞争或错误结果；TMEM 是 CTA-scoped |
+| 以为多 CTA 就应写 `cta_group=2` | 混淆独立 CTA 与 CTA-pair MMA | scope 契约错误，资源访问与完成协议可能不匹配 |
+| 没有 M/N tail 处理 | 使用非整除 `M` 或 `N` | 最后一个 tile 越界，或边界 output 不完整 |
+| 假设 CTA 执行顺序固定 | 依赖某个 tile 先完成 | 结果不稳定；正确性不该依赖 CTA 间执行顺序 |
+
+### 14.9 自测
+
+1. K-loop 和 spatial tiling 分别切分哪个维度？
+   答：K-loop 切分 K，并累加到同一个 output tile；spatial tiling 切分
+   M/N，让不同 CTA 负责不同 output tile。
+
+2. `M=384, N=128, BLK_M=BLK_N=128` 时 grid 是多少？
+   答：`[384 / 128, 128 / 128] = [3, 1]`，一共 3 个 CTA tile。
+
+3. `bx=2, by=0` 且 `BLK_M=128` 时，`m_st` 和 `n_st` 是多少？
+   答：`m_st = 2 * 128 = 256`，`n_st = 0 * 128 = 0`。
+
+4. 为什么 A load 使用 `m_st`，而 B load 使用 `n_st`？
+   答：A 的 first dimension 对应 output M，B 的 first dimension 对应
+   output N；它们分别决定当前 CTA 读取哪个 M tile 和 N tile。
+
+5. 为什么 multi-CTA grid 不意味着必须使用 `cta_group=2`？
+   答：每个 CTA 仍可独立计算自己的 output tile，使用自己的 SMEM 和
+   TMEM，因此协议仍是 `cta_group=1`；只有两个 CTA 协作执行同一次
+   pair-wide MMA 时才需要 `cta_group=2`。
+
+## 十五、当前进度
 
 `chapter_gemm_basics` 的知识点：
 
@@ -3447,10 +3908,10 @@ phase ^= 1    -> 把软件期望推进到下一轮 parity
 [x] GEMM 的 shape 约定与 Blackwell 数据路径
 [x] 第 1 步：顺序执行的单 Tile GEMM
 [x] 第 2 步：K-Loop 累加
-[ ] 第 3 步：空间 Tiling（Multi-CTA）
+[x] 第 3 步：空间 Tiling（Multi-CTA）
 ```
 
-本章第 1、2 步已经覆盖：
+本章第 1、2、3 步已经覆盖：
 
 ```text
 GEMM 使用 A(M,K)、B(N,K)、D(M,N)，计算 D = A * B^T
@@ -3495,11 +3956,20 @@ mbarrier.try_wait 等待指定 phase 完成，phase_mma 每轮翻转一次
 cta_sync 保护 SMEM load 交接，不能替代 TMEM MMA 完成等待
 serial K-loop 在等待本轮 MMA 完成后才进入下一轮 SMEM 复用
 chapter_gemm_basics 第 2 个知识点完成：K-Loop 累加与 MMA barrier phase
+spatial tiling 用 M/N 二维 grid 把输出切成多个 CTA-owned tiles
+m_st = bx * BLK_M，n_st = by * BLK_N
+A load 使用 m_st，B load 使用 n_st
+writeback 必须同时使用 m_st 和 n_st
+K-loop 与 spatial tiling 是两个正交维度
+每个 spatial CTA 仍可用 cta_group=1 独立使用自己的 SMEM 与 TMEM
+多个 CTA 的 output tiles 必须互不重叠，正确性不依赖执行顺序
+chapter_gemm_basics 第 3 个知识点完成：空间 Tiling（Multi-CTA）
 ```
 
 下一知识点：
 
 ```text
-chapter_gemm_basics
--> 第 3 步：空间 Tiling（Multi-CTA）
+chapter_gemm_basics 完成
+-> 异步搬运与 software pipeline
+-> TMA、多 stage 与 warp specialization
 ```
