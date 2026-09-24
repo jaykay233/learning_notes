@@ -29,6 +29,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
 | [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica、`tmem_datapath_layout` 的 D/F row mapping、`tcgen05_atom_layout` 的 atom / rep / register mapping、`wg_local_layout` 的 warpgroup row-to-thread mapping，以及 `ComposeLayout` 与 shared-memory XOR swizzle |
 | [15-gemm-basics.md](15-gemm-basics.md) | Tiled GEMM 的优化路线、`D = A * B^T` 约定、Blackwell 四段数据路径、单 tile baseline、`hgemm_v1` 完整代码、`D[73,91]` 的 TMEM 与 thread 映射、`hgemm_v2/v3` 的 K-loop 与 Multi-CTA spatial tiling，以及 `accum` 首轮覆写、后续累加、mbarrier phase 协议和 CTA tile 覆盖验证 |
+| [16-gemm-async-tma.md](16-gemm-async-tma.md) | `hgemm_v4` 的单线程 TMA Load、`mbarrier.arrive.expect_tx`、32768-byte transaction trace、`try_wait` phase 协议、`fence.proxy_async`、TMA Store `commit_group` / `wait_group(0)` 与完整验证脚本 |
 
 ## 当前进度
 
@@ -249,6 +250,12 @@ m_st = bx * BLK_M，n_st = by * BLK_N，A/B load 与 writeback 必须一致使�
 K-loop 与 spatial tiling 分别切分 K 和 M/N，二者是正交关系
 multi-CTA grid 中每个 CTA 仍可用 cta_group=1 独立计算自己的 output tile
 chapter_gemm_basics 第 3 个知识点完成：空间 Tiling（Multi-CTA）
+TMA 用单线程提交整块 A/B tile，TMA engine 负责实际搬运
+mbarrier 同时跟踪 thread arrival 与 TMA pending transaction bytes
+arrive.expect_tx(32768) 登记 A/B 两个 16384-byte fp16 tiles
+try_wait 必须等待当前 phase，完成后 phase_tma 每轮翻转
+Step 4 仍立即等待 TMA，因此还没有真正 overlap Load 与 Compute
+chapter_gemm_async 第 4 步完成：TMA Async Load
 ```
 
 ## 下一知识点
@@ -258,7 +265,8 @@ chapter_tirx_layout_api 完成
 -> chapter_gemm_basics 第 1 步完成
 -> chapter_gemm_basics 第 2 步完成：K-Loop 累加与 MMA barrier phase
 -> chapter_gemm_basics 第 3 步完成：空间 Tiling（Multi-CTA）
--> 异步搬运与 software pipeline
+-> chapter_gemm_async 第 4 步完成：TMA Async Load
+-> chapter_gemm_async 第 5 步：Software Pipeline（PIPE_DEPTH=2）
 ```
 
 ## 核心主线

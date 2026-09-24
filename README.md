@@ -51,7 +51,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 12-clc-dynamic-scheduling.md
 ├── 13-tirx-first-kernel.md
 ├── 14-tirx-layout-api.md
-└── 15-gemm-basics.md
+├── 15-gemm-basics.md
+└── 16-gemm-async-tma.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -201,7 +202,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-15：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-16：
 
 ```text
 layout / named axes / replication / offset
@@ -326,6 +327,11 @@ chapter_gemm_basics 第 2 个知识点完成：K-Loop 累加与 MMA barrier phas
 spatial tiling 用 M/N 二维 grid 把输出切成多个 CTA-owned tiles
 每个 CTA 以 m_st / n_st 选择 A/B rows 和 D columns，K-loop 与 spatial tiling 正交
 chapter_gemm_basics 第 3 个知识点完成：空间 Tiling（Multi-CTA）
+hgemm_v4 用单线程 TMA 替换 CTA 协作的 A/B load
+mbarrier.arrive.expect_tx 同时登记 thread arrival 与 32768 transaction bytes
+try_wait 等待 TMA A/B tiles 全部到达后才能启动 MMA
+Step 4 仍立即等待 TMA，真正的 Load / Compute overlap 留到后续 pipeline
+chapter_gemm_async 第 4 步完成：TMA Async Load
 ```
 
 完整文档索引、当前进度和硬件环境说明见
