@@ -4090,7 +4090,188 @@ CTA 负责一个 output tile
    TMEM，因此协议仍是 `cta_group=1`；只有两个 CTA 协作执行同一次
    pair-wide MMA 时才需要 `cta_group=2`。
 
-## 十五、当前进度
+## 十五、补充：`cta_sync` 的同步范围
+
+本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 3 步：空间 Tiling（Multi-CTA）
+知识点：cta_sync 只同步当前 CTA 内的线程，不跨 CTA
+上次：multi-CTA spatial tiling 的 CTA-owned output tiles
+下次：chapter_gemm_basics 完成，进入异步搬运与 software pipeline
+PTX：bar.sync；对比 barrier.cluster / cluster barrier
+```
+
+### 15.1 问题：多个 CTA 时，`cta_sync` 会不会等别的 CTA
+
+不会。
+
+```text
+T.cuda.cta_sync()
+    -> 只同步当前 CTA（thread block）内的线程
+    -> 不会等待 grid 中的其他 CTA
+    -> 也不会因为两个 CTA 属于同一个 cluster 就自动跨 CTA 同步
+```
+
+这里的 CTA 是 CUDA 的 thread block，不是多个 block 组成的 cluster。
+每个 CTA 都有自己独立的 barrier 状态；CTA0 的 barrier 0 与 CTA1 的
+barrier 0 是两个不同的硬件同步对象。
+
+因此下面这段代码的含义是：
+
+```python
+for i in T.serial(K_TILES):
+    Tx.cta.copy(
+        Asmem[:, :],
+        A[m_st : m_st + BLK_M, i * BLK_K : (i + 1) * BLK_K],
+    )
+    Tx.cta.copy(
+        Bsmem[:, :],
+        B[n_st : n_st + BLK_N, i * BLK_K : (i + 1) * BLK_K],
+    )
+
+    T.cuda.cta_sync()
+
+    if warp_id == 0:
+        if T.ptx.elect_sync():
+            Tx.gemm_async(
+                tmem[:, :BLK_N],
+                Asmem[:, :],
+                Bsmem[:, :],
+                accum=(i != 0),
+                dispatch="tcgen05",
+                cta_group=1,
+            )
+```
+
+它保证：
+
+```text
+当前这个 CTA 内，参与 copy 的 threads 都已经到达 cta_sync
+-> 当前 CTA 的 MMA issuer 才能继续
+```
+
+它不保证：
+
+```text
+其他 CTA 也已经完成自己的 copy
+```
+
+### 15.2 三种容易混淆的同步范围
+
+| 同步机制 | 谁必须到达，才能继续 | 能否跨 CTA |
+|---|---|---|
+| warp sync | 指定 warp 内的 lanes | 不能 |
+| `cta_sync` / `__syncthreads()` / `bar.sync 0` | 当前 CTA 内参与同步的 threads | 不能 |
+| cluster sync / cluster barrier | 当前 cluster 内参与同步的 CTAs | 能 |
+
+`cta_group::2` 不是普通的跨 CTA barrier。它表示某条 tensor-core
+operation 可以由两个 CTA 作为一组共同执行；围绕这次 pair-wide operation
+的数据交接和完成通知，仍然需要正确的 cluster-scope 或 mbarrier 协议。
+
+再区分一次 mbarrier 的范围：
+
+```text
+mbarrier 位于当前 CTA 的 shared memory
+    -> 当前 CTA 的 threads 可以通过 arrive/wait 观察它
+
+mbarrier 位于 peer CTA 的 distributed shared memory
+    -> 在 DSMEM 和 cluster 机制允许时，可以跨 CTA 做 arrive/wait
+```
+
+所以不是“mbarrier 天然一定跨 CTA”，而是“mbarrier 放在哪里、谁能访问它，
+决定这次同步覆盖谁”。
+
+### 15.3 具体时间线：CTA0 不会等 CTA1
+
+假设两个 CTA 都执行相同代码：
+
+```text
+CTA(0, 0) 的 128 个 threads 在 t=20 全部到达 cta_sync
+CTA(1, 0) 的 128 个 threads 在 t=40 全部到达 cta_sync
+```
+
+执行结果是：
+
+| CTA | 自己的 load/producer 全部到达 | 自己的 barrier 被释放 | 是否等待另一个 CTA |
+|---|---:|---:|---|
+| CTA(0, 0) | t=20 | t=20 | 否 |
+| CTA(1, 0) | t=40 | t=40 | 否 |
+
+CTA(0, 0) 可以在 t=20 继续发 MMA，即使 CTA(1, 0) 的 load 还没有完成。
+
+这在 `hgemm_v3` 中是正确的，因为不同 CTA 计算不同 output tile：
+
+```text
+CTA(0, 0):
+    A rows [0, 128)
+    B rows [0, 128)
+    D tile [0, 128) x [0, 128)
+
+CTA(1, 0):
+    A rows [128, 256)
+    B rows [0, 128)
+    D tile [128, 256) x [0, 128)
+```
+
+两者没有通过 SMEM 或 TMEM 交换中间结果，所以不需要跨 CTA 同步，也不应该
+为了让两个 CTA“一起继续”而把 `cta_sync` 当成 cluster barrier。
+
+### 15.4 什么时候必须使用跨 CTA 同步
+
+只有两个 CTA 之间真的存在数据依赖或资源交接时才需要，例如：
+
+```text
+CTA0 写入 DSMEM
+CTA1 读取 CTA0 的 DSMEM
+```
+
+此时 CTA0 自己的 `cta_sync` 只能证明 CTA0 内部写完，不能证明 CTA1 已经
+到达读取点；CTA1 自己的 `cta_sync` 也不能等待 CTA0 的 producer。
+需要 cluster-scope barrier，或者使用双方都能访问的 mbarrier 建立
+producer/consumer 协议。
+
+### 15.5 常见错误和可观察症状
+
+| 错误 | 实际后果 | 可观察症状 |
+|---|---|---|
+| 以为 `cta_sync` 会等 grid 中所有 CTA | CTA 提前继续 | 跨 CTA 数据未就绪时出现随机错误或旧值 |
+| 把 `cta_group::2` 当作跨 CTA barrier | 缺少 cluster 级 handoff | pair-wide MMA 读到未完成或不可见的 peer 数据 |
+| 用 `cta_sync` 代替 `tcgen05.wait::ld` | thread 到达不等于 TMEM load 完成 | registers 中仍可能是未完成数据 |
+| 用 `cta_sync` 代替 MMA barrier wait | CTA 线程可能都到了，但异步 MMA 尚未完成 | 过早读取 TMEM，得到不完整结果 |
+| 只在部分 thread 的分支里执行 CTA barrier | 其他线程可能永远到不了同一 barrier | kernel 卡住或行为未定义 |
+
+最简判断规则：
+
+```text
+同步对象在“一个 CTA 内” -> cta_sync
+同步对象跨 cluster 内的多个 CTA -> cluster barrier / cluster-scope mbarrier
+等待异步 MMA / async load 完成 -> 对应操作的 wait 协议
+```
+
+### 15.6 自测
+
+1. `T.cuda.cta_sync()` 会同步 CTA0 和 CTA1 吗？
+   答：不会。它只同步执行该语句的当前 CTA 内的线程。
+
+2. CTA0 在 load 后执行 `cta_sync`，能否保证 CTA1 的 load 也完成？
+   答：不能。CTA0 和 CTA1 各自有自己的 CTA barrier。
+
+3. `hgemm_v3` 中为什么只使用 `cta_sync` 仍然正确？
+   答：因为每个 CTA 独立加载自己的 A/B tile、计算并写回自己的 output
+   tile，CTA 之间没有共享的中间数据依赖。
+
+4. 如果 CTA1 要读取 CTA0 写入的 DSMEM，应该用什么同步？
+   答：应使用 cluster-scope 同步，或者双方都可访问的 mbarrier 建立
+   producer/consumer 协议；不能只靠各自的 `cta_sync`。
+
+5. `cta_group::2` 是否等于两个 CTA 的 `cta_sync` 组合？
+   答：不等于。它描述 pair-wide tensor-core operation 的 scope，不是
+   代替 cluster barrier 的通用同步原语。
+
+## 十六、当前进度
 
 `chapter_gemm_basics` 的知识点：
 
@@ -4099,6 +4280,7 @@ CTA 负责一个 output tile
 [x] 第 1 步：顺序执行的单 Tile GEMM
 [x] 第 2 步：K-Loop 累加
 [x] 第 3 步：空间 Tiling（Multi-CTA）
+[x] 补充：cta_sync 的同步范围
 ```
 
 本章第 1、2、3 步已经覆盖：
@@ -4154,6 +4336,10 @@ K-loop 与 spatial tiling 是两个正交维度
 每个 spatial CTA 仍可用 cta_group=1 独立使用自己的 SMEM 与 TMEM
 多个 CTA 的 output tiles 必须互不重叠，正确性不依赖执行顺序
 chapter_gemm_basics 第 3 个知识点完成：空间 Tiling（Multi-CTA）
+cta_sync 只同步当前 CTA 内的线程，不同 CTA 的 barrier 实例互相独立
+multi-CTA 本身不会让 cta_sync 变成 cluster-scope barrier
+只有 CTA 间存在 DSMEM 或资源交接时，才需要 cluster-scope 同步
+cta_group=2 描述 pair-wide MMA 的执行范围，不是通用的跨 CTA barrier
 ```
 
 下一知识点：
