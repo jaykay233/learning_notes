@@ -3563,7 +3563,197 @@ D = A @ B^T
 
 ### 14.3 `hgemm_v3` 的四个关键位置
 
-完整 kernel 在 `11.2`。下面只标出 spatial tiling 必需的四个位置。
+下面先给出完整的 `hgemm_v3`，再把 spatial tiling 的四个关键位置单独
+拆出来。完整 imports 如下：
+
+```python
+import tvm
+from tvm.script import tirx as T
+from tvm.script.tirx import tile as Tx
+from tvm.backend.cuda.tile_primitive.tma_utils import (
+    mma_shared_layout,
+    SwizzleMode,
+)
+from tvm.tirx.layout import TileLayout, S, TLane, TCol, tid_in_wg
+```
+
+完整函数如下：
+
+```python
+def hgemm_v3(M, N, K):
+    a_type = tvm.DataType("float16")
+    b_type = tvm.DataType("float16")
+    d_type = tvm.DataType("float16")
+    acc_type = tvm.DataType("float32")
+
+    BLK_M, BLK_N, BLK_K = 128, 128, 64
+    K_TILES = K // BLK_K
+
+    A_layout = mma_shared_layout(
+        a_type,
+        SwizzleMode.SWIZZLE_128B_ATOM,
+        (BLK_M, BLK_K),
+    )
+    B_layout = mma_shared_layout(
+        b_type,
+        SwizzleMode.SWIZZLE_128B_ATOM,
+        (BLK_N, BLK_K),
+    )
+
+    @T.prim_func
+    def kernel(
+        A: T.Buffer((M, K), a_type),
+        B: T.Buffer((N, K), b_type),
+        D: T.Buffer((M, N), d_type),
+    ):
+        T.device_entry()
+
+        bx, by = T.cta_id([M // BLK_M, N // BLK_N])
+        wg_id = T.warpgroup_id([1])
+        warp_id = T.warp_id_in_wg([4])
+        lane_id = T.lane_id([32])
+
+        pool = T.SMEMPool()
+        tmem_addr = pool.alloc((1,), "uint32")
+        mma_bar = pool.alloc((1,), "uint64", align=8)
+        pool.move_base_to(1024)
+        Asmem = pool.alloc(
+            (BLK_M, BLK_K),
+            a_type,
+            layout=A_layout,
+        )
+        Bsmem = pool.alloc(
+            (BLK_N, BLK_K),
+            b_type,
+            layout=B_layout,
+        )
+        pool.commit()
+
+        if warp_id == 0:
+            if lane_id == 0:
+                T.ptx.mbarrier.init(mma_bar.ptr_to([0]), 1)
+            T.ptx.tcgen05.alloc(
+                T.address_of(tmem_addr),
+                n_cols=512,
+                cta_group=1,
+            )
+
+        T.ptx.fence.proxy_async("shared::cta")
+        T.ptx.fence.mbarrier_init()
+        T.cuda.cta_sync()
+
+        tmem = T.decl_buffer(
+            (128, 512),
+            "float32",
+            scope="tmem",
+            allocated_addr=tmem_addr[0],
+            layout=TileLayout(
+                S[(128, 512) : (1 @ TLane, 1 @ TCol)]
+            ),
+        )
+
+        phase_mma: T.int32 = 0
+        m_st = T.meta_var(bx * BLK_M)
+        n_st = T.meta_var(by * BLK_N)
+
+        for i in T.serial(K_TILES):
+            Tx.cta.copy(
+                Asmem[:, :],
+                A[
+                    m_st : m_st + BLK_M,
+                    i * BLK_K : (i + 1) * BLK_K,
+                ],
+            )
+            Tx.cta.copy(
+                Bsmem[:, :],
+                B[
+                    n_st : n_st + BLK_N,
+                    i * BLK_K : (i + 1) * BLK_K,
+                ],
+            )
+
+            T.cuda.cta_sync()
+
+            if warp_id == 0:
+                if T.ptx.elect_sync():
+                    Tx.gemm_async(
+                        tmem[:, :BLK_N],
+                        Asmem[:, :],
+                        Bsmem[:, :],
+                        accum=(i != 0),
+                        dispatch="tcgen05",
+                        cta_group=1,
+                    )
+                    T.ptx.tcgen05.commit(
+                        mma_bar.ptr_to([0]),
+                        cta_group=1,
+                    )
+
+            T.ptx.mbarrier.try_wait(
+                mma_bar.ptr_to([0]),
+                phase_mma,
+            )
+            phase_mma ^= 1
+
+        Dreg = T.alloc_local((BLK_N,), acc_type)
+        Dreg_f16 = T.alloc_local((BLK_N,), d_type)
+        Dreg_wg = Dreg.view(
+            128,
+            BLK_N,
+            layout=TileLayout(
+                S[(128, BLK_N) : (1 @ tid_in_wg, 1)]
+            ),
+        )
+
+        Tx.wg.copy_async(Dreg_wg[:, :], tmem[:, :BLK_N])
+        T.ptx.tcgen05.wait.ld()
+        Tx.cast(Dreg_f16[:], Dreg[:])
+
+        m_thr = T.meta_var(m_st + warp_id * 32 + lane_id)
+        Tx.copy(
+            D[m_thr, n_st : n_st + BLK_N],
+            Dreg_f16[:],
+        )
+
+        T.cuda.cta_sync()
+        if warp_id == 0:
+            T.ptx.tcgen05.relinquish_alloc_permit(cta_group=1)
+            T.ptx.tcgen05.dealloc(
+                tmem_addr[0],
+                n_cols=512,
+                cta_group=1,
+            )
+
+    return kernel
+```
+
+构造一个 `256 x 256 x 128` 的 kernel：
+
+```python
+kernel_v3 = hgemm_v3(256, 256, 128)
+print(type(kernel_v3))
+```
+
+在当前机器上，这里可以做 TIRx 构造和静态 IR 检查，但不能执行
+`tcgen05.mma`，因为本地没有 Blackwell GPU。实际 GPU 运行还需要：
+
+```text
+Blackwell SM100 GPU
+TIRx lowering
+CUDA driver / runtime
+PyTorch 或等价 tensor 输入
+```
+
+合法 shape 边界：
+
+```text
+M % 128 == 0
+N % 128 == 0
+K >= 64
+K % 64 == 0
+```
+
+下面再把 spatial tiling 必需的四个位置单独拆出来。
 
 第一，生成 M/N 二维 grid：
 
