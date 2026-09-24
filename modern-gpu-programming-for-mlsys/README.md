@@ -30,6 +30,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica、`tmem_datapath_layout` 的 D/F row mapping、`tcgen05_atom_layout` 的 atom / rep / register mapping、`wg_local_layout` 的 warpgroup row-to-thread mapping，以及 `ComposeLayout` 与 shared-memory XOR swizzle |
 | [15-gemm-basics.md](15-gemm-basics.md) | Tiled GEMM 的优化路线、`D = A * B^T` 约定、Blackwell 四段数据路径、单 tile baseline、`hgemm_v1` 完整代码、`D[73,91]` 的 TMEM 与 thread 映射、`hgemm_v2/v3` 的 K-loop 与 Multi-CTA spatial tiling，以及 `accum` 首轮覆写、后续累加、mbarrier phase 协议和 CTA tile 覆盖验证 |
 | [16-gemm-async-tma.md](16-gemm-async-tma.md) | `hgemm_v4` 的单线程 TMA Load、`mbarrier.arrive.expect_tx`、32768-byte transaction trace、`try_wait` phase 协议、`fence.proxy_async`、TMA Store `commit_group` / `wait_group(0)` 与完整验证脚本 |
+| [17-gemm-software-pipeline.md](17-gemm-software-pipeline.md) | `hgemm_v5` 的 `PIPE_DEPTH=2` 双缓冲、prologue prefetch、stage ring、每 stage 独立 TMA barrier、`phase_tma` / `phase_mma` 翻转规则，以及 `K_TILES=5` 的完整执行 trace |
 
 ## 当前进度
 
@@ -256,6 +257,13 @@ arrive.expect_tx(32768) 登记 A/B 两个 16384-byte fp16 tiles
 try_wait 必须等待当前 phase，完成后 phase_tma 每轮翻转
 Step 4 仍立即等待 TMA，因此还没有真正 overlap Load 与 Compute
 chapter_gemm_async 第 4 步完成：TMA Async Load
+hgemm_v5 为 A/B 增加 PIPE_DEPTH=2 的 SMEM ring buffer
+prologue 预取前两个 stages，main loop 用 stage = k % PIPE_DEPTH 复用 slot
+每个 stage 使用独立 tma_bar，phase_tma 在 ring wrap 时翻转
+MMA 仍共用一个 tmem accumulator 和 mma_bar，phase_mma 每轮翻转
+回填前必须等待 MMA 完成，避免覆盖尚未消费的 operand stage
+Step 5 已建立 prefetch 与部分异步重叠，但完整 producer / consumer 分工留到 Step 7
+chapter_gemm_async 第 5 步完成：Software Pipeline（PIPE_DEPTH=2）
 ```
 
 ## 下一知识点
@@ -266,7 +274,8 @@ chapter_tirx_layout_api 完成
 -> chapter_gemm_basics 第 2 步完成：K-Loop 累加与 MMA barrier phase
 -> chapter_gemm_basics 第 3 步完成：空间 Tiling（Multi-CTA）
 -> chapter_gemm_async 第 4 步完成：TMA Async Load
--> chapter_gemm_async 第 5 步：Software Pipeline（PIPE_DEPTH=2）
+-> chapter_gemm_async 第 5 步完成：Software Pipeline（PIPE_DEPTH=2）
+-> chapter_gemm_async 第 6 步：Persistent Kernel + Tile Scheduler
 ```
 
 ## 核心主线
