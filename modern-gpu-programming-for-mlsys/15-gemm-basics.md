@@ -34,7 +34,7 @@ PTX：tcgen05.alloc、tcgen05.mma、tcgen05.commit、tcgen05.ld、mbarrier.try_w
 ```text
 [x] GEMM 的 shape 约定与 Blackwell 数据路径
 [x] 第 1 步：顺序执行的单 Tile GEMM
-[ ] 第 2 步：K-Loop 累加
+[x] 第 2 步：K-Loop 累加
 [ ] 第 3 步：空间 Tiling（Multi-CTA）
 ```
 
@@ -3059,18 +3059,398 @@ v3 writeback: D[201, 128:256]
    答：Spatial tiling 改变的是每个 CTA 读取和写回的全局地址；在一个 CTA
    内部，K 累加和 TMEM accumulator 的生命周期没有改变。
 
-## 十二、当前进度
+## 十二、第 2 步：K-Loop 累加与 MMA barrier phase
+
+本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_gemm_basics
+小节：第 2 步：K-Loop 累加与 MMA barrier phase
+知识点：accum 的首轮覆写、后续累加与 mbarrier phase 翻转
+上次：hgemm_v2 与 hgemm_v3 的区别
+下次：第 3 步：空间 Tiling（Multi-CTA）
+PTX：tcgen05.mma、tcgen05.commit、mbarrier.try_wait.parity
+```
+
+### 12.1 这一小步解决的问题
+
+第 1 步的 tile baseline 一次只计算：
+
+```text
+D_tile = A_tile(M, 64) @ B_tile(N, 64)^T
+```
+
+真实的 Linear、Attention projection 或 KV-cache GEMM 通常有更大的 K。
+例如：
+
+```text
+M = 128
+N = 128
+K = 128
+BLK_K = 64
+K_TILES = K / BLK_K = 2
+```
+
+不能把整个 `K=128` 一次塞进同一个 SMEM tile，而是拆成两个 K chunk：
+
+```text
+i = 0:  A[:, 0:64]  @ B[:, 0:64]^T
+i = 1:  A[:, 64:128] @ B[:, 64:128]^T
+```
+
+最终的 tile 结果是两个 partial sum 的和：
+
+```text
+D_tile =
+    A[:, 0:64]  @ B[:, 0:64]^T
+  + A[:, 64:128] @ B[:, 64:128]^T
+```
+
+关键问题是：`tcgen05.mma` 不会自动帮 Python 的循环变量做这件事。每次
+发 MMA 时，必须明确告诉硬件：
+
+```text
+第 1 个 K tile：覆盖 accumulator
+后续 K tile：累加到同一个 accumulator
+```
+
+这正是 `accum=(i != 0)` 的含义。
+
+### 12.2 先把“数据累加”和“完成通知”分开
+
+这个循环同时维护两条不同性质的依赖：
+
+| 依赖 | 保护什么 | 使用的机制 |
+|---|---|---|
+| SMEM 数据依赖 | `Asmem/Bsmem` 已经写完，MMA 才能读取 | `Tx.cta.copy` 后做 `T.cuda.cta_sync()` |
+| TMEM 完成依赖 | 异步 MMA 已经完成，后续操作才能安全观察 TMEM | `tcgen05.commit` + `mbarrier.try_wait` |
+| 跨轮 phase | 区分第 0、1、2... 轮的同一条 barrier 完成事件 | 软件 `phase_mma ^= 1` |
+
+可以把 TMEM accumulator 想成一个持续存在的盒子：
+
+```text
+i = 0:
+    partial_0 产生
+    accum=False -> 盒子 = partial_0
+
+i > 0:
+    partial_i 产生
+    accum=True  -> 盒子 = 盒子 + partial_i
+```
+
+`tcgen05.commit` 解决的不是“如何相加”，而是“何时知道异步 MMA 已经
+完成”。它把此前发出的 tcgen05 异步操作完成事件关联到指定 mbarrier。
+它不会阻塞当前线程，也不会由软件立即做一次普通 arrival。
+
+`mbarrier.try_wait(bar, phase)` 才是等待端：它检查指定 phase 是否已经
+完成。软件维护的 `phase_mma` 每完成一轮就翻转一次，使第 2 轮不会误用
+第 1 轮已经完成的旧 phase。
+
+### 12.3 课程代码中的 K-loop
+
+下面是从 `hgemm_v2` / `hgemm_v3` 中抽出的核心循环。完整 kernel 在
+`11.2` 中，包含初始化、TMEM layout、writeback 和 deallocation。
+
+```python
+phase_mma: T.int32 = 0
+
+for i in T.serial(K_TILES):
+    Tx.cta.copy(
+        Asmem[:, :],
+        A[:, i * BLK_K : (i + 1) * BLK_K],
+    )
+    Tx.cta.copy(
+        Bsmem[:, :],
+        B[:, i * BLK_K : (i + 1) * BLK_K],
+    )
+
+    T.cuda.cta_sync()
+
+    if warp_id == 0:
+        if T.ptx.elect_sync():
+            Tx.gemm_async(
+                tmem[:, :BLK_N],
+                Asmem[:, :],
+                Bsmem[:, :],
+                accum=(i != 0),
+                dispatch="tcgen05",
+                cta_group=1,
+            )
+            T.ptx.tcgen05.commit(
+                mma_bar.ptr_to([0]),
+                cta_group=1,
+            )
+
+    T.ptx.mbarrier.try_wait(
+        mma_bar.ptr_to([0]),
+        phase_mma,
+    )
+    phase_mma ^= 1
+```
+
+这和 `hgemm_v3` 的 spatial tiling 不冲突。`v3` 只把 A/B 的 source
+row 换成当前 CTA 的 tile：
+
+```text
+A load: A[m_st:m_st+BLK_M, i*BLK_K:(i+1)*BLK_K]
+B load: B[n_st:n_st+BLK_N, i*BLK_K:(i+1)*BLK_K]
+```
+
+在一个 CTA 内部，K-loop、`accum` 和 `mma_bar/phase_mma` 的协议不变。
+
+### 12.4 每一行分别保证什么
+
+#### `for i in T.serial(K_TILES)`
+
+按 K 方向串行遍历 chunk。当前实现没有 double buffering，所以一次只使用
+一组 `Asmem/Bsmem`。
+
+#### `Tx.cta.copy(Asmem[:, :], A[:, k0:k1])`
+
+CTA scope 的线程协作把当前 K chunk 从 GMEM 搬到 SMEM。此时 MMA 还不能
+开始，因为部分线程可能仍在搬运。
+
+#### `T.cuda.cta_sync()`
+
+让 CTA 内相关线程完成本轮 SMEM load 的交接，并让 MMA issuer 能看到一个
+完成的 SMEM tile。它保护的是“加载完成”，不是“异步 MMA 完成”。
+
+#### `if warp_id == 0` 与 `T.ptx.elect_sync()`
+
+只让 warp 0 中被选中的线程发起 tile-level MMA 和 commit，避免重复提交
+同一组操作。
+
+#### `accum=(i != 0)`
+
+```text
+i == 0:
+    accum=False
+    MMA 的结果覆盖 TMEM accumulator，不读取旧的未初始化值
+
+i > 0:
+    accum=True
+    MMA 把当前 partial sum 加到已有 TMEM accumulator
+```
+
+#### `T.ptx.tcgen05.commit(...)`
+
+给本轮异步 MMA 注册一个延迟完成通知：
+
+```text
+发出异步 tcgen05 MMA
+-> 注册“完成后对 mma_bar 产生一次 arrival”
+-> 当前线程继续执行，不在这里等待
+```
+
+#### `T.ptx.mbarrier.try_wait(..., phase_mma)`
+
+等待本轮关联到 `mma_bar` 的完成事件。只有返回后，才能安全进入下一轮的
+SMEM 复用或最终的 TMEM load。
+
+#### `phase_mma ^= 1`
+
+把软件期望的 phase parity 从当前轮翻到下一轮：
+
+```text
+第 1 次 wait 等 phase 0
+第 2 次 wait 等 phase 1
+第 3 次 wait 等 phase 0
+...
+```
+
+### 12.5 `K=128, BLK_K=64` 的 phase trace
+
+初始化：
+
+```text
+mma_bar expected arrival count = 1
+hardware phase = 0
+software phase_mma = 0
+```
+
+| 迭代 | `accum` | wait 前的 `phase_mma` | 本轮发生的事件 | toggle 后 |
+|---|---:|---:|---|---:|
+| `i=0` | `False` | `0` | phase 0 完成并翻到 phase 1 | `1` |
+| `i=1` | `True` | `1` | phase 1 完成并翻到 phase 0 | `0` |
+
+所以 `phase_mma` 不是某个固定常量，而是 consumer 对“下一次应该等待哪个
+phase”的软件记账。它与硬件 barrier 的 parity 必须同步推进。
+
+### 12.6 完整可运行模拟：累加值和 phase
+
+下面这个脚本不需要 GPU。它用一个门闩式 `MBarrier` 模拟
+`tcgen05.commit` 对应的完成事件，用一个标量模拟 TMEM accumulator。
+
+文件：`simulate_kloop_accum_phase.py`
+
+```python
+from __future__ import annotations
+
+
+K = 128
+BLK_K = 64
+K_TILES = K // BLK_K
+
+
+class MBarrier:
+    """Only models the parity behavior needed by this K-loop."""
+
+    def __init__(self) -> None:
+        self.hardware_phase = 0
+        self.completed_phases: list[int] = []
+
+    def complete_one_phase(self) -> int:
+        completed = self.hardware_phase
+        self.completed_phases.append(completed)
+        self.hardware_phase ^= 1
+        return completed
+
+    def try_wait(self, expected_phase: int) -> bool:
+        # try_wait.parity succeeds after current hardware phase moves past
+        # expected_phase. Keeping this explicit also exposes stale parity.
+        return self.hardware_phase != expected_phase
+
+
+def partial_sum(k0: int, k1: int) -> int:
+    # For one output element choose A[m, k] = 1 and B[n, k] = k.
+    # Then partial = sum(k0 <= k < k1) A[m, k] * B[n, k].
+    return sum(k for k in range(k0, k1))
+
+
+def main() -> None:
+    barrier = MBarrier()
+    phase_mma = 0
+    accumulator: int | None = None
+
+    for i in range(K_TILES):
+        k0 = i * BLK_K
+        k1 = k0 + BLK_K
+        partial = partial_sum(k0, k1)
+        accum = i != 0
+
+        # The MMA issuer launched asynchronous work and committed its
+        # completion to barrier. Before hardware completion, waiting for
+        # the current phase must not succeed.
+        assert not barrier.try_wait(phase_mma)
+
+        completed_phase = barrier.complete_one_phase()
+        assert completed_phase == phase_mma
+        assert barrier.try_wait(phase_mma)
+
+        if accum:
+            assert accumulator is not None
+            accumulator += partial
+        else:
+            accumulator = partial
+
+        print(
+            f"i={i}, k=[{k0},{k1}), accum={accum}, "
+            f"partial={partial}, accumulator={accumulator}, "
+            f"completed_phase={completed_phase}"
+        )
+
+        phase_mma ^= 1
+
+    print(f"final_accumulator={accumulator}")
+    print(f"final_phase_mma={phase_mma}")
+    assert accumulator == 8128
+    assert phase_mma == 0
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python3 simulate_kloop_accum_phase.py
+```
+
+预期输出：
+
+```text
+i=0, k=[0,64), accum=False, partial=2016, accumulator=2016, completed_phase=0
+i=1, k=[64,128), accum=True, partial=6112, accumulator=8128, completed_phase=1
+final_accumulator=8128
+final_phase_mma=0
+```
+
+数值推导：
+
+```text
+partial_0 = sum(k for k in 0..63)
+          = 63 * 64 / 2
+          = 2016
+
+partial_1 = sum(k for k in 64..127)
+          = (64 + 127) * 64 / 2
+          = 191 * 32
+          = 6112
+
+final = partial_0 + partial_1
+      = 2016 + 6112
+      = 8128
+```
+
+### 12.7 常见错误和可观察症状
+
+| 错误 | 发生原因 | 可观察症状 |
+|---|---|---|
+| 每轮都写 `accum=False` | 每个 K tile 都覆盖 TMEM | 最终只剩最后一个 K tile 的结果 |
+| 第一轮写 `accum=True` | 未初始化的 TMEM 被纳入累加 | 单 K tile 时直接出现随机偏差；多轮时也可能污染结果 |
+| 漏掉 `tcgen05.commit` | MMA 完成事件没有连到 barrier | `try_wait` 等不到本轮 phase，kernel 可能挂起或超时 |
+| wait 的 phase 不翻转 | 反复等待已经完成的旧 phase | wait 可能过早成功，下一轮读到未完成 TMEM |
+| phase 翻转两次 | 跳过下一轮的完成条件 | 下一轮 wait 可能等待未来 phase 而卡住 |
+| 没有 `cta_sync` | MMA issuer 可能在 SMEM 写满前发 MMA | 结果随调度变化，出现局部或整块错误 |
+| MMA 完成前复用 A/B SMEM | 下一轮 copy 覆盖上一轮输入 | 数据竞争式错误，结果不稳定 |
+| `mbarrier.init(..., 1)` 却每轮 commit 多次 | arrival count 与完成协议不匹配 | barrier 提前完成或永远不完成 |
+| `K % BLK_K != 0` 没有 tail 处理 | 最后一次 slice 越界或漏算 | 非法内存访问或最后一个 K tile 结果不完整 |
+
+需要特别区分：
+
+```text
+cta_sync      -> 交接同步的 SMEM load
+commit        -> 注册异步 MMA 完成通知
+try_wait      -> 等待该完成通知
+phase ^= 1    -> 把软件期望推进到下一轮 parity
+```
+
+### 12.8 自测
+
+1. 为什么第一轮必须使用 `accum=False`？
+   答：TMEM accumulator 中还没有有效 partial sum；`accum=False` 让第一次
+   MMA 覆盖 TMEM，避免把未初始化数据算进去。
+
+2. 为什么后续轮必须使用 `accum=True`？
+   答：每一轮只计算一个 K chunk 的 partial sum，需要把它们累加到同一个
+   TMEM accumulator，才能得到完整 K 的结果。
+
+3. `tcgen05.commit` 本身会等待 MMA 完成吗？
+   答：不会。它只把完成事件关联到 mbarrier；等待由
+   `mbarrier.try_wait` 完成。
+
+4. `K=192, BLK_K=64` 时，三轮 wait 分别使用哪些 phase？
+   答：按 `0, 1, 0` 的顺序；每轮结束后 `phase_mma ^= 1`。最终
+   `phase_mma` 回到 `1`，因为一共翻转了三次。
+
+5. 为什么 `T.cuda.cta_sync()` 不能代替 MMA barrier wait？
+   答：`cta_sync` 只表示相关线程到达同步点，不能证明已发出的异步
+   `tcgen05.mma` 已完成，因此也就不能保证 TMEM 结果已经可读。
+
+## 十三、当前进度
 
 `chapter_gemm_basics` 的知识点：
 
 ```text
 [x] GEMM 的 shape 约定与 Blackwell 数据路径
 [x] 第 1 步：顺序执行的单 Tile GEMM
-[ ] 第 2 步：K-Loop 累加
+[x] 第 2 步：K-Loop 累加
 [ ] 第 3 步：空间 Tiling（Multi-CTA）
 ```
 
-本章第 1 步已经覆盖：
+本章第 1、2 步已经覆盖：
 
 ```text
 GEMM 使用 A(M,K)、B(N,K)、D(M,N)，计算 D = A * B^T
@@ -3107,11 +3487,19 @@ v2 只在 writeback 使用 m_st/n_st，实际 tile 仍是 0
 v3 在 A/B load 和 writeback 中都使用 m_st/n_st
 从 v2 到 v3 不改变 CTA 内部的 MMA 与 mbarrier 协议
 chapter_gemm_basics 第 1 个知识点完成：单 Tile Baseline
+K-loop 把一个完整 K 拆成多个 BLK_K chunk，并复用同一个 TMEM accumulator
+accum=False 让第一个 K tile 覆盖未初始化 TMEM
+accum=True 让后续 K tile 把 partial sum 加到已有 TMEM accumulator
+tcgen05.commit 把异步 MMA 完成事件关联到 mbarrier，本身不阻塞
+mbarrier.try_wait 等待指定 phase 完成，phase_mma 每轮翻转一次
+cta_sync 保护 SMEM load 交接，不能替代 TMEM MMA 完成等待
+serial K-loop 在等待本轮 MMA 完成后才进入下一轮 SMEM 复用
+chapter_gemm_basics 第 2 个知识点完成：K-Loop 累加与 MMA barrier phase
 ```
 
 下一知识点：
 
 ```text
 chapter_gemm_basics
--> 第 2 步：K-Loop 累加与 MMA barrier phase
+-> 第 3 步：空间 Tiling（Multi-CTA）
 ```

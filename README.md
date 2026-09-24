@@ -320,6 +320,9 @@ chapter_tirx_layout_api 第九个知识点完成：ComposeLayout 与 shared-memo
 GEMM 的 A(M,K) / B(N,K) / D(M,N) 约定
 单 tile baseline 的 GMEM -> SMEM -> TMEM -> registers -> GMEM 数据路径
 chapter_gemm_basics 第 1 个知识点完成：单 Tile Baseline
+K-loop 按 BLK_K 切分 K，并用 accum=False / True 控制 TMEM 首轮覆写与后续累加
+tcgen05.commit 关联异步 MMA 完成，mbarrier phase 每轮翻转
+chapter_gemm_basics 第 2 个知识点完成：K-Loop 累加与 MMA barrier phase
 ```
 
 完整文档索引、当前进度和硬件环境说明见

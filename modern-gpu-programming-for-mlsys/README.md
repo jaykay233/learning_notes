@@ -28,7 +28,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
 | [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
 | [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica、`tmem_datapath_layout` 的 D/F row mapping、`tcgen05_atom_layout` 的 atom / rep / register mapping、`wg_local_layout` 的 warpgroup row-to-thread mapping，以及 `ComposeLayout` 与 shared-memory XOR swizzle |
-| [15-gemm-basics.md](15-gemm-basics.md) | Tiled GEMM 的优化路线、`D = A * B^T` 约定、Blackwell 四段数据路径、单 tile baseline、`hgemm_v1` 完整代码、`D[73,91]` 的 TMEM 与 thread 映射，以及第 1 步的限制 |
+| [15-gemm-basics.md](15-gemm-basics.md) | Tiled GEMM 的优化路线、`D = A * B^T` 约定、Blackwell 四段数据路径、单 tile baseline、`hgemm_v1` 完整代码、`D[73,91]` 的 TMEM 与 thread 映射、`hgemm_v2/v3` 的 K-loop 与 spatial tiling，以及 `accum` 首轮覆写、后续累加和 mbarrier phase 协议 |
 
 ## 当前进度
 
@@ -238,6 +238,12 @@ j=0 时八行地址为 72*i，bank 为 0,4,8,...,28
 无 swizzle 时八行都落 bank 0
 chapter_tirx_layout_api 第九个知识点完成：ComposeLayout 与 shared-memory swizzle
 chapter_gemm_basics 第 1 个知识点完成：单 Tile Baseline
+K-loop 把一个完整 K 拆成多个 BLK_K chunk，并复用同一个 TMEM accumulator
+accum=False 让第一个 K tile 覆盖未初始化 TMEM
+accum=True 让后续 K tile 把 partial sum 加到已有 TMEM accumulator
+tcgen05.commit 关联异步 MMA 完成事件，mbarrier.try_wait 等待指定 phase
+phase_mma 每轮翻转，防止旧 phase 完成状态被下一轮误用
+chapter_gemm_basics 第 2 个知识点完成：K-Loop 累加与 MMA barrier phase
 ```
 
 ## 下一知识点
@@ -245,7 +251,8 @@ chapter_gemm_basics 第 1 个知识点完成：单 Tile Baseline
 ```text
 chapter_tirx_layout_api 完成
 -> chapter_gemm_basics 第 1 步完成
--> chapter_gemm_basics 第 2 步：K-Loop 累加
+-> chapter_gemm_basics 第 2 步完成：K-Loop 累加与 MMA barrier phase
+-> chapter_gemm_basics 第 3 步：空间 Tiling（Multi-CTA）
 ```
 
 ## 核心主线
