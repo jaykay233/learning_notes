@@ -29,7 +29,7 @@ PTX：cp.async.bulk.tensor、mbarrier.try_wait.parity、
 ```text
 [x] Step 4：TMA Async Load
 [x] Step 5：Software Pipeline（PIPE_DEPTH=2）
-[ ] Step 6：Persistent Kernel + Tile Scheduler
+[x] Step 6：Persistent Kernel + Tile Scheduler
 [ ] Step 7：Warp Specialization 与完整 Load / Compute overlap
 ```
 

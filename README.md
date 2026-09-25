@@ -53,7 +53,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 14-tirx-layout-api.md
 ├── 15-gemm-basics.md
 ├── 16-gemm-async-tma.md
-└── 17-gemm-software-pipeline.md
+├── 17-gemm-software-pipeline.md
+└── 18-gemm-persistent-kernel.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -203,7 +204,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-17：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-18：
 
 ```text
 layout / named axes / replication / offset
@@ -339,6 +340,13 @@ stage = k % PIPE_DEPTH 控制 operand slot，k + PIPE_DEPTH 回填已释放 slot
 所有 K iterations 共用一个 TMEM accumulator 和 mma_bar，phase_mma 每轮翻转
 回填前必须等待 MMA 完成，避免覆盖仍在读取的 operand stage
 chapter_gemm_async 第 5 步完成：Software Pipeline（PIPE_DEPTH=2）
+hgemm_v6 用固定数量的 persistent CTA 顺序处理多块 output tile
+bx = T.cta_id([SM_COUNT]) 把二维 tile grid 改成一维 persistent worker grid
+ClusterPersistentScheduler2D 统一生成 tile 坐标并按 l2_group_size 调整访问顺序
+1024 块 output tile 分给 148 个 CTA：136 个处理 7 块，12 个处理 6 块
+TMEM、SMEM allocation 和 barriers 在 CTA 生命周期内只初始化一次
+K_TILES=64、PIPE_DEPTH=2 时 barrier completion 次数为偶数，块边界可安全重置 phase
+chapter_gemm_async 第 6 步完成：Persistent Kernel + Tile Scheduler
 ```
 
 完整文档索引、当前进度和硬件环境说明见
