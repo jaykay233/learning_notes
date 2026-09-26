@@ -33,6 +33,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [17-gemm-software-pipeline.md](17-gemm-software-pipeline.md) | `hgemm_v5` 的 `PIPE_DEPTH=2` 双缓冲、prologue prefetch、stage ring、每 stage 独立 TMA barrier、`phase_tma` / `phase_mma` 翻转规则，以及 `K_TILES=5` 的完整执行 trace |
 | [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、`work_id` / `init(bx)` / stride 148、M 优先与 N 优先的完整编号对照、`l2_group_size=8` 的 L2 locality、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
 | [19-gemm-warp-specialization.md](19-gemm-warp-specialization.md) | `chapter_gemm_advanced` Step 7 的 `hgemm_v7`、TMA producer / MMA consumer / writeback 三角色拆分、`tma2mma` / `mma2tma` 的 SMEM full-empty 协议、`mma2ld` / `ld2mma` 的 TMEM result-reuse 协议、named barrier、完整代码与 `PIPE_DEPTH=2` 交接 trace |
+| [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8.1 的 `hgemm_v8`、CTA0/CTA1 的 A/B slice 所有权、cooperative MMA 生成的 `256 x 256` output tile、四个 `128 x 128` quadrant、65536-byte TMA transaction、`cta_mask=3` completion 与 256-arrival `ld2mma` |
 
 ## 当前进度
 
@@ -286,6 +287,13 @@ PIPE_DEPTH=2 时 MMA(k0) 通过 mma2tma[0] 释放 stage 0 给 TMA(k2)
 warpgroup_sync(10) lower 为 bar.sync 10, 128，而不是 cta_sync
 TMA store 使用 commit_group / wait_group(0) 与第二次 warpgroup_sync 保护 Dsmem
 chapter_gemm_advanced 第 7 步完成：Warp Specialization
+Two-CTA cluster 以 256 x 256 output tile 为调度单位
+CTA0 加载 A rows 0:128 与 stored-B rows 0:128，CTA1 加载 A/B rows 128:256
+cooperative MMA 跨 CTA 读取 SMEM，并产生四个 128 x 128象限
+CTA0 的 tma2mma 集中登记两个 CTA 的 65536-byte K-stage transaction
+cta_group=2 的 MMA completion 使用 cta_mask=3 通知两侧 CTA
+两个 writeback warpgroup 共 256 个 arrivals 才能释放 TMEM
+chapter_gemm_advanced 第 8 步第 1 个知识点完成：Two-CTA Tile Ownership
 ```
 
 ## 下一知识点
@@ -299,7 +307,8 @@ chapter_tirx_layout_api 完成
 -> chapter_gemm_async 第 5 步完成：Software Pipeline（PIPE_DEPTH=2）
 -> chapter_gemm_async 第 6 步完成：Persistent Kernel + Tile Scheduler
 -> chapter_gemm_advanced 第 7 步完成：Warp Specialization 与四条 barrier 交接
--> chapter_gemm_advanced 第 8 步：Two-CTA Cluster
+-> chapter_gemm_advanced 第 8 步第 1 个知识点完成：Two-CTA Tile Ownership
+-> chapter_gemm_advanced 第 8 步第 2 个知识点：Tile 地址计算与 Epilogue
 ```
 
 ## 核心主线

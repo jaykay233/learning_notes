@@ -35,7 +35,8 @@ PTX：tcgen05.mma、tcgen05.commit、mbarrier、
 
 ```text
 [x] Step 7：Warp Specialization 与完整 Load / Compute / Writeback overlap
-[ ] Step 8：Two-CTA Cluster
+[ ] Step 8：Two-CTA Cluster（进行中；8.1 见
+    `20-gemm-two-cta-cluster.md`）
 [ ] Step 9：Multi-Consumer Warp Specialization
 ```
 
@@ -989,10 +990,14 @@ warpgroup 都完成 release。
 ## 下一知识点
 
 下一步进入 `chapter_gemm_advanced` 的 Step 8：Two-CTA Cluster。
-重点会转向：
+第一个知识点已经记录在
+[`20-gemm-two-cta-cluster.md`](20-gemm-two-cta-cluster.md)，先解释两个
+CTA 的 A/B slice 所有权以及 `256 x 256` output tile 的 TMEM 切分。
+随后继续：
 
 ```text
-两个 CTA 如何共同计算一个 256 x 256 output tile
-两侧 A/B slices 如何通过 cta_group=2 的 MMA 被读取
-tma2mma / ld2mma 如何通过 remote_view 和 cta_mask 连接两个 CTA
+m_idx / n_idx 如何表示 256 x 256 cluster tile
+cbx 如何选择 A/B slice
+m_st / n_st / n_st_epi 分别用在哪个数据路径
+为什么 epilogue 不能复用 n_st
 ```

@@ -55,7 +55,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 16-gemm-async-tma.md
 ├── 17-gemm-software-pipeline.md
 ├── 18-gemm-persistent-kernel.md
-└── 19-gemm-warp-specialization.md
+├── 19-gemm-warp-specialization.md
+└── 20-gemm-two-cta-cluster.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -218,6 +219,8 @@ TMA tile copy / swizzle / pipeline / descriptor / mbarrier / bulk group
 Blackwell tcgen05.mma / TMEM / commit + mbarrier / cta_group
 Warp specialization / TMA producer / MMA consumer / writeback
 tma2mma、mma2tma、mma2ld、ld2mma 四条 barrier 交接
+Two-CTA cluster / CTA pair operand ownership
+cooperative MMA / 256 x 256 output tile / cta_mask completion
 cta_group::2 的 CTA pair 资源访问边界
 cta_group::1, M=128 的直接 accumulator 映射
 cta_group::1, M=64 的 Layout F
