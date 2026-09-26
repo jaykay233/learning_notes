@@ -32,6 +32,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [16-gemm-async-tma.md](16-gemm-async-tma.md) | `hgemm_v4` 的单线程 TMA Load、`mbarrier.arrive.expect_tx`、32768-byte transaction trace、`try_wait` phase 协议、`fence.proxy_async`、TMA Store `commit_group` / `wait_group(0)` 与完整验证脚本 |
 | [17-gemm-software-pipeline.md](17-gemm-software-pipeline.md) | `hgemm_v5` 的 `PIPE_DEPTH=2` 双缓冲、prologue prefetch、stage ring、每 stage 独立 TMA barrier、`phase_tma` / `phase_mma` 翻转规则，以及 `K_TILES=5` 的完整执行 trace |
 | [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、`work_id` / `init(bx)` / stride 148、M 优先与 N 优先的完整编号对照、`l2_group_size=8` 的 L2 locality、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
+| [19-gemm-warp-specialization.md](19-gemm-warp-specialization.md) | `chapter_gemm_advanced` Step 7 的 `hgemm_v7`、TMA producer / MMA consumer / writeback 三角色拆分、`tma2mma` / `mma2tma` 的 SMEM full-empty 协议、`mma2ld` / `ld2mma` 的 TMEM result-reuse 协议、named barrier、完整代码与 `PIPE_DEPTH=2` 交接 trace |
 
 ## 当前进度
 
@@ -271,6 +272,20 @@ ClusterPersistentScheduler2D 决定 linear_idx、m_idx、n_idx 和 next_tile 的
 l2_group_size=8 让 M 方向连续 8 行 tile 共享相同的 N column 编号区间
 K_TILES=64、PIPE_DEPTH=2 时每块 tile 的 TMA / MMA completion 次数都是偶数，phase 可在 tile 边界重置为 0
 chapter_gemm_async 第 6 步完成：Persistent Kernel + Tile Scheduler
+Warp specialization 将 TMA producer、MMA consumer 与 writeback 分成固定角色
+WG1 warp 3 只负责 TMA producer，WG1 warp 0 只负责 MMA consumer
+WG0 的 128 个 threads 共同完成 TMEM -> RF -> Dsmem -> GMEM writeback
+tma2mma 表示 SMEM data 已准备好
+mma2tma 表示 MMA 已读完 SMEM stage，可以复用
+mma2ld 表示完整 TMEM accumulator 已准备好
+ld2mma 表示 writeback 已读完 TMEM，可以供下一块 tile 复用
+tma2mma.init(1) 与 32768-byte A/B transaction
+ld2mma.init(128) 对应整个 writeback warpgroup
+producer 初始 phase=1，consumer 与 writeback 初始 phase=0
+PIPE_DEPTH=2 时 MMA(k0) 通过 mma2tma[0] 释放 stage 0 给 TMA(k2)
+warpgroup_sync(10) lower 为 bar.sync 10, 128，而不是 cta_sync
+TMA store 使用 commit_group / wait_group(0) 与第二次 warpgroup_sync 保护 Dsmem
+chapter_gemm_advanced 第 7 步完成：Warp Specialization
 ```
 
 ## 下一知识点
@@ -283,7 +298,8 @@ chapter_tirx_layout_api 完成
 -> chapter_gemm_async 第 4 步完成：TMA Async Load
 -> chapter_gemm_async 第 5 步完成：Software Pipeline（PIPE_DEPTH=2）
 -> chapter_gemm_async 第 6 步完成：Persistent Kernel + Tile Scheduler
--> chapter_gemm_async 第 7 步：Warp Specialization 与完整 Load / Compute overlap
+-> chapter_gemm_advanced 第 7 步完成：Warp Specialization 与四条 barrier 交接
+-> chapter_gemm_advanced 第 8 步：Two-CTA Cluster
 ```
 
 ## 核心主线
@@ -319,5 +335,6 @@ TMEM lane / column 不匹配
 
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
-TMA producer / consumer warp specialization
+Two-CTA Cluster 的 cooperative MMA 与 remote barrier
+Multi-Consumer Warp Specialization
 ```

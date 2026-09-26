@@ -54,7 +54,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 15-gemm-basics.md
 ├── 16-gemm-async-tma.md
 ├── 17-gemm-software-pipeline.md
-└── 18-gemm-persistent-kernel.md
+├── 18-gemm-persistent-kernel.md
+└── 19-gemm-warp-specialization.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -204,7 +205,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-18：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-19：
 
 ```text
 layout / named axes / replication / offset
@@ -215,6 +216,8 @@ Hopper WGMMA / Blackwell TMEM
 tcgen05 / SFA/SFB / scale_vec
 TMA tile copy / swizzle / pipeline / descriptor / mbarrier / bulk group
 Blackwell tcgen05.mma / TMEM / commit + mbarrier / cta_group
+Warp specialization / TMA producer / MMA consumer / writeback
+tma2mma、mma2tma、mma2ld、ld2mma 四条 barrier 交接
 cta_group::2 的 CTA pair 资源访问边界
 cta_group::1, M=128 的直接 accumulator 映射
 cta_group::1, M=64 的 Layout F
