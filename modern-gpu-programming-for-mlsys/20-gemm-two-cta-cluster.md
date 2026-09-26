@@ -1,14 +1,16 @@
-# GEMM Advanced Step 8.1：Two-CTA Cluster 的 Tile 所有权与数据复用
+# GEMM Advanced Step 8.1-8.2：Two-CTA Cluster 的 Tile 所有权、地址与 Epilogue
 
 这篇笔记进入 `chapter_gemm_advanced` 的 Step 8。Step 7 已经在一个 CTA
 内部把 TMA producer、MMA consumer 和 writeback 拆成三个角色；Step 8
 把协作范围继续扩大到一个包含两个 CTA 的 cluster。
 
-本文只讲 Step 8 的第一个小知识点：
+本文讲 Step 8 的前两个小知识点：
 
 ```text
-两个 CTA 为什么只各自加载一半 A/B，
-却能共同计算一个 256 x 256 的 output tile。
+1. 两个 CTA 为什么只各自加载一半 A/B，却能共同计算一个
+   256 x 256 的 output tile。
+2. m_st / n_st / n_st_epi 分别属于哪条数据路径，以及 epilogue
+   为什么要把 256 columns 分成两段 128-column 写回。
 ```
 
 ## 本次讲解位置
@@ -20,8 +22,7 @@
 知识点：CTA0/CTA1 的 A/B slice 所有权，以及 cooperative MMA 产生的
         256 x 256 output tile 与 TMEM 切分
 上次：Step 7: Warp Specialization 与四条 barrier 交接
-下次：Step 8 的 tile 地址计算：cta_id_in_cluster、m_st / n_st 与
-      256-column epilogue 的两段写回
+下次：Step 8.3：CTA0 集中式 tma2mma barrier 与 65536-byte transaction
 PTX：tcgen05.mma cta_group::2、cp.async.bulk.tensor、
      mbarrier remote arrive、tcgen05.commit cta_mask
 ```
@@ -30,7 +31,7 @@ PTX：tcgen05.mma cta_group::2、cp.async.bulk.tensor、
 
 ```text
 [x] 8.1 Two-CTA cluster 的 A/B 所有权与 256 x 256 output tile
-[ ] 8.2 Tile 地址计算与 epilogue 的两段 128-column 写回
+[x] 8.2 Tile 地址计算与 epilogue 的两段 128-column 写回
 [ ] 8.3 CTA0 集中式 tma2mma barrier 与 65536-byte transaction
 [ ] 8.4 cta_group=2 cooperative MMA 与 cta_mask=3 completion
 [ ] 8.5 ld2mma 的 256 arrivals 与跨 CTA TMEM 复用
@@ -981,13 +982,441 @@ CTA_GROUP * (BLK_M * BLK_K + BLK_N * BLK_K) * F16_SIZE
 fragment 和 `Dsmem`，降低 register pressure，并复用同一份
 writeback / TMA store 流程。
 
-## 下一知识点
+## 十、Step 8.2：Tile 地址计算与 Epilogue 的两段 128-column 写回
 
-下一步只讲 Step 8 的地址计算：
+## 本次讲解位置
 
 ```text
-m_idx / n_idx 如何表示 256 x 256 cluster tile
-cbx 如何选择 A/B slice
-m_st / n_st / n_st_epi 分别用在哪个数据路径
-为什么 epilogue 不能复用 n_st
+本次讲解位置
+章节：chapter_gemm_advanced
+小节：Step 8: Two-CTA Cluster / Tile 地址计算
+知识点：m_st / n_st / n_st_epi 分别属于哪条数据路径，以及
+        256-column epilogue 为什么拆成两段 128-column 写回
+上次：Step 8.1：CTA0/CTA1 的 A/B slice 所有权与 256 x 256 output tile
+下次：Step 8.3：CTA0 集中式 tma2mma barrier 与 65536-byte transaction
+PTX：cp.async.bulk.tensor、tcgen05.ld、tcgen05.wait::ld、
+     cp.async.bulk.commit_group / wait_group
+```
+
+### 1. 学习目标：不要把“输入切片地址”和“输出切片地址”混在一起
+
+Step 8.1 已经说明，一个 cluster 共同计算 `256 x 256` output tile：
+
+```text
+CTA0 加载 A0 和 B0
+CTA1 加载 A1 和 B1
+```
+
+这里容易出现一个很自然、但错误的推断：
+
+```text
+CTA0 加载 B0，所以 CTA0 只写 output columns 0:128
+CTA1 加载 B1，所以 CTA1 只写 output columns 128:256
+```
+
+这不是 cooperative MMA 的结果所有权。
+
+真正的关系是：
+
+```text
+输入 B 的所有权是斜对角切分：
+    CTA0 只加载 B0
+    CTA1 只加载 B1
+
+输出 D 的所有权是行带切分：
+    CTA0 写前 128 rows 的全部 256 columns
+    CTA1 写后 128 rows 的全部 256 columns
+```
+
+本节要解决的核心问题就是：
+
+```text
+哪两个地址可以用 cbx，
+哪一个 epilogue 地址不能用 cbx。
+```
+
+### 2. 心智模型：输入所有权是斜对角，输出所有权是行带
+
+把一个 `256 x 256` cluster tile 看成四个 `128 x 128` quadrant：
+
+```text
+                output columns
+              C0 = 0:128    C1 = 128:256
+            +-------------+-------------+
+R0 = 0:128  |    D00      |    D01      |
+            +-------------+-------------+
+R1 = 128:256|    D10      |    D11      |
+            +-------------+-------------+
+```
+
+每个 quadrant 需要的 A/B 和最终持有它的 CTA 是：
+
+| Quadrant | 使用 A | 使用 stored-B | 输出 rows | 输出 columns | TMEM 所在 CTA |
+|---|---|---|---|---|---|
+| `D00` | A0，CTA0 加载 | B0，CTA0 加载 | R0 | C0 | CTA0 |
+| `D01` | A0，CTA0 加载 | B1，CTA1 加载 | R0 | C1 | CTA0 |
+| `D10` | A1，CTA1 加载 | B0，CTA0 加载 | R1 | C0 | CTA1 |
+| `D11` | A1，CTA1 加载 | B1，CTA1 加载 | R1 | C1 | CTA1 |
+
+所以 `B` 的加载所有权决定“谁把哪份 B 放进 SMEM”，并不决定“谁最终
+写哪几列 D”。CTA0 读取两份 B 的结果 `D00` 和 `D01` 都在自己的 TMEM
+中，因此它必须写完整的两段 columns。
+
+### 3. 三个地址的名字、公式和使用路径
+
+先看源码里的三行：
+
+```python
+m_st = T.meta_var((m_idx * CTA_GROUP + cbx) * BLK_M)
+n_st = T.meta_var((n_idx * CTA_GROUP + cbx) * BLK_N)
+n_st_epi = T.meta_var(n_idx * 256 + no * 128)
+```
+
+其中：
+
+```text
+CTA_GROUP = 2
+BLK_M = BLK_N = 128
+cbx in {0, 1}
+no  in {0, 1}
+```
+
+展开后得到：
+
+```text
+m_st     = m_base + cbx * 128
+n_st     = n_base + cbx * 128
+n_st_epi = n_base + no * 128
+```
+
+这里的 `m_base` 和 `n_base` 是 cluster tile 的左上角：
+
+```text
+m_base = m_idx * 256
+n_base = n_idx * 256
+```
+
+| 地址 | 是否使用 `cbx` | 公式 | 用于哪条路径 |
+|---|---:|---|---|
+| `m_st` | 是 | `(m_idx * 2 + cbx) * 128` | A 的 row 起点；D 的 row 起点 |
+| `n_st` | 是 | `(n_idx * 2 + cbx) * 128` | 当前 CTA 加载的 stored-B row 起点 |
+| `n_st_epi` | 否 | `n_idx * 256 + no * 128` | D 的 column 起点；与 `no` 选择的 TMEM chunk 对齐 |
+
+最重要的不变量是：
+
+```text
+m_st 同时属于 A load 和 D store。
+n_st 只属于 B load。
+n_st_epi 只属于 D store。
+```
+
+`n_st` 和 `n_st_epi` 在外观上相似，但生命周期完全分开。只要把
+`n_st` 误用到 epilogue，CTA1 就会从 output 的中线开始写，导致前半列
+缺失、后半列重复，甚至写到相邻 cluster tile。
+
+### 4. 完整 Epilogue 路径：一次处理 128 columns，执行两次
+
+每个 CTA 的 TMEM accumulator 在逻辑上是：
+
+```text
+128 local rows x 256 columns
+```
+
+写回时只取其中一段：
+
+```python
+tmem[:, no * 128 : (no + 1) * 128]
+```
+
+完整 epilogue 如下。代码与前面 Step 8 kernel 的 `wg_id == 0` 分支一致：
+
+```python
+elif wg_id == 0:
+    wb_ps = PipelineState(1, phase=0)
+    reg_f16 = T.alloc_local((128,), d_type)
+
+    while tile_scheduler.valid():
+        mma2ld.wait(
+            wb_ps.stage,
+            wb_ps.phase,
+        )
+        wb_ps.advance()
+        T.ptx.tcgen05.fence.after_thread_sync()
+
+        for no in T.unroll(2):
+            reg = T.alloc_local(
+                (128,),
+                acc_type,
+            )
+            reg_wg = reg.view(
+                128,
+                128,
+                layout=TileLayout(
+                    S[
+                        (128, 128)
+                        : (1 @ tid_in_wg, 1)
+                    ]
+                ),
+            )
+            Tx.wg.copy_async(
+                reg_wg[:],
+                tmem[
+                    :,
+                    no * 128 : (no + 1) * 128,
+                ],
+            )
+            T.ptx.tcgen05.wait.ld()
+            Tx.cast(reg_f16[:], reg[:])
+            Tx.copy(
+                Dsmem[
+                    warp_id * 32 + lane_id,
+                    :,
+                ],
+                reg_f16[:],
+            )
+            T.ptx.fence.proxy_async("shared::cta")
+            T.cuda.warpgroup_sync(10)
+            if warp_id == 0:
+                if lane_id == 0:
+                    n_st_epi = T.meta_var(
+                        n_idx * 256 + no * 128
+                    )
+                    Tx.copy_async(
+                        D[
+                            m_st : m_st + BLK_M,
+                            n_st_epi : n_st_epi + 128,
+                        ],
+                        Dsmem[:, :],
+                        dispatch="tma_auto",
+                    )
+                    T.ptx.cp_async.bulk.commit_group()
+                    T.ptx.cp_async.bulk.wait_group(0)
+            T.cuda.warpgroup_sync(10)
+
+        ld2mma_cta0.arrive(0)
+        tile_scheduler.next_tile()
+```
+
+数据路径是：
+
+```text
+TMEM 128 x 128 chunk
+    --tcgen05.ld--> reg: 128 fp32 values per thread
+    --cast-------> reg_f16: 128 fp16 values per thread
+    --copy-------> Dsmem[128, 128]
+    --TMA store--> D[m_st:m_st+128, n_st_epi:n_st_epi+128]
+```
+
+每次只保留一段 128-column fragment：
+
+| 方案 | 每线程需要同时保持的 fp32 accumulator | 代价 |
+|---|---:|---|
+| 一次处理 256 columns | 256 registers | 接近或超过 CUDA 255-register 上限，容易 spill 或编译失败 |
+| 每次处理 128 columns | 128 registers | 连续执行两次，使用同一份 `reg` / `Dsmem` 流程 |
+
+这不是为了改变 output tile，而是为了让寄存器压力可控。最终仍然由
+两个 CTA 各写两段，合计覆盖完整的 `256 x 256` tile。
+
+### 5. 具体例子：`m_idx=5, n_idx=7`
+
+cluster tile 的起点是：
+
+```text
+m_base = 5 * 256 = 1280
+n_base = 7 * 256 = 1792
+```
+
+因此它覆盖：
+
+```text
+D[1280:1536, 1792:2048]
+```
+
+两个 CTA 的地址如下：
+
+| CTA | `cbx` | `m_st` | `n_st` | D rows | `n_st_epi` 取值 |
+|---|---:|---:|---:|---|---|
+| CTA0 | 0 | 1280 | 1792 | `1280:1408` | 1792, 1920 |
+| CTA1 | 1 | 1408 | 1920 | `1408:1536` | 1792, 1920 |
+
+注意两个关键对照：
+
+```text
+n_st 在 CTA0/CTA1 之间不同：
+    CTA0 加载 B[1792:1920]
+    CTA1 加载 B[1920:2048]
+
+n_st_epi 在 CTA0/CTA1 之间相同：
+    两边都写 D[:, 1792:1920]
+    两边都写 D[:, 1920:2048]
+```
+
+它们不会冲突，因为 row 起点不同：
+
+```text
+CTA0:
+    D[1280:1408, 1792:1920]
+    D[1280:1408, 1920:2048]
+
+CTA1:
+    D[1408:1536, 1792:1920]
+    D[1408:1536, 1920:2048]
+```
+
+四块 `128 x 128` 结果正好拼成：
+
+```text
+D[1280:1536, 1792:2048]
+```
+
+### 6. 完整可运行的地址 trace
+
+下面是只依赖 Python 标准库的完整脚本。它不依赖 CUDA，可以在 macOS
+上直接执行，并检查四个 quadrant 是否恰好被覆盖一次。
+
+#### 文件：`trace_two_cta_tile_address.py`
+
+```python
+CTA_GROUP = 2
+BLK_M = 128
+BLK_N = 128
+
+m_idx = 5
+n_idx = 7
+
+m_base = m_idx * CTA_GROUP * BLK_M
+n_base = n_idx * CTA_GROUP * BLK_N
+covered = set()
+
+print(f"m_idx={m_idx} n_idx={n_idx}")
+print(
+    f"cluster output rows: "
+    f"D[{m_base}:{m_base + CTA_GROUP * BLK_M}]"
+)
+print(
+    f"cluster output cols: "
+    f"D[{n_base}:{n_base + CTA_GROUP * BLK_N}]"
+)
+
+for cbx in range(CTA_GROUP):
+    m_st = (m_idx * CTA_GROUP + cbx) * BLK_M
+    n_st = (n_idx * CTA_GROUP + cbx) * BLK_N
+
+    print()
+    print(f"CTA cbx={cbx}")
+    print(f"  m_st={m_st} -> A rows / D rows")
+    print(f"  n_st={n_st} -> stored-B rows only")
+
+    for no in range(2):
+        n_st_epi = n_idx * CTA_GROUP * BLK_N + no * BLK_N
+        row_tile = (m_st // BLK_M, n_st_epi // BLK_N)
+        covered.add(row_tile)
+        print(
+            f"  no={no} -> n_st_epi={n_st_epi} -> "
+            f"D[{m_st}:{m_st + BLK_M}, "
+            f"{n_st_epi}:{n_st_epi + BLK_N}]"
+        )
+
+expected = {
+    (
+        m_base // BLK_M + row,
+        n_base // BLK_N + col,
+    )
+    for row in range(CTA_GROUP)
+    for col in range(CTA_GROUP)
+}
+
+print()
+print(f"covered 128x128 tiles: {len(covered)}")
+assert covered == expected
+print("PASS: all four output quadrants are covered exactly once")
+```
+
+运行：
+
+```bash
+python3 trace_two_cta_tile_address.py
+```
+
+预期输出：
+
+```text
+m_idx=5 n_idx=7
+cluster output rows: D[1280:1536]
+cluster output cols: D[1792:2048]
+
+CTA cbx=0
+  m_st=1280 -> A rows / D rows
+  n_st=1792 -> stored-B rows only
+  no=0 -> n_st_epi=1792 -> D[1280:1408, 1792:1920]
+  no=1 -> n_st_epi=1920 -> D[1280:1408, 1920:2048]
+
+CTA cbx=1
+  m_st=1408 -> A rows / D rows
+  n_st=1920 -> stored-B rows only
+  no=0 -> n_st_epi=1792 -> D[1408:1536, 1792:1920]
+  no=1 -> n_st_epi=1920 -> D[1408:1536, 1920:2048]
+
+covered 128x128 tiles: 4
+PASS: all four output quadrants are covered exactly once
+```
+
+### 7. 常见错误与可观察症状
+
+| 错误 | 错误地址 | 可观察症状 |
+|---|---|---|
+| epilogue 复用 `n_st` | CTA1 从 `n_base+128` 写 column | 前半列缺失、后半列重复，第二段甚至越界到邻居 tile |
+| `n_st_epi` 加 `cbx` | CTA1 只写后半段 | CTA1 的 `C0` quadrant 没有被写；如果再加第二段会越界 |
+| `m_st` 使用 `m_idx * BLK_M` | cluster row 间距从 256 变成 128 | 相邻 cluster tile 的 rows 重叠，部分输出永远不被覆盖 |
+| 把 `n_st` 当成 output column base | 混淆“谁加载 B”和“谁写 D” | 列所有权完全错位，结果依赖 CTA 顺序 |
+| epilogue 一次读取 256 columns | 每线程同时持有 256 个 fp32 | register pressure 过高、spill 或编译失败 |
+| 忘记按两段切换 TMEM column | 两段都读 `tmem[:, 0:128]` | 后半列没有被读取，输出右半部分保持旧值 |
+
+### 8. 自测题与答案
+
+#### 1. `m_idx=5, n_idx=7` 时，CTA1 的 `m_st`、`n_st` 和两个
+`n_st_epi` 分别是多少？
+
+答：
+
+```text
+m_st = (5 * 2 + 1) * 128 = 1408
+n_st = (7 * 2 + 1) * 128 = 1920
+n_st_epi(no=0) = 7 * 256 + 0 * 128 = 1792
+n_st_epi(no=1) = 7 * 256 + 1 * 128 = 1920
+```
+
+#### 2. 为什么 `n_st_epi` 不能包含 `cbx`？
+
+答：`cbx` 表示当前 CTA 加载哪一份 stored-B，不表示它最终拥有哪几列
+output。cooperative MMA 已把两段 columns 的结果都放进每个 CTA 的
+TMEM，所以两个 CTA 都要写完整的 `n_base:n_base+256`。它们通过不同的
+`m_st` 避免写同一行。
+
+#### 3. CTA0 没有加载 B1，为什么可以写 `D[:, n_base+128:n_base+256]`？
+
+答：B1 由 CTA1 加载，但 `cta_group=2` 的 cooperative MMA 可以跨 CTA
+读取两边 SMEM。`A0 @ B1.T` 的结果仍写入 CTA0 所属的 TMEM row band，
+所以 CTA0 最终负责写 `D01`。
+
+#### 4. 为什么 epilogue 要拆成两次 128-column copy？
+
+答：一次处理 256 columns 会让每个 writeback thread 同时保留 256 个
+fp32 accumulator，接近或超过线程寄存器上限。两段处理将 live
+accumulator 降到 128 个，并复用同一份 `reg`、`reg_f16` 和 `Dsmem`。
+
+#### 5. 如果把 `n_st` 用到 TMA store 的 column 参数上，会发生什么？
+
+答：CTA0 会写 `0:128` 和 `128:256`，CTA1 会写 `128:256` 和
+`256:384`。结果是前半列缺失、后半列被重复写，第二段还侵入相邻
+cluster tile 的 columns。
+
+## 下一知识点
+
+Step 8.2 已经完成。下一步进入 Step 8.3：
+
+```text
+CTA0 的 tma2mma 为什么作为 cluster 的集中 completion barrier
+两个 CTA 的 TMA transaction 如何 remote arrive 到同一个 barrier
+为什么每个 K stage 登记 65536 bytes，而不是 32768 bytes
 ```

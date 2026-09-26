@@ -206,7 +206,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-19：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-20：
 
 ```text
 layout / named axes / replication / offset
@@ -221,6 +221,8 @@ Warp specialization / TMA producer / MMA consumer / writeback
 tma2mma、mma2tma、mma2ld、ld2mma 四条 barrier 交接
 Two-CTA cluster / CTA pair operand ownership
 cooperative MMA / 256 x 256 output tile / cta_mask completion
+m_st / n_st / n_st_epi 的三条地址生命周期
+256-column epilogue 拆成两段 128-column 写回
 cta_group::2 的 CTA pair 资源访问边界
 cta_group::1, M=128 的直接 accumulator 映射
 cta_group::1, M=64 的 Layout F

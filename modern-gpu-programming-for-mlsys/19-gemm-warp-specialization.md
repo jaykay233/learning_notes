@@ -989,15 +989,15 @@ warpgroup 都完成 release。
 
 ## 下一知识点
 
-下一步进入 `chapter_gemm_advanced` 的 Step 8：Two-CTA Cluster。
-第一个知识点已经记录在
-[`20-gemm-two-cta-cluster.md`](20-gemm-two-cta-cluster.md)，先解释两个
-CTA 的 A/B slice 所有权以及 `256 x 256` output tile 的 TMEM 切分。
-随后继续：
+`chapter_gemm_advanced` 的 Step 8.1-8.2 已经记录在
+[`20-gemm-two-cta-cluster.md`](20-gemm-two-cta-cluster.md)：
 
 ```text
-m_idx / n_idx 如何表示 256 x 256 cluster tile
-cbx 如何选择 A/B slice
-m_st / n_st / n_st_epi 分别用在哪个数据路径
-为什么 epilogue 不能复用 n_st
+两个 CTA 的 A/B slice 所有权
+256 x 256 output tile 与 128 x 256 per-CTA TMEM
+m_st / n_st / n_st_epi 的三条地址生命周期
+epilogue 为什么拆成两段 128-column 写回
 ```
+
+下一步进入 Step 8.3：CTA0 集中式 `tma2mma` barrier 与
+65536-byte K-stage transaction。
