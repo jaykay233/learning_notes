@@ -1252,3 +1252,541 @@ tile 可以从 phase 0 开始。该性质由
 allocation 和 scheduler state。没有省掉每块 tile 的 TMA load、MMA、
 K-loop、TMEM load 与 GMEM writeback；persistent 改变的是 tile
 所有权和调度，不是 tile 内部的数据路径。
+
+## 十六、Scheduler 追问补充：work_id、L2 locality 与 CTA 分配
+
+这一节把 Step 6 中容易混在一起的几个概念拆开：`tile_scheduler.init(bx)`、
+`work_id`、`num_clusters`、SM 与 CTA 的关系，以及
+`l2_group_size` 对任务编号顺序的影响。
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_gemm_async
+小节：Step 6: Persistent Kernel + Tile Scheduler
+知识点：scheduler 状态初始化、work_id、静态 stride 与 L2 locality
+上次：Step 6 的主 kernel 与资源复用
+下次：Step 7: Warp Specialization 与完整 Load / Compute overlap
+PTX：本补充不引入新的 PTX 指令，讨论 TMA / MMA 之前的 tile 调度
+```
+
+### 1. `tile_scheduler.init(bx)` 到底做了什么
+
+`init` 不是初始化 CUDA，也不是把 CTA 绑定到某个 SM。它只初始化
+scheduler 的逻辑状态，并立即计算当前 CTA 的第一块 output tile。
+
+概念上等价于：
+
+```python
+linear_idx = bx
+tile_count = 0
+m_idx, n_idx = decode_group_major(linear_idx)
+```
+
+其中：
+
+```text
+bx          = 当前 CTA 编号，范围 0..147
+linear_idx  = 当前 CTA 对应的全局 work id
+tile_count  = 当前 CTA 已经领取多少块 tile
+m_idx       = 当前 tile 的 M 方向编号
+n_idx       = 当前 tile 的 N 方向编号
+```
+
+例如：
+
+```text
+CTA 0:
+  init(0)
+  linear_idx = 0
+  (m_idx, n_idx) = (0, 0)
+
+CTA 136:
+  init(136)
+  linear_idx = 136
+  (m_idx, n_idx) = (0, 17)
+
+CTA 147:
+  init(147)
+  linear_idx = 147
+  (m_idx, n_idx) = (3, 18)
+```
+
+第一块 tile 的坐标已经由 `init` 计算出来，所以 `while` 第一次进入
+循环时不需要先调用 `next_tile()`。
+
+### 2. `work_id` 的角色
+
+`work_id` 有时也叫 `linear_idx` 或 `work_idx`。它是：
+
+```text
+二维 tile 任务在一维调度顺序中的编号
+```
+
+它不是：
+
+```text
+SM 编号
+CTA 编号
+m_idx
+n_idx
+A/B/D 的内存地址
+```
+
+当前共有：
+
+```text
+32 * 32 = 1024 个 output tiles
+```
+
+所以：
+
+```text
+work_id = 0..1023
+```
+
+`work_id` 先经过 scheduler 解码，再变成二维坐标：
+
+```text
+work_id -> decode(work_id) -> (m_idx, n_idx)
+```
+
+三个编号的职责可以对齐如下：
+
+| 编号 | 范围 | 角色 |
+|---|---:|---|
+| `bx` | `0..147` | worker 身份，也就是 persistent CTA 编号 |
+| `work_id` | `0..1023` | 全局任务编号，决定任务顺序 |
+| `(m_idx,n_idx)` | `0..31` | output tile 的二维逻辑坐标 |
+
+物理地址来自 `(m_idx,n_idx)`，不直接来自 `work_id`：
+
+```python
+m_st = tile_scheduler.m_idx * BLK_M
+n_st = tile_scheduler.n_idx * BLK_N
+```
+
+例如 CTA 0 第二步拿到：
+
+```text
+work_id = 148
+decode(148) = (m_idx=4, n_idx=18)
+```
+
+于是：
+
+```text
+m_st = 4 * 128 = 512
+n_st = 18 * 128 = 2304
+```
+
+`148` 本身不会作为矩阵下标使用。
+
+### 3. 为什么 `next_tile()` 让 work id 加 148
+
+当前 scheduler 有 148 个逻辑 worker。每个 worker 从自己的 `bx`
+开始，然后按 worker 数量向前走：
+
+```text
+work_id = bx + k * 148
+k = 0, 1, 2, ...
+```
+
+因此：
+
+```text
+CTA 0   -> 0,   148, 296, 444, ...
+CTA 1   -> 1,   149, 297, 445, ...
+CTA 2   -> 2,   150, 298, 446, ...
+...
+CTA 147 -> 147, 295, 443, 591, ...
+```
+
+这些序列的余数互不相同：
+
+```text
+CTA 0   -> work_id % 148 = 0
+CTA 1   -> work_id % 148 = 1
+...
+CTA 147 -> work_id % 148 = 147
+```
+
+因此不会出现两个 CTA 领取同一个 `work_id`，也不会漏掉中间的任务。
+所有序列合起来正好覆盖：
+
+```text
+0, 1, 2, ..., 1023
+```
+
+这里的 148 来自 worker 数量：
+
+```text
+num_clusters = SM_COUNT = 148
+```
+
+它不是 tile 数量，也不是 K 维参数。当前 cluster 配置是：
+
+```text
+cluster_m = 1
+cluster_n = 1
+cta_group = 1
+```
+
+所以一个 scheduler cluster 正好对应一个 CTA。
+
+如果以后一个 cluster 包含两个 CTA，那么 scheduler 的 stride 应该按
+cluster 数量计算，而不是继续使用 CTA 数量。否则两个 CTA 会错误地
+领取不同的 scheduler 任务。
+
+### 4. `num_clusters`、SM、CTA、tile 不是一回事
+
+| 概念 | 当前值 | 含义 |
+|---|---:|---|
+| SM 数量 | 约 148 | 硬件计算单元数量 |
+| CTA 数量 | 148 | kernel 实际启动的 persistent worker |
+| scheduler cluster 数量 | 148 | 当前一个 cluster 对应一个 CTA |
+| output tile 数量 | 1024 | 总任务数量 |
+| 每 CTA tile 数量 | 6 或 7 | 静态分配结果 |
+
+因此：
+
+```text
+一个 SM 不是一个 tile。
+一个 CTA 也不只处理一个 tile。
+一个 CTA 在任一时刻处理一块 tile，完成后继续领取下一块。
+```
+
+`SM_COUNT=148` 的设计目标是在 B200 上近似做到“一个 SM 一个
+persistent CTA”。但语言层面没有把某个 CTA 永久绑定到某个 SM。
+CTA 实际放在哪个 SM、何时被调度，仍由硬件决定。
+
+当前 CTA 又分配了：
+
+```python
+n_cols=512
+```
+
+而 TMEM 的一颗 SM 总布局是：
+
+```text
+128 lanes x 512 columns
+```
+
+所以该 kernel 的资源占用会强烈接近“一 SM 一 CTA”的执行模型。
+这是资源 residency 的结果，不是 CTA 与 SM 的固定 affinity。
+
+### 5. `l2_group_size` 改变的是什么
+
+`l2_group_size` 不改变：
+
+```text
+CTA 数量
+每个 CTA 的 stride
+总 tile 数量
+```
+
+它只改变：
+
+```text
+work_id -> (m_idx,n_idx)
+```
+
+也就是全局任务顺序。
+
+为了把三种顺序完整看清，使用一个小网格：
+
+```text
+M tiles = 16
+N tiles = 8
+l2_group_size = 8
+```
+
+#### M 优先
+
+M 优先表示外层遍历 `m`，内层遍历 `n`：
+
+```text
+0   -> (m0,n0)
+1   -> (m0,n1)
+...
+7   -> (m0,n7)
+8   -> (m1,n0)
+...
+127 -> (m15,n7)
+```
+
+矩阵形式：
+
+| m\n | n0 | n1 | n2 | n3 | n4 | n5 | n6 | n7 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| 1 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |
+| 2 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23 |
+| 3 | 24 | 25 | 26 | 27 | 28 | 29 | 30 | 31 |
+| 4 | 32 | 33 | 34 | 35 | 36 | 37 | 38 | 39 |
+| 5 | 40 | 41 | 42 | 43 | 44 | 45 | 46 | 47 |
+| 6 | 48 | 49 | 50 | 51 | 52 | 53 | 54 | 55 |
+| 7 | 56 | 57 | 58 | 59 | 60 | 61 | 62 | 63 |
+| 8 | 64 | 65 | 66 | 67 | 68 | 69 | 70 | 71 |
+| 9 | 72 | 73 | 74 | 75 | 76 | 77 | 78 | 79 |
+| 10 | 80 | 81 | 82 | 83 | 84 | 85 | 86 | 87 |
+| 11 | 88 | 89 | 90 | 91 | 92 | 93 | 94 | 95 |
+| 12 | 96 | 97 | 98 | 99 | 100 | 101 | 102 | 103 |
+| 13 | 104 | 105 | 106 | 107 | 108 | 109 | 110 | 111 |
+| 14 | 112 | 113 | 114 | 115 | 116 | 117 | 118 | 119 |
+| 15 | 120 | 121 | 122 | 123 | 124 | 125 | 126 | 127 |
+
+特征是：
+
+```text
+A_m 连续复用
+B_n 的复用距离更大
+```
+
+例如 `A0` 被 work id `0..7` 连续使用，而 `B0` 下一次出现在
+work id `8`。
+
+#### N 优先
+
+N 优先表示外层遍历 `n`，内层遍历 `m`：
+
+```text
+0   -> (m0,n0)
+1   -> (m1,n0)
+...
+15  -> (m15,n0)
+16  -> (m0,n1)
+...
+127 -> (m15,n7)
+```
+
+矩阵形式：
+
+| m\n | n0 | n1 | n2 | n3 | n4 | n5 | n6 | n7 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 16 | 32 | 48 | 64 | 80 | 96 | 112 |
+| 1 | 1 | 17 | 33 | 49 | 65 | 81 | 97 | 113 |
+| 2 | 2 | 18 | 34 | 50 | 66 | 82 | 98 | 114 |
+| 3 | 3 | 19 | 35 | 51 | 67 | 83 | 99 | 115 |
+| 4 | 4 | 20 | 36 | 52 | 68 | 84 | 100 | 116 |
+| 5 | 5 | 21 | 37 | 53 | 69 | 85 | 101 | 117 |
+| 6 | 6 | 22 | 38 | 54 | 70 | 86 | 102 | 118 |
+| 7 | 7 | 23 | 39 | 55 | 71 | 87 | 103 | 119 |
+| 8 | 8 | 24 | 40 | 56 | 72 | 88 | 104 | 120 |
+| 9 | 9 | 25 | 41 | 57 | 73 | 89 | 105 | 121 |
+| 10 | 10 | 26 | 42 | 58 | 74 | 90 | 106 | 122 |
+| 11 | 11 | 27 | 43 | 59 | 75 | 91 | 107 | 123 |
+| 12 | 12 | 28 | 44 | 60 | 76 | 92 | 108 | 124 |
+| 13 | 13 | 29 | 45 | 61 | 77 | 93 | 109 | 125 |
+| 14 | 14 | 30 | 46 | 62 | 78 | 94 | 110 | 126 |
+| 15 | 15 | 31 | 47 | 63 | 79 | 95 | 111 | 127 |
+
+特征是：
+
+```text
+B_n 连续复用
+A_m 的复用距离更大
+```
+
+例如 `B0` 被 work id `0..15` 连续使用，而 `A0` 下一次出现在
+work id `16`。
+
+#### `l2_group_size=8`
+
+每 8 行 M tile 组成一组：
+
+```text
+group 0: m0..m7
+group 1: m8..m15
+```
+
+组内固定 `n`，扫描 8 个 `m`：
+
+```text
+0  -> (m0,n0)
+1  -> (m1,n0)
+...
+7  -> (m7,n0)
+8  -> (m0,n1)
+9  -> (m1,n1)
+...
+63 -> (m7,n7)
+64 -> (m8,n0)
+...
+127 -> (m15,n7)
+```
+
+矩阵形式：
+
+| m\n | n0 | n1 | n2 | n3 | n4 | n5 | n6 | n7 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 8 | 16 | 24 | 32 | 40 | 48 | 56 |
+| 1 | 1 | 9 | 17 | 25 | 33 | 41 | 49 | 57 |
+| 2 | 2 | 10 | 18 | 26 | 34 | 42 | 50 | 58 |
+| 3 | 3 | 11 | 19 | 27 | 35 | 43 | 51 | 59 |
+| 4 | 4 | 12 | 20 | 28 | 36 | 44 | 52 | 60 |
+| 5 | 5 | 13 | 21 | 29 | 37 | 45 | 53 | 61 |
+| 6 | 6 | 14 | 22 | 30 | 38 | 46 | 54 | 62 |
+| 7 | 7 | 15 | 23 | 31 | 39 | 47 | 55 | 63 |
+| 8 | 64 | 72 | 80 | 88 | 96 | 104 | 112 | 120 |
+| 9 | 65 | 73 | 81 | 89 | 97 | 105 | 113 | 121 |
+| 10 | 66 | 74 | 82 | 90 | 98 | 106 | 114 | 122 |
+| 11 | 67 | 75 | 83 | 91 | 99 | 107 | 115 | 123 |
+| 12 | 68 | 76 | 84 | 92 | 100 | 108 | 116 | 124 |
+| 13 | 69 | 77 | 85 | 93 | 101 | 109 | 117 | 125 |
+| 14 | 70 | 78 | 86 | 94 | 102 | 110 | 118 | 126 |
+| 15 | 71 | 79 | 87 | 95 | 103 | 111 | 119 | 127 |
+
+特征是：
+
+```text
+B_n 在连续 8 个 work id 中复用
+A_m 每隔 8 个 work id 再次出现
+```
+
+例如：
+
+```text
+B0：work id 0..7
+A0：work id 0, 8, 16, 24, ...
+```
+
+### 6. 为什么这样对 L2 有帮助
+
+每个 output tile `(m,n)` 都需要：
+
+```text
+A_m：128 x K
+B_n：128 x K
+```
+
+不同 tile 会共享 A 或 B。如果两个 tile 的 work id 离得很近，它们
+更可能在相近时间访问同一份 A/B 数据，也就更有机会命中 L2。
+
+当前 `32 x 32` tile 网格在第一个 wave 有 148 个 work id。粗看三个
+顺序的工作集：
+
+| 顺序 | 第一个 wave 的 A tile | 第一个 wave 的 B tile | 粗略工作集 |
+|---|---:|---:|---:|
+| M 优先 | 5 | 32 | `5 + 32 = 37` |
+| N 优先 | 32 | 5 | `32 + 5 = 37` |
+| `l2_group_size=8` | 8 | 19 | `8 + 19 = 27` |
+
+每个完整 A/B tile 在 `K=4096`、fp16 下约为：
+
+```text
+128 * 4096 * 2 bytes = 1 MiB
+```
+
+所以这三种顺序的粗略 working set 大约分别是：
+
+```text
+M 优先：37 MiB
+N 优先：37 MiB
+group=8：27 MiB
+```
+
+这个计算没有考虑 pipeline stage、L2 容量和 CTA 实际推进速度，只
+用于解释编号顺序为什么会影响缓存压力。
+
+需要强调：
+
+```text
+l2_group_size 只提高 L2 复用的概率。
+它不保证每个请求都命中 L2。
+它也不保证 CTA 按照全局 work id 完全同步执行。
+```
+
+### 7. scheduler 绑定后，后面是不是普通流水线
+
+对于当前 kernel，可以这样理解：
+
+```text
+scheduler 外层：
+  决定当前 CTA 处理哪块 tile
+
+K-loop 内层：
+  仍然是 Step 5 的 TMA + MMA 软件流水线
+```
+
+结构是：
+
+```python
+tile_scheduler.init(bx)
+
+while tile_scheduler.valid():
+    m_st = tile_scheduler.m_idx * BLK_M
+    n_st = tile_scheduler.n_idx * BLK_N
+
+    # Step 5 的完整 tile 计算流水线
+    # prologue TMA
+    # K-loop MMA
+    # epilogue writeback
+
+    T.cuda.cta_sync()
+    tile_scheduler.next_tile()
+```
+
+“逻辑分配固定”和“物理执行固定”要分开：
+
+| 项目 | 是否固定 |
+|---|---|
+| CTA 的 work id 序列 | 固定 |
+| work id 到 `(m_idx,n_idx)` 的映射 | 固定 |
+| 每块 tile 的 `m_st/n_st` | 固定 |
+| CTA 运行在哪颗 SM | 硬件决定，不固定 |
+| CTA 何时开始执行 | 硬件决定，不保证 |
+| 各 CTA 是否同步推进 | 不保证 |
+
+所以后面大部分确实只是原有 pipeline，但外层 loop 仍有两个硬性
+约束：
+
+```text
+所有线程完成当前 tile 后，才能 next_tile()
+每块 tile 重置 phase 前，必须满足偶数次 completion 的 parity 条件
+```
+
+### 8. 常见错误
+
+| 错误理解或实现 | 后果 |
+|---|---|
+| 把 `work_id` 当成 A/B/D 地址 | tile 坐标和内存 offset 混乱 |
+| `next_tile()` 只加 1 | 多个 CTA 重复处理相同 tile |
+| 把 `SM_COUNT` 当成 tile 数量 | 误判每个 CTA 的任务数 |
+| 认为 CTA 永久绑定某个 SM | 错误推断 residency 和负载 |
+| 在 `cta_sync()` 前调用 `next_tile()` | 不同线程使用不同 `m_st/n_st` |
+| 认为 `l2_group_size` 保证 L2 命中 | 用逻辑顺序代替性能测量 |
+| 多 CTA cluster 仍使用 CTA 数量作为 stride | cluster 之间任务划分错误 |
+
+### 9. 补充自测
+
+#### 1. `tile_scheduler.init(bx)` 会得到什么状态？
+
+答：得到当前 worker 的初始 `linear_idx=bx`、`tile_count=0`，并
+立即解码出第一块 tile 的 `m_idx/n_idx`。它不会调用
+`next_tile()`，也不会绑定物理 SM。
+
+#### 2. `work_id` 和 `(m_idx,n_idx)` 的区别是什么？
+
+答：`work_id` 是任务在全局调度顺序中的一维编号；`(m_idx,n_idx)`
+是任务对应的 output tile 二维坐标。地址由 `(m_idx,n_idx)` 计算，
+而不是直接使用 `work_id`。
+
+#### 3. 为什么 `next_tile()` 让 work id 增加 148？
+
+答：当前有 148 个 scheduler cluster，每个 cluster 对应一个 CTA。
+每个 worker 从 `bx` 开始，按 worker 数量做 stride，保证 148 个
+序列互不重叠并覆盖所有 tile。
+
+#### 4. `SM_COUNT=148` 是否表示一个 SM 一块 tile？
+
+答：不是。它启动 148 个 CTA，每个 CTA 处理 6 或 7 块 tile。设计
+目标是接近一 SM 一个 persistent CTA，但 CTA 与 SM 没有固定绑定。
+
+#### 5. 为什么 `l2_group_size=8` 对 L2 locality 有好处？
+
+答：它让固定 N column 的 8 个 M tile 连续出现，使 `B_n` 在很短
+的 work id 窗口中复用；同时 `A_m` 每隔 8 个 work id 再次出现。
+相比 M 优先或 N 优先，它把 A/B 工作集控制在更平衡、通常更小的
+范围内，从而提高 L2 命中的概率。

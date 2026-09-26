@@ -31,7 +31,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [15-gemm-basics.md](15-gemm-basics.md) | Tiled GEMM 的优化路线、`D = A * B^T` 约定、Blackwell 四段数据路径、单 tile baseline、`hgemm_v1` 完整代码、`D[73,91]` 的 TMEM 与 thread 映射、`hgemm_v2/v3` 的 K-loop 与 Multi-CTA spatial tiling，以及 `accum` 首轮覆写、后续累加、mbarrier phase 协议和 CTA tile 覆盖验证 |
 | [16-gemm-async-tma.md](16-gemm-async-tma.md) | `hgemm_v4` 的单线程 TMA Load、`mbarrier.arrive.expect_tx`、32768-byte transaction trace、`try_wait` phase 协议、`fence.proxy_async`、TMA Store `commit_group` / `wait_group(0)` 与完整验证脚本 |
 | [17-gemm-software-pipeline.md](17-gemm-software-pipeline.md) | `hgemm_v5` 的 `PIPE_DEPTH=2` 双缓冲、prologue prefetch、stage ring、每 stage 独立 TMA barrier、`phase_tma` / `phase_mma` 翻转规则，以及 `K_TILES=5` 的完整执行 trace |
-| [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、1024 tiles / 148 CTAs 分配、`l2_group_size=8`、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
+| [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、`work_id` / `init(bx)` / stride 148、M 优先与 N 优先的完整编号对照、`l2_group_size=8` 的 L2 locality、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
 
 ## 当前进度
 
