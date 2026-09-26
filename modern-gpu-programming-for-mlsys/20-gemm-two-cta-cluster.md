@@ -1,16 +1,18 @@
-# GEMM Advanced Step 8.1-8.2：Two-CTA Cluster 的 Tile 所有权、地址与 Epilogue
+# GEMM Advanced Step 8.1-8.3：Two-CTA Cluster 的所有权、Epilogue 与集中式 TMA Barrier
 
 这篇笔记进入 `chapter_gemm_advanced` 的 Step 8。Step 7 已经在一个 CTA
 内部把 TMA producer、MMA consumer 和 writeback 拆成三个角色；Step 8
 把协作范围继续扩大到一个包含两个 CTA 的 cluster。
 
-本文讲 Step 8 的前两个小知识点：
+本文讲 Step 8 的前三个小知识点：
 
 ```text
 1. 两个 CTA 为什么只各自加载一半 A/B，却能共同计算一个
    256 x 256 的 output tile。
 2. m_st / n_st / n_st_epi 分别属于哪条数据路径，以及 epilogue
    为什么要把 256 columns 分成两段 128-column 写回。
+3. 两个 CTA 的 TMA transaction 为什么集中完成到 CTA0 的
+   tma2mma barrier，以及为什么每个 stage 登记 65536 bytes。
 ```
 
 ## 本次讲解位置
@@ -22,7 +24,7 @@
 知识点：CTA0/CTA1 的 A/B slice 所有权，以及 cooperative MMA 产生的
         256 x 256 output tile 与 TMEM 切分
 上次：Step 7: Warp Specialization 与四条 barrier 交接
-下次：Step 8.3：CTA0 集中式 tma2mma barrier 与 65536-byte transaction
+下次：Step 8.4：cta_group=2 cooperative MMA 与 cta_mask=3 completion
 PTX：tcgen05.mma cta_group::2、cp.async.bulk.tensor、
      mbarrier remote arrive、tcgen05.commit cta_mask
 ```
@@ -32,7 +34,7 @@ PTX：tcgen05.mma cta_group::2、cp.async.bulk.tensor、
 ```text
 [x] 8.1 Two-CTA cluster 的 A/B 所有权与 256 x 256 output tile
 [x] 8.2 Tile 地址计算与 epilogue 的两段 128-column 写回
-[ ] 8.3 CTA0 集中式 tma2mma barrier 与 65536-byte transaction
+[x] 8.3 CTA0 集中式 tma2mma barrier 与 65536-byte transaction
 [ ] 8.4 cta_group=2 cooperative MMA 与 cta_mask=3 completion
 [ ] 8.5 ld2mma 的 256 arrivals 与跨 CTA TMEM 复用
 ```
@@ -1411,12 +1413,633 @@ accumulator 降到 128 个，并复用同一份 `reg`、`reg_f16` 和 `Dsmem`。
 `256:384`。结果是前半列缺失、后半列被重复写，第二段还侵入相邻
 cluster tile 的 columns。
 
-## 下一知识点
+## 十一、Step 8.3：CTA0 集中式 `tma2mma` barrier 与 65536-byte transaction
 
-Step 8.2 已经完成。下一步进入 Step 8.3：
+## 本次讲解位置
 
 ```text
-CTA0 的 tma2mma 为什么作为 cluster 的集中 completion barrier
-两个 CTA 的 TMA transaction 如何 remote arrive 到同一个 barrier
-为什么每个 K stage 登记 65536 bytes，而不是 32768 bytes
+本次讲解位置
+章节：chapter_gemm_advanced
+小节：Step 8: Two-CTA Cluster / Cross-CTA Data Handoff
+知识点：CTA0 集中式 tma2mma barrier、remote_view(0) 与
+        65536-byte transaction
+上次：Step 8.2：Tile 地址计算与两段 128-column epilogue
+下次：Step 8.4：cta_group=2 cooperative MMA 与 cta_mask=3 completion
+PTX：cp.async.bulk.tensor、mbarrier.arrive.expect_tx、
+     mbarrier.try_wait.parity、remote CTA barrier
+```
+
+### 1. 学习目标：让 CTA0 一次等到两个 CTA 的四笔 TMA
+
+Step 8 的 cooperative MMA 只由 CTA0 中一个 elected thread 发起。但是这次
+MMA 读取的 operand 分布在两个 CTA 的 SMEM 中：
+
+```text
+CTA0 SMEM: A0, B0
+CTA1 SMEM: A1, B1
+```
+
+因此 CTA0 的 MMA consumer 不能只等待自己的 A0、B0。它必须等到：
+
+```text
+CTA0 的 A0 load 完成
+CTA0 的 B0 load 完成
+CTA1 的 A1 load 完成
+CTA1 的 B1 load 完成
+```
+
+最直接的想法是让每个 CTA 先等待自己的两笔 TMA，再执行一次 cluster-wide
+同步。但这个做法会把两侧的 TMA latency 串成两段，并且破坏 per-stage
+pipeline。
+
+Step 8.3 采用集中式完成协议：
+
+```text
+两个 CTA 的 TMA 完成事件
+-> 都报告到 CTA0 的 tma2mma[stage]
+
+CTA0 中唯一的 producer thread
+-> 登记本轮需要完成的 65536 bytes
+
+CTA0 的 MMA consumer
+-> 只等待这一份 barrier
+```
+
+学习目标不是背出 `65536`，而是能回答下面三个问题：
+
+```text
+为什么 init 的数量是 1，而不是 2？
+为什么一个 K stage 要登记 65536 bytes，而不是 32768？
+remote_view(0) 把什么变成 remote，什么仍然保持 local？
+```
+
+### 2. 心智模型：一个 CTA0 barrier 汇总四笔 transaction
+
+先把 `tma2mma` 想成 CTA0 中每 stage 一个“到货看板”。它同时记录两类工作：
+
+```text
+software arrivals
+以及尚未完成的 TMA bytes
+```
+
+一个 phase 完成的条件是：
+
+```text
+待到达的 arrival 次数 == 0
+并且
+待完成的 transaction bytes == 0
+```
+
+K stage 0 的完整关系可以画成：
+
+```text
+CTA0 TMA engine
+    A0: 16384 bytes --------+
+    B0: 16384 bytes --------+----> CTA0 tma2mma[0]
+                                 |
+CTA1 TMA engine                  |
+    A1: 16384 bytes --------+----> 同一份 barrier
+    B1: 16384 bytes --------+
+
+CTA0 elected producer
+    1 arrival + expect 65536 ----^
+
+CTA0 MMA consumer
+    wait(tma2mma[0], phase) <----+
+```
+
+四条 `complete_tx` 路径只减少 pending bytes，不会各自产生一次 software
+arrival。software arrival 只有 CTA0 中一个 elected producer 提供。
+
+因此，`tma2mma.init(1)` 的含义是：
+
+```text
+每个 phase 只等待 1 次软件 arrival
+```
+
+不是：
+
+```text
+每个 CTA 各自 arrive 一次
+每个 TMA engine arrive 一次
+每个 A/B operand arrive 一次
+```
+
+TMA 的到货通过 byte count 报告，不是通过普通 thread arrival 报告。
+
+### 3. `tma2mma`、`init` 与 `remote_view(0)` 的作用范围
+
+完整 kernel 中与本节直接相关的初始化代码是：
+
+```python
+pool = T.SMEMPool()
+tmem_addr = pool.alloc((1,), "uint32")
+tma2mma = TMABar(pool, PIPE_DEPTH)
+mma2tma = TCGen05Bar(pool, PIPE_DEPTH)
+mma2ld = TCGen05Bar(pool, 1)
+ld2mma = MBarrier(pool, 1)
+pool.move_base_to(1024)
+Asmem = pool.alloc(
+    (PIPE_DEPTH, BLK_M, BLK_K),
+    a_type,
+    layout=A_layout,
+)
+Bsmem = pool.alloc(
+    (PIPE_DEPTH, BLK_N, BLK_K),
+    b_type,
+    layout=B_layout,
+)
+Dsmem = pool.alloc(
+    (BLK_M, 128),
+    d_type,
+    layout=D_layout,
+)
+
+tma2mma.init(1)
+mma2tma.init(1)
+mma2ld.init(1)
+ld2mma.init(128 * CTA_GROUP)
+pool.commit()
+
+if wg_id == 0:
+    if warp_id == 0:
+        T.ptx.tcgen05.alloc(
+            T.address_of(tmem_addr),
+            n_cols=512,
+            cta_group=CTA_GROUP,
+        )
+
+T.ptx.fence.proxy_async("shared::cta")
+T.ptx.fence.mbarrier_init()
+T.cuda.cta_sync()
+```
+
+这里每个 CTA 都会执行 `tma2mma = TMABar(pool, PIPE_DEPTH)` 和
+`tma2mma.init(1)`。每个 CTA 的 shared memory 中都有一组本地 barrier
+slots，但是 Step 8 只把 CTA0 的那组当作聚集点。
+
+两边得到同一个远程引用的方式是：
+
+```python
+tma2mma_cta0 = tma2mma.remote_view(0)
+```
+
+它的语义可以展开为：
+
+| 调用所在位置 | `remote_view(0)` 解析结果 | 结果 |
+|---|---|---|
+| CTA0 | CTA0 的本地 `tma2mma` | 仍然是 local barrier |
+| CTA1 | cluster rank 0 的 `tma2mma` | 通过 DSMEM 访问 CTA0 的 barrier |
+
+这里“remote”的只有 barrier 的 completion target。A1、B1 的数据并不是写到
+CTA0 的 SMEM，它们仍分别搬进 CTA1 自己的：
+
+```text
+CTA1.Asmem
+CTA1.Bsmem
+```
+
+需要区分三类 object：
+
+| Object | 数据或状态所在位置 | 谁写 | 谁读 |
+|---|---|---|---|
+| `Asmem`, `Bsmem` | 当前 CTA 的 shared memory | 当前 CTA 的 TMA load | cooperative MMA |
+| CTA0 的 `tma2mma[stage]` | CTA0 的 shared memory | 两个 CTA 的 TMA engine，以及 CTA0 的 producer | CTA0 的 MMA consumer |
+| TMEM accumulator | 两个 CTA 各自的 TMEM | cooperative MMA | 各自的 writeback warpgroup |
+
+### 4. 完整交接路径
+
+以下是完整 kernel 中实际执行的四段路径：
+
+```python
+if wg_id == 1:
+    if warp_id == 3:
+        tma_ps = PipelineState(PIPE_DEPTH, phase=1)
+
+        @T.inline
+        def tma_load(k_offset):
+            Tx.copy_async(
+                Asmem[tma_ps.stage, :, :],
+                A[
+                    m_st : m_st + BLK_M,
+                    k_offset : k_offset + BLK_K,
+                ],
+                dispatch="tma_auto",
+                cta_group=CTA_GROUP,
+                mbar=tma2mma_cta0.ptr_to([tma_ps.stage]),
+            )
+            Tx.copy_async(
+                Bsmem[tma_ps.stage, :, :],
+                B[
+                    n_st : n_st + BLK_N,
+                    k_offset : k_offset + BLK_K,
+                ],
+                dispatch="tma_auto",
+                cta_group=CTA_GROUP,
+                mbar=tma2mma_cta0.ptr_to([tma_ps.stage]),
+            )
+
+        if T.filter(lane_id, T.ptx.elect_sync()):
+            while tile_scheduler.valid():
+                for k in range(K_TILES):
+                    mma2tma.wait(
+                        tma_ps.stage,
+                        tma_ps.phase,
+                    )
+                    tma_load(k * BLK_K)
+                    if cbx == 0:
+                        tma2mma_cta0.arrive(
+                            tma_ps.stage,
+                            CTA_GROUP
+                            * (
+                                BLK_M * BLK_K
+                                + BLK_N * BLK_K
+                            )
+                            * F16_SIZE,
+                        )
+                    tma_ps.advance()
+                tile_scheduler.next_tile()
+
+    elif warp_id == 0:
+        mma_ps = PipelineState(PIPE_DEPTH, phase=0)
+        ld_ps = PipelineState(1, phase=1)
+
+        if cbx == 0:
+            if T.filter(lane_id, T.ptx.elect_sync()):
+                while tile_scheduler.valid():
+                    ld2mma.wait(
+                        ld_ps.stage,
+                        ld_ps.phase,
+                    )
+                    ld_ps.advance()
+
+                    for k in range(K_TILES):
+                        tma2mma.wait(
+                            mma_ps.stage,
+                            mma_ps.phase,
+                        )
+                        Tx.gemm_async(
+                            tmem[:, :MMA_N],
+                            Asmem[mma_ps.stage, :, :],
+                            Bsmem[mma_ps.stage, :, :],
+                            accum=(k != 0),
+                            dispatch="tcgen05",
+                            cta_group=CTA_GROUP,
+                        )
+                        mma2tma.arrive(
+                            mma_ps.stage,
+                            cta_group=CTA_GROUP,
+                            cta_mask=3,
+                        )
+                        mma_ps.advance()
+
+                    mma2ld.arrive(
+                        0,
+                        cta_group=CTA_GROUP,
+                        cta_mask=3,
+                    )
+                    tile_scheduler.next_tile()
+```
+
+完整 kernel 位于本文件的“三、完整 Kernel”，因此不需要打开临时课程
+clone。这里把每个 action 的 scope 再列一次：
+
+| 代码 | 执行者 | 作用 |
+|---|---|---|
+| `tma_load(k_offset)` | 两边各自的 producer elected lane | 每个 CTA 发起自己的 A、B TMA load |
+| `mbar=tma2mma_cta0.ptr_to([stage])` | 两边各自的 TMA copy | completion bytes 都报告到 CTA0 的 stage barrier |
+| `if cbx == 0: arrive(stage, 65536)` | 只有 CTA0 的 producer elected lane | 提供 1 次 arrival，并登记两个 CTA 的总 bytes |
+| `tma2mma.wait(stage, phase)` | 只有 CTA0 的 MMA consumer elected lane | 等完整 A0/B0/A1/B1 集合 |
+| `Tx.gemm_async(..., cta_group=2)` | CTA0 的 MMA consumer | 跨 CTA 读取两侧 SMEM |
+
+CTA1 不执行 `tma2mma.wait`，因为 CTA1 不单独发起 cooperative MMA。
+CTA1 的 TMA engine 只负责搬运自己的 SMEM，并把“搬完了多少 bytes”报告给
+CTA0 的 barrier。
+
+### 5. 为什么是 1 次 arrival，不是 2 次
+
+`tma2mma.init(1)` 和 `arrive(stage, ...)` 的第二项是两个不同的计数器。
+
+| 项目 | `init(1)` | `arrive(stage, 65536)` |
+|---|---|---|
+| 作用 | 设置每个 phase 的 expected software arrivals | 执行 1 次 arrival并登记 tx bytes |
+| 物理含义 | 需要多少个普通 arrival 事件 | 需要多少 TMA bytes 完成 |
+| 谁提供 | CTA0 的 elected producer | 两个 CTA 的四笔 TMA transaction |
+| 数量来源 | 协调者只有一个 | `2 * (A + B)` 的总字节数 |
+
+如果写成：
+
+```python
+tma2mma.init(2)
+```
+
+但只有一个 CTA0 producer 执行 arrive，那么每个 phase 都会缺少一次
+arrival。表现通常是：
+
+```text
+TMA 数据已经全部搬完
+pending bytes 已经变成 0
+但 pending arrivals 仍然为 1
+CTA0 MMA consumer 一直等不到 phase completion
+kernel hang 或 timeout
+```
+
+反过来，如果没有 `if cbx == 0`，让两个 CTA 都执行 arrive，而 barrier 仍然
+初始化为 1，也会破坏协议。这里的 `init` 统计的是 software arrival 数量，
+不是 CTA 数量，也不是 TMA engine 数量。
+
+可以用一句话记住：
+
+```text
+两个 CTA 产生 bytes
+一个 CTA0 协调者产生 arrival
+```
+
+### 6. 为什么每个 K stage 是 65536 bytes
+
+当前配置是：
+
+```python
+CTA_GROUP = 2
+BLK_M = 128
+BLK_N = 128
+BLK_K = 64
+F16_SIZE = 2
+```
+
+先算一个 CTA：
+
+```text
+A bytes
+= BLK_M * BLK_K * F16_SIZE
+= 128 * 64 * 2
+= 16384
+
+B bytes
+= BLK_N * BLK_K * F16_SIZE
+= 128 * 64 * 2
+= 16384
+
+单个 CTA 的 A + B
+= 16384 + 16384
+= 32768
+```
+
+再算两个 CTA：
+
+```text
+cluster bytes
+= CTA_GROUP * (A bytes + B bytes)
+= 2 * (16384 + 16384)
+= 2 * 32768
+= 65536
+```
+
+源码公式可以逐项展开：
+
+```python
+CTA_GROUP * (BLK_M * BLK_K + BLK_N * BLK_K) * F16_SIZE
+= 2 * (128 * 64 + 128 * 64) * 2
+= 2 * (8192 + 8192) * 2
+= 2 * 16384 * 2
+= 65536
+```
+
+注意这里第一个 `2` 表示两个 CTA，最后一个 `2` 表示 fp16 的 2 bytes。
+两者数量相同，但物理含义不同。
+
+如果只登记 `32768`，barrier 可能在一个 CTA 的两笔 load 完成后就认为
+phase 已经完成，CTA0 会过早发起 MMA，读到另一侧尚未完成的 SMEM。
+
+### 7. 具体状态 trace：一个 stage 从 phase 0 到 phase 1
+
+以 K stage 0 为例。barrier 初始化后：
+
+```text
+phase = 0
+pending arrivals = 1
+pending tx bytes = 0
+```
+
+两个 CTA 各自发出 A、B 两笔 TMA copy。仅“发出 copy”不会改变 software
+arrival count，也不会立刻完成 phase。
+
+当 CTA0 的 producer 执行：
+
+```python
+tma2mma_cta0.arrive(0, 65536)
+```
+
+状态变为：
+
+```text
+phase = 0
+pending arrivals = 0
+pending tx bytes = 65536
+```
+
+四笔 transaction 的完成顺序不固定。下面故意使用与发射顺序不同的顺序：
+
+| 完成事件 | 完成 bytes | arrival 余量 | tx bytes 余量 | phase |
+|---|---:|---:|---:|---:|
+| 初始状态 | 0 | 1 | 0 | 0 |
+| CTA0 执行 `arrive.expect_tx(65536)` | 0 | 0 | 65536 | 0 |
+| CTA1 B1 完成 | 16384 | 0 | 49152 | 0 |
+| CTA1 A1 完成 | 16384 | 0 | 32768 | 0 |
+| CTA0 B0 完成 | 16384 | 0 | 16384 | 0 |
+| CTA0 A0 完成 | 16384 | 0 | 0 | 0 -> 1 |
+
+当 arrival 和 bytes 同时归零时：
+
+```text
+phase 0 完成
+phase parity 翻转为 1
+barrier 自动开始准备下一轮 arrival
+CTA0 的 tma2mma.wait(0, phase=0) 返回
+CTA0 可以发起 cooperative MMA
+```
+
+完成顺序交换不会改变最终结果。barrier 关心的是总 bytes 是否归零，不是
+四个 transaction 按什么顺序完成。
+
+### 8. 完整可运行的 barrier 状态模拟
+
+下面的脚本不依赖 GPU，只模拟 `tma2mma` 的 arrival 与 tx-count 协议。
+它用相反顺序完成四笔 transaction，验证 phase 仍然正确完成：
+
+```bash
+python3 - <<'PY'
+from dataclasses import dataclass, field
+
+
+@dataclass
+class PhaseBarrier:
+    expected_arrivals: int
+    pending_arrivals: int = field(init=False)
+    tx_pending: int = 0
+    phase: int = 0
+    completed_phases: int = 0
+
+    def __post_init__(self):
+        self.pending_arrivals = self.expected_arrivals
+
+    @property
+    def complete(self):
+        return self.pending_arrivals == 0 and self.tx_pending == 0
+
+    def arrive_expect_tx(self, tx_count):
+        assert self.pending_arrivals > 0, "no arrival is pending"
+        self.pending_arrivals -= 1
+        self.tx_pending += tx_count
+        self._finish_if_ready()
+        print(
+            f"arrive.expect_tx({tx_count}): "
+            f"arrivals={self.pending_arrivals}, tx={self.tx_pending}, "
+            f"phase={self.phase}, completed={self.completed_phases}"
+        )
+
+    def complete_tx(self, byte_count):
+        assert self.tx_pending >= byte_count, (
+            "complete-tx exceeds pending bytes"
+        )
+        self.tx_pending -= byte_count
+        self._finish_if_ready()
+        print(
+            f"complete_tx({byte_count}): "
+            f"arrivals={self.pending_arrivals}, tx={self.tx_pending}, "
+            f"phase={self.phase}, completed={self.completed_phases}"
+        )
+
+    def _finish_if_ready(self):
+        if self.complete:
+            self.pending_arrivals = self.expected_arrivals
+            self.phase ^= 1
+            self.completed_phases += 1
+
+
+CTA_GROUP = 2
+BLK_M = 128
+BLK_N = 128
+BLK_K = 64
+F16_SIZE = 2
+
+a_bytes = BLK_M * BLK_K * F16_SIZE
+b_bytes = BLK_N * BLK_K * F16_SIZE
+local_bytes = a_bytes + b_bytes
+cluster_bytes = CTA_GROUP * local_bytes
+
+barrier = PhaseBarrier(expected_arrivals=1)
+
+transactions = [
+    ("CTA0 A", a_bytes),
+    ("CTA0 B", b_bytes),
+    ("CTA1 A", a_bytes),
+    ("CTA1 B", b_bytes),
+]
+
+print(f"A per CTA: {a_bytes}")
+print(f"B per CTA: {b_bytes}")
+print(f"local subtotal: {local_bytes}")
+print(f"cluster tx_count: {cluster_bytes}")
+print()
+
+for name, nbytes in transactions:
+    print(f"issue {name}: {nbytes} bytes -> CTA0 barrier")
+
+barrier.arrive_expect_tx(cluster_bytes)
+
+for name, nbytes in reversed(transactions):
+    print(f"finish {name}")
+    barrier.complete_tx(nbytes)
+
+assert barrier.completed_phases == 1
+assert barrier.phase == 1
+assert barrier.pending_arrivals == 1
+assert barrier.tx_pending == 0
+print("\nPASS: one phase completed after 1 arrival and 65536 bytes")
+PY
+```
+
+本机静态运行得到的预期输出是：
+
+```text
+A per CTA: 16384
+B per CTA: 16384
+local subtotal: 32768
+cluster tx_count: 65536
+
+issue CTA0 A: 16384 bytes -> CTA0 barrier
+issue CTA0 B: 16384 bytes -> CTA0 barrier
+issue CTA1 A: 16384 bytes -> CTA0 barrier
+issue CTA1 B: 16384 bytes -> CTA0 barrier
+arrive.expect_tx(65536): arrivals=0, tx=65536, phase=0, completed=0
+finish CTA1 B
+complete_tx(16384): arrivals=0, tx=49152, phase=0, completed=0
+finish CTA1 A
+complete_tx(16384): arrivals=0, tx=32768, phase=0, completed=0
+finish CTA0 B
+complete_tx(16384): arrivals=0, tx=16384, phase=0, completed=0
+finish CTA0 A
+complete_tx(16384): arrivals=1, tx=0, phase=1, completed=1
+
+PASS: one phase completed after 1 arrival and 65536 bytes
+```
+
+### 9. 常见错误与可观察症状
+
+| 错误 | 协议发生了什么 | 可观察症状 |
+|---|---|---|
+| CTA1 的 TMA 使用本地 `tma2mma`，没有走 `remote_view(0)` | CTA0 只收到 32768 bytes，却登记了 65536 | CTA0 的 `tma2mma.wait` 永远不返回，kernel hang |
+| `tma2mma.init(2)`，但只有 CTA0 执行 arrive | 每轮少一次 software arrival | bytes 已归零但 phase 不完成 |
+| 两个 CTA 都执行 arrive，但 init 仍是 1 | 多出一次 arrival，可能提前推进 phase | barrier 记账错位、随机读到未完成数据或后续 phase 挂起 |
+| tx_count 只写 32768 | 一个 CTA 完成后就被误判为完整 | cooperative MMA 读取另一侧尚未完成的 SMEM，结果随机错误 |
+| `PIPE_DEPTH` 个 stages 共用一份 barrier | 新旧 K stage 的完成事件混在同一 phase | stage 交错时随机 hang 或读到旧 tile |
+| 把 `remote_view(0)` 理解成 remote copy | 误以为 A1、B1 应写进 CTA0 SMEM | layout 和 local allocation 全错，MMA 读取错误地址 |
+| barrier init 后缺少 fence 和 CTA sync | 其他线程可能观察不到初始化结果 | barrier 行为未定义、首轮随机失败 |
+
+### 10. 自测题与答案
+
+#### 1. 两个 CTA 都有 TMA producer，为什么 `tma2mma.init(1)` 仍然正确？
+
+答：TMA completion 通过 `complete_tx` 减少 pending bytes，不会产生
+software arrival。两个 CTA 的四笔 transaction 都由 CTA0 唯一的 elected
+producer 通过一次 `arrive` 统一登记，所以 expected arrival count 是 1。
+
+#### 2. 为什么一个 K stage 的 `tx_count` 是 65536？
+
+答：
+
+```text
+A per CTA = 128 * 64 * 2 = 16384 bytes
+B per CTA = 128 * 64 * 2 = 16384 bytes
+one CTA = 32768 bytes
+two CTAs = 65536 bytes
+```
+
+#### 3. `remote_view(0)` 让哪部分变成 remote？
+
+答：它让 barrier 的 arrival 和 transaction completion 落到 cluster rank
+0，也就是 CTA0 的 `tma2mma`。A1、B1 的数据仍然写进 CTA1 自己的 SMEM，
+数据目的地没有变成 remote。
+
+#### 4. 如果 CTA1 的 TMA completion 报告到本地 barrier，会发生什么？
+
+答：CTA0 只能看见自己的 32768 bytes，无法让登记的 65536 bytes 归零。
+CTA0 的 MMA consumer 会一直等待，典型症状是 kernel hang 或 timeout。
+
+#### 5. 为什么不能直接用 `cluster_sync()` 代替 `tma2mma`？
+
+答：`cluster_sync()` 只能说明两个 CTA 的线程到达了同步点，不能说明各自
+发出的异步 TMA 已经把 A、B bytes 全部写入 SMEM。即使两侧都调用
+`cluster_sync()`，TMA 仍可能尚未完成。完成协议必须等 TMA 的 bytes，
+`tma2mma` 正是这个 per-stage byte-completion barrier。
+
+## 下一知识点
+
+Step 8.3 已经完成。下一步进入 Step 8.4：
+
+```text
+cta_group=2 如何让一次 MMA 读取两个 CTA 的 SMEM
+为什么只由 CTA0 发起 cooperative MMA
+tcgen05.commit 的 cta_mask=3 如何通知两侧 CTA
 ```
