@@ -1424,8 +1424,25 @@ O1 = S_region[3]
 `P_region` 把 fp16 第二维 `1024` 分解成：
 
 ```text
-4 stages × 2 halves × 128 fp16 values
+4 个 128-column blocks × 2 halves × 128 fp16 values
 ```
+
+这里的“4”不是四个 Q pipeline stages，而是 fp16 alias 覆盖整块 512 physical
+columns 后得到的四个 128-column blocks。它们分别对应底层已经存在的
+`S0 / S1 / O0 / O1`：
+
+| `s` | fp16 logical slots | physical columns | fp32 区域 |
+|---:|---:|---:|---|
+| 0 | `[0, 256)` | `[0, 128)` | `S0` |
+| 1 | `[256, 512)` | `[128, 256)` | `S1` |
+| 2 | `[512, 768)` | `[256, 384)` | `O0` |
+| 3 | `[768, 1024)` | `[384, 512)` | `O1` |
+
+`two=2` 再把每个 256-fp16-slot block 分成两个 128-fp16-slot 的 half。例如
+`s=0` 的 high half 使用 fp16 slots `[128, 256)`，对应 physical columns
+`[64, 128)`，因此它就是 `P0`。同理，`s=1` 的 high half 对应 `P1`。
+`s=2`、`s=3` 对应 O accumulator，不会拿来保存 P。因此 Q pipeline 仍然只有
+两个 stages，`q_stage` 的取值仍只有 0 和 1。
 
 源码实际使用每个 stage 的 high half：
 
