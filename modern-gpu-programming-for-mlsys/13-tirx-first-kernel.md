@@ -916,19 +916,270 @@ m_thr = m_st + warp_id * 32 + lane_id
 如果 mapping 一边改变而另一边未变，通常会产生有规律的 row 置换；
 这通常不是浮点误差。
 
-## 九、当前进度
+## 九、补充：`T.device_entry()` 是 device region marker
+
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_intro_tirx
+小节：TIRx PrimFunc 的 device region
+知识点：T.device_entry() 的 IR 语义，以及省略后的编译行为
+上次：第一个单 tile TIRx GEMM 的完整数据路径
+下次：chapter_tirx_layout_api
+PTX：无；T.device_entry() 是 TIRx 编译期 marker，不生成 PTX 指令
+```
+
+### 1. 学习目标：谁告诉编译器“从这里开始是 GPU 代码”
+
+`@T.prim_func` 给出的是一个 TIRx 函数边界。一个 host/device 程序在
+lowering 后通常需要变成两部分：
+
+```text
+host launcher
+    负责准备参数并启动 kernel
+
+device kernel
+    运行在 GPU 上，使用 blockIdx、threadIdx、SMEM、TMEM 等资源
+```
+
+编译器不能只因为函数里出现了 `T.thread_id()` 就猜测整段代码都是 device
+代码。`T.device_entry()` 的作用就是显式标出 device region 的起点。
+
+它解决的是编译期分区问题，不是运行时行为：
+
+| 问题 | 由谁回答 |
+|---|---|
+| 哪些语句属于 device region？ | `T.device_entry()` |
+| grid 中有多少 CTA？ | `T.cta_id([extent...])` 等 scope ID |
+| 一个 CTA 有多少 threads？ | `T.thread_id([extent])` 等 scope ID |
+| GPU 上执行哪条指令？ | TIRx primitive 与 backend lowering |
+
+### 2. 心智模型：它是一道区域边界，不是一次 CUDA 调用
+
+下面写法：
+
+```python
+@T.prim_func
+def scale(
+    A: T.Buffer((128,), "float32"),
+    B: T.Buffer((128,), "float32"),
+):
+    T.device_entry()
+    tx = T.thread_id([128])
+    B[tx] = A[tx] * T.float32(2.0)
+```
+
+可以近似理解为：
+
+```text
+PrimFunc
+  device region
+    thread id binding: tx
+    B[tx] = A[tx] * 2
+```
+
+在 TIRx IR 中，它保存为一个 `AttrStmt`：
+
+```text
+AttrStmt(
+  attr_key="tirx.device_entry",
+  value=True,
+  body=<device region 中的后续语句>,
+)
+```
+
+编译器后续会执行两类关键工作：
+
+```text
+LowerTIRx
+    解析 T.cta_id、T.thread_id 等抽象 ID，
+    建立 blockIdx / threadIdx 对应的 thread binding
+
+SplitHostDevice
+    从带 device_entry marker 的区域提取 device kernel，
+    生成配套的 host launcher
+```
+
+因此它有三个直接结论：
+
+```text
+它不是 CUDA API
+它不产生机器指令
+它没有运行时开销
+```
+
+它也不会决定 grid 和 block 的大小。真正的形状来自：
+
+```python
+bx = T.cta_id([4])       # gridDim.x = 4
+tx = T.thread_id([256])  # blockDim.x = 256
+```
+
+### 3. 完整可运行对比
+
+文件：`device_entry_demo.py`
+
+这个文件分别编译“有 marker”和“没有 marker”的版本。没有 marker 的
+版本在运行前就会在 TIRx 编译流程中失败，因此不会进入 CUDA 执行阶段。
+
+```python
+import tvm
+from tvm.script import tirx as T
+
+
+@T.prim_func
+def scale_with_entry(
+    A: T.Buffer((128,), "float32"),
+    B: T.Buffer((128,), "float32"),
+):
+    T.device_entry()
+    tx = T.thread_id([128])
+    B[tx] = A[tx] * T.float32(2.0)
+
+
+@T.prim_func
+def scale_without_entry(
+    A: T.Buffer((128,), "float32"),
+    B: T.Buffer((128,), "float32"),
+):
+    tx = T.thread_id([128])
+    B[tx] = A[tx] * T.float32(2.0)
+
+
+def compile_one(name, fn):
+    print(f"=== {name} ===")
+    try:
+        tvm.compile(
+            tvm.IRModule({"main": fn}),
+            target="cuda",
+            tir_pipeline="tirx",
+        )
+        print("compile: PASS")
+    except Exception as err:
+        print("compile: FAIL")
+        print(f"{type(err).__name__}: {err}")
+
+
+def main():
+    compile_one("device_entry=True", scale_with_entry)
+    compile_one("device_entry=False", scale_without_entry)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+执行：
+
+```bash
+cd /Users/saboxu/Documents/ChatGPT/mlc学习
+./mlc/bin/python device_entry_demo.py
+```
+
+本机 `mlc` 环境中，核心输出是：
+
+```text
+=== device_entry=True ===
+compile: PASS
+
+=== device_entry=False ===
+compile: FAIL
+RuntimeError: Memory verification failed with the following errors:
+Variable `B_ptr` is directly accessed by host memory (it is not contained in a thread environment or in the function arguments.
+Variable `A_ptr` is directly accessed by host memory (it is not contained in a thread environment or in the function arguments.
+Did you forget to bind?
+```
+
+这个实验揭示了一个容易忽略的区别：
+
+```text
+@T.prim_func 解析源码：没有 device_entry 也可以成功
+tvm.compile 做 lowering：没有 device_entry 会失败
+```
+
+原因是 `T.thread_id([128])` 只是在 TIRx 源码里声明了一个抽象 ID。
+没有 device region，后续 verification 仍会把 `A[tx]` 和 `B[tx]` 看作
+host 对被捕获 buffer 的直接访问，而不是 device kernel 中的
+thread-dependent access。
+
+### 4. print IR 时会看到什么
+
+调用：
+
+```python
+print(scale_with_entry.script())
+```
+
+会看到 marker 被打印成：
+
+```python
+T.attr({"tirx.device_entry": T.bool(True)})
+tx = T.thread_id([128])
+B[tx] = A[tx] * T.float32(2.0)
+```
+
+`scale_without_entry.script()` 中不会再出现
+`tirx.device_entry`。这说明它不是普通 Python 空函数调用后被丢弃，
+而是进入 TIRx IR 的结构性属性。
+
+### 5. 常见错误与可观察症状
+
+| 错误 | 实际含义 | 可观察症状 |
+|---|---|---|
+| 把它当作 CUDA kernel launch | 它不设置 grid 或 block | 写了 marker 仍不知道启动规模 |
+| 认为省略它只是少一个注解 | device region 没有建立 | `tvm.compile` 报 host memory access 或 thread binding 错误 |
+| 放在条件分支里 | marker 的区域范围变成条件体 | 分支外语句不属于 device region，lowering 不完整 |
+| 在 host-only `PrimFunc` 中使用 | host 函数没有 GPU device region | 可能产生无意义或错误的 host/device 分区 |
+| 期待它出现在 PTX/CUDA source | 它只存在于 TIRx IR | 生成的 device code 中找不到这个调用 |
+| 用多个 marker 划分多段 device region | 一个 TIRx function 通常只需一个入口边界 | 分区与 binding 语义混乱 |
+
+最值得记住的是：`T.device_entry()` 是编译器的“区域标记”，类似
+IR 层的边界说明，不是执行时的函数调用。
+
+### 6. 自测题与答案
+
+#### 1. `T.device_entry()` 是一条 CUDA runtime API 吗？
+
+答：不是。它是 TIRx 的编译期 marker，用来标记 device region，
+不生成运行时的 CUDA 调用。
+
+#### 2. 既然 `@T.prim_func` 已经定义函数，为什么还需要它？
+
+答：`@T.prim_func` 定义函数和参数边界，但没有单独告诉 lowering
+哪一段是 GPU device 代码。`T.device_entry()` 显式给出这个区域边界。
+
+#### 3. 省略它会怎样？
+
+答：`fn.script()` 可能仍能打印，但 `tvm.compile(...,
+tir_pipeline="tirx")` 可能因为 device region 和 thread binding 不完整
+而失败。最小示例中的错误是 buffer 被报告为 host direct access。
+
+#### 4. 它负责设置 grid 和 block 的大小吗？
+
+答：不负责。grid 和 block 的 extent 来自 `T.cta_id([...])`、
+`T.thread_id([...])` 等 scope ID 声明。
+
+#### 5. 它会产生运行时性能开销吗？
+
+答：不会。它不是一条 device instruction，除了参与编译期 host/device
+切分，不会在执行阶段留下指令。
+
+## 十、当前进度
 
 `chapter_intro_tirx` 的知识点：
 
 ```text
 [x] 第一个 TIRx Kernel
 [x] 编译并验证结果
+[x] T.device_entry() 的 device region 语义
 ```
 
 已经覆盖：
 
 ```text
 TIRx 是使用 threads、SMEM、TMEM、barrier 与 Tensor Core 概念的 Python DSL
+T.device_entry 标记 device region，不生成 PTX 指令
 Scope / Layout / Dispatch 是 tile 操作的三项核心语义
 单 tile GEMM 计算 D = A x B^T
 A/B 数据路径：GMEM -> SMEM -> tcgen05.mma

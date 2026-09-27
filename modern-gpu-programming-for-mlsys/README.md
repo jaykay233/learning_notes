@@ -26,7 +26,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md) | TMEM 容量、按列 allocation、warp Lane 访问窗口、`tcgen05.ld/st`、shape/num、pack/unpack，以及 `wait::ld/st` 的异步完成边界 |
 | [11-mbarrier-phase-lifecycle.md](11-mbarrier-phase-lifecycle.md) | `mbarrier` 的 arrival、phase 完成条件、parity 翻转、threads 与 TMA 的 fence / sync 交接、`full` / `empty` stage 所有权，以及 `tcgen05.commit` 的完成 arrival |
 | [12-clc-dynamic-scheduling.md](12-clc-dynamic-scheduling.md) | 静态 persistent scheduler 的 launch tail、CLC 请求生命周期、请求与当前 tile 的异步重叠、静态与动态调度的适用边界，以及 `sm_100+` 硬件限制 |
-| [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
+| [13-tirx-first-kernel.md](13-tirx-first-kernel.md) | TIRx 单 tile GEMM 数据路径、`T.device_entry()` 的 device region 语义、Scope / Layout / Dispatch、SMEMPool、TMEM allocation、elected-thread MMA 与 warpgroup writeback |
 | [14-tirx-layout-api.md](14-tirx-layout-api.md) | TIRx `TileLayout` 的 `S[...]`、`R[...]`、固定 offset、命名轴语义、`apply()` 的三种入口、TMEM accumulator、scale-factor replica、`tmem_datapath_layout` 的 D/F row mapping、`tcgen05_atom_layout` 的 atom / rep / register mapping、`wg_local_layout` 的 warpgroup row-to-thread mapping，以及 `ComposeLayout` 与 shared-memory XOR swizzle |
 | [15-gemm-basics.md](15-gemm-basics.md) | Tiled GEMM 的优化路线、`D = A * B^T` 约定、Blackwell 四段数据路径、单 tile baseline、`hgemm_v1` 完整代码、`D[73,91]` 的 TMEM 与 thread 映射、`hgemm_v2/v3` 的 K-loop 与 Multi-CTA spatial tiling，以及 `accum` 首轮覆写、后续累加、mbarrier phase 协议和 CTA tile 覆盖验证 |
 | [16-gemm-async-tma.md](16-gemm-async-tma.md) | `hgemm_v4` 的单线程 TMA Load、`mbarrier.arrive.expect_tx`、32768-byte transaction trace、`try_wait` phase 协议、`fence.proxy_async`、TMA Store `commit_group` / `wait_group(0)` 与完整验证脚本 |
@@ -175,6 +175,7 @@ tid_in_wg 将 output row 映射到 thread
 tcgen05.wait.ld 与 TMEM -> register writeback
 relinquish_alloc_permit 与 tcgen05.dealloc
 chapter_intro_tirx 第一个单 tile GEMM Kernel
+chapter_intro_tirx 补充：T.device_entry 标记 device region
 tvm.compile、IRModule 与 tir_pipeline="tirx"
 LowerTIRx 展开 tile-level primitives
 检查 TIRx script 与最终 CUDA source
