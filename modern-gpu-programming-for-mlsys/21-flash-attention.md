@@ -8,10 +8,11 @@ persistent scheduling、warp specialization 和 two-CTA cooperative MMA
 QK^T MMA -> softmax -> PV MMA
 ```
 
-目前已经讲完三个知识点：不保存完整 score matrix，如何按 K/V block
+目前已经讲完四个知识点：不保存完整 score matrix，如何按 K/V block
 计算等价的 attention 输出；FA4 如何用 `delta`、阈值 8 和
-`acc_scale` 减少 TMEM 中 `O` 的重缩放次数；以及 `S`、`P`、`O`
-如何共享同一块 512-column TMEM allocation。
+`acc_scale` 减少 TMEM 中 `O` 的重缩放次数；`S`、`P`、`O` 如何
+共享同一块 512-column TMEM allocation；以及 softmax 如何把 TMEM
+中的 `S` 读入 registers、按行计算，再把 fp16 `P` 写回 TMEM。
 
 ## 本次讲解位置
 
@@ -34,7 +35,7 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
 [x] 3. S / P / O 的 TMEM layout 与分时复用
 [ ] 4. QK^T MMA、softmax、PV MMA 的数据路径
     [x] 4.1 QK^T MMA：SMEM 中的 Q/K -> TMEM 中的 S
-    [ ] 4.2 Softmax：S TMEM -> registers -> P TMEM
+    [x] 4.2 Softmax：S TMEM -> registers -> P TMEM
     [ ] 4.3 PV MMA：P TMEM + V SMEM -> O TMEM
 [ ] 5. Warp 角色、register 分配与 barrier 分工
 [ ] 6. Q / K / V pipeline 时间线
@@ -2073,8 +2074,532 @@ K block 中的 key。
 S；O 则是所有 K/V blocks 的累计输出，因此 PV MMA 要持续累加到同一块
 `O_region`，期间还可能执行 correction。
 
-## 十三、下一知识点
+## 十三、Softmax 数据路径：S TMEM -> registers -> P TMEM
 
-下一步讲解 softmax 的读出阶段：WG0 或 WG1 如何等待 `s_ready`，再通过
-`tcgen05.ld` 把 128×128 的 S 分块读入 registers，以及为什么不能把
-TMEM 当作普通数组逐线程读取。
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：两次 MMA 之间的 Softmax
+知识点：TMEM 中的 S 如何读入 registers，完成逐行 softmax，再以 fp16 P 写回 TMEM
+上次：SMEM 中的 Q/K 经过 QKᵀ MMA 生成 TMEM 中的 S
+下次：TMEM 中的 P 与 SMEM 中的 V 经过 PV MMA 累加到 O
+PTX：tcgen05.ld、tcgen05.st、tcgen05.wait::st、mbarrier
+```
+
+### 为什么现在讲这个
+
+QKᵀ MMA 完成后，TMEM 中只有原始 score tile `S`。`S` 不能直接交给
+PV MMA，因为 PV MMA 需要的 operand 是逐行归一化过程中的指数结果
+`P = exp2((S - row_max_safe) * scale_log2)`。
+
+这一步同时引入两个容易出错的状态变化。第一，完整的一行 `S` 要先从
+TMEM 读进 registers，之后才能用 fp16 `P` 覆盖同一块 TMEM；如果只读了
+前半行就开始写回，后半行 scores 会被破坏。第二，`P` 是异步 TMEM store，
+函数返回不代表数据已经可见；PV MMA 必须等 `tcgen05.wait.st()` 和对应
+barrier 完成后才能读取。本节的软硬件边界是：Tensor Core 产出 `S`，
+128 个 softmax threads 在 registers 中计算 `P`，Tensor Core 再从 TMEM
+读取 `P` 做 PV MMA。
+
+### 一、心智模型
+
+对一个 128×128 score tile，softmax 的执行结构是：
+
+```text
+128 rows × 128 columns
+        |
+        | one warpgroup: 128 threads
+        v
+thread r owns logical row r
+        |
+        | 4 × tcgen05.ld
+        v
+thread r's registers: s_chunk[0:128]
+        |
+        | row max / exp2 / fp16 cast
+        v
+thread r's registers: fp32 P and packed fp16 P
+        |
+        | 4 × tcgen05.st
+        v
+P in TMEM, readable by PV MMA
+```
+
+`S` 到 `P` 的路径是：
+
+```text
+S TMEM fp32
+    -> registers fp32
+    -> registers fp32 P
+    -> registers packed fp16 P
+    -> TMEM fp16 P
+```
+
+它不是：
+
+```text
+S TMEM -> TMEM 原地 softmax -> PV MMA
+```
+
+TMEM 不执行 softmax。`max`、FMA、`exp2`、cast 和逐行求和都由
+softmax warpgroup 的 CUDA cores 完成。
+
+### 二、线程、layout 与四个 chunk
+
+默认 `GQA_RATIO=1` 时，当前 score tile 有 128 行，softmax warpgroup
+也有 128 个 threads，因此：
+
+```text
+tid_in_wg = r
+row r -> thread r
+```
+
+每个 thread 最终要持有自己这一行的 128 个 fp32 scores。源码不是用一个
+巨大的 TMEM load 一次取完整行，而是使用：
+
+```python
+SOFTMAX_LD_CHUNK = 32
+
+for chunk_idx in T.unroll(BLK_N // SOFTMAX_LD_CHUNK):
+    Tx.wg.copy_async(
+        s_chunk[
+            :, chunk_idx * SOFTMAX_LD_CHUNK : (chunk_idx + 1) * SOFTMAX_LD_CHUNK
+        ],
+        S_region[
+            wg_id, :,
+            chunk_idx * SOFTMAX_LD_CHUNK : (chunk_idx + 1) * SOFTMAX_LD_CHUNK,
+        ],
+    )
+```
+
+这里的 `BLK_N=128`，所以循环执行四次：
+
+| chunk | TMEM columns | register fragment |
+|---:|---:|---:|
+| 0 | `[0, 32)` | `s_chunk[0:32]` |
+| 1 | `[32, 64)` | `s_chunk[32:64]` |
+| 2 | `[64, 96)` | `s_chunk[64:96]` |
+| 3 | `[96, 128)` | `s_chunk[96:128]` |
+
+`Tx.wg.copy_async` 在这条 TMEM-to-register 路径上 lower 成
+`tcgen05.ld`。四个 chunks 是 load 粒度，不是四次独立的 softmax。
+四次读取完成后，每个 thread 的 registers 中仍保留完整 128 个 scores，
+后续 max、exp 和 sum 都针对整行执行。
+
+当 `GQA_RATIO != 1` 时，thread 到 packed query row 的映射还要经过
+`seq_pos_in_wg = tid_in_wg // GQA_RATIO`。上面的“thread `r` 处理 row
+`r`”只描述默认比例。
+
+### 三、课程代码中的完整 softmax 主路径
+
+先等待 QKᵀ MMA 完成：
+
+```python
+s_ready.wait(wg_id, score_epoch.phase)
+```
+
+读取完整 S row，并计算本轮候选最大值：
+
+```python
+for chunk_idx in range(BLK_N // SOFTMAX_LD_CHUNK):
+    tmem_load(
+        s_chunk,
+        chunk_idx * SOFTMAX_LD_CHUNK,
+        tmem(wg_id * MMA_N + chunk_idx * SOFTMAX_LD_CHUNK),
+        SOFTMAX_LD_CHUNK,
+    )
+
+if apply_mask:
+    apply_causal_mask(s_chunk, m_block_idx, i_kv)
+
+if is_first:
+    reduce_max_128(tile_max, s_chunk)
+else:
+    row_max_old = row_max
+    tile_max[0] = row_max_old
+    reduce_max_128(tile_max, s_chunk, accum=True)
+```
+
+根据 FA4 的阈值 8 决定是否保留旧参考值：
+
+```python
+row_max_new = tile_max[0]
+row_max_safe = T.if_then_else(
+    tile_max[0] == NEG_INF,
+    T.float32(0.0),
+    tile_max[0],
+)
+
+if is_first:
+    acc_scale = T.float32(1.0)
+else:
+    acc_scale_ = (row_max_old - row_max_safe) * scale_log2
+    if acc_scale_ >= -rescale_threshold:
+        row_max_new = row_max_old
+        row_max_safe = row_max_old
+        acc_scale = T.float32(1.0)
+    else:
+        acc_scale = T.ptx.exp2(acc_scale_)
+
+row_max = row_max_new
+```
+
+把 base-2 exponent 的输入写成 FMA，再计算 fp32 `P`、打包成 fp16。
+下面先只保留 hardware `exp2` 路径；FA4 的实际 kernel 会按 pair 选择
+`exp2` 或三次多项式近似，但两者产生同一个逻辑 `P`，不改变本节的数据路径：
+
+```python
+Tx.wg.fma(
+    s_chunk,
+    s_chunk,
+    scale_log2,
+    -row_max_safe * scale_log2,
+)
+
+for fragment_idx in T.unroll(4):
+    for pair_index in T.unroll(BLK_N // 4 // 2):
+        index = T.meta_var(fragment_idx * BLK_N // 4 + 2 * pair_index)
+        s_chunk[index] = T.ptx.exp2(s_chunk[index])
+        s_chunk[index + 1] = T.ptx.exp2(s_chunk[index + 1])
+
+    Tx.wg.cast(
+        p_chunk[
+            :,
+            fragment_idx * BLK_N // 4 : (fragment_idx + 1) * BLK_N // 4,
+        ],
+        s_chunk[
+            :,
+            fragment_idx * BLK_N // 4 : (fragment_idx + 1) * BLK_N // 4,
+        ],
+    )
+```
+
+最后把 fp16 `P` 分块写回 TMEM。Non-causal 路径先写三块，再写最后一块：
+
+```python
+P_SPLIT_Q = 3
+
+for i in T.unroll(P_SPLIT_Q):
+    Tx.wg.copy_async(
+        P_region[wg_id, 1, :, i * BLK_N // 4 : (i + 1) * BLK_N // 4],
+        p_chunk[:, i * BLK_N // 4 : (i + 1) * BLK_N // 4],
+    )
+
+T.ptx.tcgen05.wait.st()
+p_o_rescale.arrive(wg_id)
+
+for i in T.unroll(4 - P_SPLIT_Q):
+    Tx.wg.copy_async(
+        P_region[
+            wg_id,
+            1,
+            :,
+            (P_SPLIT_Q + i) * BLK_N // 4 : (P_SPLIT_Q + i + 1) * BLK_N // 4,
+        ],
+        p_chunk[
+            :,
+            (P_SPLIT_Q + i) * BLK_N // 4 : (P_SPLIT_Q + i + 1) * BLK_N // 4,
+        ],
+    )
+
+T.ptx.tcgen05.wait.st()
+p_ready_2.arrive(wg_id)
+```
+
+这里两次 `wait.st()` 对应两个不同的交接点：
+
+```text
+前三块写完 -> p_o_rescale -> 第一段 PV MMA 可以开始
+第四块写完 -> p_ready_2   -> 第二段 PV MMA 可以开始
+```
+
+Causal 路径使用 `P_SPLIT_Q=2`，按 `64 + 64` 交接；non-causal 路径按
+`96 + 32` 交接。这个差异只改变第一段 PV MMA 能多早启动，不改变
+softmax 每行仍处理 128 个 columns。
+
+`row_sum` 必须在 WG2 读走当前 `acc_scale` 之后更新：
+
+```python
+softmax_corr.empty.wait(wg_id, softmax_epoch.phase)
+
+if is_first:
+    reduce_sum_128(row_sum, s_chunk)
+else:
+    row_sum[0] = row_sum[0] * acc_scale
+    reduce_sum_128(row_sum, s_chunk, accum=True)
+```
+
+行和使用的是 registers 中的 fp32 `P`，不是已经 cast 成 fp16 的
+`p_chunk`。这一点决定了 denominator 保留 fp32 精度。
+
+### 四、完整可运行数据路径模拟
+
+下面的脚本不依赖 CUDA。它复现一行的四个读 chunk、FA4 阈值判断、
+base-2 指数、fp32 行和、非因果 `96 + 32` 写回和完成通知。文件名：
+`flash_attention_softmax_trace.py`
+
+```python
+from __future__ import annotations
+
+import struct
+
+
+BLK_N = 128
+SOFTMAX_LD_CHUNK = 32
+SCALE_LOG2 = 1.0
+RESCALE_THRESHOLD = 8.0
+P_SPLIT_Q = 3
+
+
+def exp2(value: float) -> float:
+    return 2.0 ** value
+
+
+def to_fp16(value: float) -> float:
+    return struct.unpack("e", struct.pack("e", value))[0]
+
+
+def softmax_step(
+    scores: list[float],
+    row_max_old: float,
+    row_sum_old: float,
+    is_first: bool,
+) -> tuple[list[float], list[float], float, float, float]:
+    if len(scores) != BLK_N:
+        raise ValueError("expected one full 128-column score row")
+
+    if is_first:
+        candidate_max = max(scores)
+        row_max_new = candidate_max
+        row_max_safe = 0.0 if candidate_max == -float("inf") else candidate_max
+        acc_scale = 1.0
+    else:
+        candidate_max = max(row_max_old, max(scores))
+        row_max_safe = 0.0 if candidate_max == -float("inf") else candidate_max
+        delta = (row_max_old - row_max_safe) * SCALE_LOG2
+        if delta >= -RESCALE_THRESHOLD:
+            row_max_new = row_max_old
+            row_max_safe = row_max_old
+            acc_scale = 1.0
+        else:
+            row_max_new = candidate_max
+            acc_scale = exp2(delta)
+
+    p_fp32 = [
+        exp2((score - row_max_safe) * SCALE_LOG2)
+        for score in scores
+    ]
+    p_fp16 = [to_fp16(value) for value in p_fp32]
+
+    contribution = sum(p_fp32)
+    if is_first:
+        row_sum_new = contribution
+    else:
+        row_sum_new = row_sum_old * acc_scale + contribution
+
+    return p_fp16, p_fp32, row_max_new, row_sum_new, acc_scale
+
+
+scores = [float((column % 4) - 1) for column in range(BLK_N)]
+row_max_old = 3.0
+row_sum_old = 4.0
+
+p_fp16, p_fp32, row_max_new, row_sum_new, acc_scale = softmax_step(
+    scores,
+    row_max_old,
+    row_sum_old,
+    is_first=False,
+)
+
+print("logical rows: 128")
+print("thread mapping: thread r handles row r")
+print()
+
+for chunk_idx in range(BLK_N // SOFTMAX_LD_CHUNK):
+    start = chunk_idx * SOFTMAX_LD_CHUNK
+    end = start + SOFTMAX_LD_CHUNK
+    print(
+        f"tcgen05.ld chunk {chunk_idx}: "
+        f"columns [{start}, {end}) -> registers [{start}, {end})"
+    )
+
+print()
+print("candidate max =", max(scores))
+print("row_max_old =", row_max_old)
+print("row_max_safe =", row_max_old)
+print("delta = (3.0 - 3.0) * 1.0 = 0.0")
+print("delta >= -8.0: keep old reference")
+print("acc_scale = 1.0")
+print()
+
+for index in (0, 1, 2, 3, 127):
+    exponent_input = (scores[index] - row_max_old) * SCALE_LOG2
+    print(
+        f"P[{index}] = exp2(({scores[index]:g} - 3.0) * 1.0) "
+        f"= exp2({exponent_input:g}) = {p_fp32[index]}"
+    )
+
+print()
+print("fp32 contribution =", sum(p_fp32))
+print("row_sum_new = 4.0 * 1.0 +", sum(p_fp32), "=", row_sum_new)
+print()
+
+for chunk_idx in range(P_SPLIT_Q):
+    start = chunk_idx * SOFTMAX_LD_CHUNK
+    end = start + SOFTMAX_LD_CHUNK
+    print(
+        f"tcgen05.st first group chunk {chunk_idx}: "
+        f"P columns [{start}, {end}) -> TMEM"
+    )
+
+print("tcgen05.wait.st -> all first-group stores complete")
+print("p_o_rescale.arrive(stage)")
+
+chunk_idx = P_SPLIT_Q
+start = chunk_idx * SOFTMAX_LD_CHUNK
+end = start + SOFTMAX_LD_CHUNK
+print(
+    f"tcgen05.st remaining chunk {chunk_idx}: "
+    f"P columns [{start}, {end}) -> TMEM"
+)
+print("tcgen05.wait.st -> remaining store complete")
+print("p_ready_2.arrive(stage)")
+print("softmax_corr.empty.wait(stage) -> fp32 row_sum may advance")
+print("row_sum =", row_sum_new)
+print("P[0:4] in fp16 TMEM =", p_fp16[0:4])
+```
+
+运行：
+
+```bash
+python3 flash_attention_softmax_trace.py
+```
+
+预期输出：
+
+```text
+logical rows: 128
+thread mapping: thread r handles row r
+
+tcgen05.ld chunk 0: columns [0, 32) -> registers [0, 32)
+tcgen05.ld chunk 1: columns [32, 64) -> registers [32, 64)
+tcgen05.ld chunk 2: columns [64, 96) -> registers [64, 96)
+tcgen05.ld chunk 3: columns [96, 128) -> registers [96, 128)
+
+candidate max = 2.0
+row_max_old = 3.0
+row_max_safe = 3.0
+delta = (3.0 - 3.0) * 1.0 = 0.0
+delta >= -8.0: keep old reference
+acc_scale = 1.0
+
+P[0] = exp2((-1 - 3.0) * 1.0) = exp2(-4) = 0.0625
+P[1] = exp2((0 - 3.0) * 1.0) = exp2(-3) = 0.125
+P[2] = exp2((1 - 3.0) * 1.0) = exp2(-2) = 0.25
+P[3] = exp2((2 - 3.0) * 1.0) = exp2(-1) = 0.5
+P[127] = exp2((2 - 3.0) * 1.0) = exp2(-1) = 0.5
+
+fp32 contribution = 30.0
+row_sum_new = 4.0 * 1.0 + 30.0 = 34.0
+
+tcgen05.st first group chunk 0: P columns [0, 32) -> TMEM
+tcgen05.st first group chunk 1: P columns [32, 64) -> TMEM
+tcgen05.st first group chunk 2: P columns [64, 96) -> TMEM
+tcgen05.wait.st -> all first-group stores complete
+p_o_rescale.arrive(stage)
+tcgen05.st remaining chunk 3: P columns [96, 128) -> TMEM
+tcgen05.wait.st -> remaining store complete
+p_ready_2.arrive(stage)
+softmax_corr.empty.wait(stage) -> fp32 row_sum may advance
+row_sum = 34.0
+P[0:4] in fp16 TMEM = [0.0625, 0.125, 0.25, 0.5]
+```
+
+这个脚本验证的是行映射、FA4 阈值路径、fp32 行和和分段交接。它不执行
+真实 `tcgen05.ld` 或 `tcgen05.st`；真实 kernel 需要 Blackwell 硬件、
+TIRx 和完整的 `flash_attention4.py`。
+
+### 五、为什么 P 要覆盖回 S 的 TMEM
+
+Stage 0 的 `S0` 占用 fp32 physical columns `[0, 128)`。softmax 把整行
+读进 registers 后，`P0` 的 128 个 fp16 values 会写到 physical columns
+`[64, 128)`：
+
+```text
+P_region[0, 1, :, n]
+    -> physical column 64 + n // 2
+```
+
+因此 `P0[:, 0]` 和 `P0[:, 1]` 共用 physical column 64 的两个 fp16
+半格，`P0[:, 2]` 和 `P0[:, 3]` 共用 column 65。最终 `P0` 只占 64 个
+物理 columns。
+
+这份空间复用有严格顺序：
+
+```text
+1. QKᵀ MMA 写完整 S0
+2. softmax 等待 s_ready
+3. 四次 tcgen05.ld 读完整 S0 到 registers
+4. 计算 P
+5. tcgen05.st 用 P0 覆盖 S0 的物理 columns [64, 128)
+6. tcgen05.wait.st 证明 store 完成
+7. barrier 放行 PV MMA
+```
+
+如果第 3 步未完成就开始第 5 步，尚未读出的 `S0[:, 64:128]` 会被 `P0`
+覆盖。症状通常不是统一错误，而是部分 score columns 计算正确、另一部分
+出现随机错误，最终 attention 输出也只在这些 columns 对应的 V rows 上
+异常。
+
+### 六、常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 |
+|---|---|---|
+| 一次 `tcgen05.ld` 后就把 32 个 values 当成整行 softmax | 每行仍有另外 96 个 columns 未读入 | 行最大值和 denominator 都偏小，P 错误 |
+| 未读完 S 就执行 `tcgen05.st` | P 会覆盖尚未读取的 S columns | 部分 scores 随机损坏，结果不可复现 |
+| 把四个 load chunks 当成四段独立 softmax | softmax max 和 sum 必须覆盖整行 | 得到四个局部归一化片段 |
+| `tcgen05.st` 后不执行 `tcgen05.wait.st()` | store 仍异步进行 | PV MMA 读到旧值或部分新值 |
+| 用 fp16 `p_chunk` 累计 `row_sum` | denominator 应保留 fp32 精度 | 长 K/V loop 中归一化误差逐渐增大 |
+| `p_o_rescale` 对 `GQA_RATIO != 1` 却按 256 arrivals 理解 | GQA 路径使用 pairwise named barriers | 同步比例解释错误，进而误判死锁原因 |
+| `softmax_corr.empty` 后仍重写上一轮 `acc_scale` | WG2 可能尚未消费该行 statistics | statistics 丢失或 O correction 使用错误 scale |
+
+### 七、自测题与答案
+
+#### 1. 一个 softmax warpgroup 有 128 个 threads，为什么能让 thread `r` 负责 row `r`？
+
+答：默认 `GQA_RATIO=1` 时，一个 S tile 正好有 128 行，warpgroup 也正好
+有 128 个 threads。每个 thread 在自己的 registers 中保留一整行 128 个
+fp32 scores，因此无需跨 thread 交换 row max 和 row sum。
+
+#### 2. 为什么`tcgen05.ld`分成四个 32-column chunks，但 softmax 不是四次局部计算？
+
+答：四个 chunks 只控制单次 TMEM load 的 register tuple 大小。四次读取
+完成后，每个 thread 持有完整 128 个 scores，随后对整行做一次 max、
+exp2 和 sum。
+
+#### 3. 为什么 `P0` 能覆盖 `S0`，而不会丢失数据？
+
+答：`P0` 写入之前，softmax 已把完整 `S0` 读入 registers。`P0` 只需要
+128 个 fp16 values，两两打包后占 64 个物理 columns，因此可以覆盖
+`S0` 的后 64 个 fp32 columns。被覆盖的数据已经不再需要。
+
+#### 4. 为什么前三块写完后要 `tcgen05.wait.st()` 再 `p_o_rescale.arrive`？
+
+答：`p_o_rescale` 只证明前三块 `P` 可被第一段 PV MMA 读取。若不先等
+TMEM stores 完成就发 arrival，PV MMA 可能读到未写完的 `P`。
+
+#### 5. `row_sum` 更新为什么要等待 `softmax_corr.empty`？
+
+答：当前 `acc_scale` 还要由 WG2 读取，用于决定是否重缩放 TMEM 中的旧
+`O`。Softmax 在 WG2 确认对应 `sScale` slot 已被消费之前，不应推进到下一
+个 phase 并重写该状态。等待完成后，softmax 才用 registers 中仍保留的
+fp32 `P` 更新 `row_sum`。
+
+## 十四、下一知识点
+
+下一步进入 `4.3 PV MMA`：讲解 `P_region[i_q, 1, :, 0:K_SPLIT]` 和
+`V_smem` 如何作为两个 operand 交给 `tcgen05.mma`，为什么第一轮使用
+`accum=false`，后续轮次持续累加到 `O`，以及
+`p_o_rescale`、`p_ready_2` 和 `o_ready` 如何构成 PV MMA 的完整
+执行边界。
