@@ -8,11 +8,12 @@ persistent scheduling、warp specialization 和 two-CTA cooperative MMA
 QK^T MMA -> softmax -> PV MMA
 ```
 
-目前已经讲完四个知识点：不保存完整 score matrix，如何按 K/V block
+目前已经讲完五个知识点：不保存完整 score matrix，如何按 K/V block
 计算等价的 attention 输出；FA4 如何用 `delta`、阈值 8 和
 `acc_scale` 减少 TMEM 中 `O` 的重缩放次数；`S`、`P`、`O` 如何
 共享同一块 512-column TMEM allocation；以及 softmax 如何把 TMEM
-中的 `S` 读入 registers、按行计算，再把 fp16 `P` 写回 TMEM。
+中的 `S` 读入 registers、按行计算，再把 fp16 `P` 写回 TMEM；最后
+是 `P` 与 `V` 如何分两段累加到 TMEM 中的 `O`。
 
 ## 本次讲解位置
 
@@ -33,10 +34,10 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
 [x] 1. Tile 分解与 online softmax 三状态
 [x] 2. FA4 conditional rescaling、delta 与 acc_scale
 [x] 3. S / P / O 的 TMEM layout 与分时复用
-[ ] 4. QK^T MMA、softmax、PV MMA 的数据路径
+[x] 4. QK^T MMA、softmax、PV MMA 的数据路径
     [x] 4.1 QK^T MMA：SMEM 中的 Q/K -> TMEM 中的 S
     [x] 4.2 Softmax：S TMEM -> registers -> P TMEM
-    [ ] 4.3 PV MMA：P TMEM + V SMEM -> O TMEM
+    [x] 4.3 PV MMA：P TMEM + V SMEM -> O TMEM
 [ ] 5. Warp 角色、register 分配与 barrier 分工
 [ ] 6. Q / K / V pipeline 时间线
 [ ] 7. Correction、最终归一化与 epilogue
@@ -2596,10 +2597,508 @@ TMEM stores 完成就发 arrival，PV MMA 可能读到未写完的 `P`。
 个 phase 并重写该状态。等待完成后，softmax 才用 registers 中仍保留的
 fp32 `P` 更新 `row_sum`。
 
-## 十四、下一知识点
+## 十四、PV MMA 数据路径：P TMEM + V SMEM -> O TMEM
 
-下一步进入 `4.3 PV MMA`：讲解 `P_region[i_q, 1, :, 0:K_SPLIT]` 和
-`V_smem` 如何作为两个 operand 交给 `tcgen05.mma`，为什么第一轮使用
-`accum=false`，后续轮次持续累加到 `O`，以及
-`p_o_rescale`、`p_ready_2` 和 `o_ready` 如何构成 PV MMA 的完整
-执行边界。
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：PV MMA
+知识点：TMEM 中的 P 与 SMEM 中的 V 分两段累加到 TMEM 中的 O
+上次：softmax 把 TMEM 中的 S 转成 TMEM 中的 fp16 P
+下次：Warp 角色、register 分配与 barrier 分工
+PTX：tcgen05.mma、tcgen05.commit、mbarrier
+```
+
+### 为什么现在讲这个
+
+Softmax 只产生了当前 K/V block 的权重 `P`，还没有把它作用到 value
+`V`。PV MMA 必须计算：
+
+```text
+O_block = P_block @ V_block
+```
+
+第一个 K/V block 的乘积用于初始化长期累加器 `O`；后续 block 的乘积必须
+继续累加到同一块 `O`。如果所有 N 个 KV blocks 都使用 `accum=false`，
+最后只会保留最后一个 block；如果第一轮第二个 MMA segment 也使用
+`accum=false`，它会把第一段刚算出的 partial sum 覆盖掉。
+
+本节还要说明 `P` 和 `V` 为什么能从不同 memory spaces 直接进入同一条 MMA，
+以及 `p_o_rescale`、`p_ready_2`、`o_ready` 分别证明哪一部分数据或
+accumulator 已经可用。
+
+### 一、心智模型
+
+设 `HEAD_DIM=d`，当前 K/V block 的长度是 `BLK_N=128`：
+
+```text
+P_block: [128, 128]         tensor cores 的 A operand
+V_block: [128, d]           tensor cores 的 B operand
+O_tile:  [128, d]           accumulator，位于 TMEM
+
+P_block @ V_block -> O_tile
+```
+
+一个输出元素是：
+
+```text
+O[row, col] = sum_{k=0}^{127} P[row, k] * V[k, col]
+```
+
+其中 `k` 是当前 K/V block 内的归约位置。PV MMA 执行时：
+
+```text
+读取 P：TMEM
+读取 V：SMEM
+累加 O：TMEM
+```
+
+`P` 不需要重新搬回 SMEM，`V` 也不需要先搬进 TMEM。Blackwell 的
+`tcgen05.mma` 支持 TMEM operand，因此可以形成：
+
+```text
+QKᵀ MMA: SMEM + SMEM -> TMEM
+Softmax:  TMEM -> registers -> TMEM
+PV MMA:  TMEM + SMEM -> TMEM
+```
+
+这就是 FA4 能把两次 MMA 和 register-softmax 串在片上完成的关键。
+
+### 二、Operand、scope 与物理位置
+
+课程中的调用是：
+
+```python
+K_SPLIT = T.meta_var((4 if is_causal else 6) * MMA_K)
+
+Tx.warp.gemm_async(
+    O_region[SMEM_PIPE_DEPTH_Q + i_q, :, :],
+    P_region[i_q, 1, :, 0:K_SPLIT],
+    V_smem[kv_stage, 0:K_SPLIT, 0:HEAD_DIM],
+    transB=True,
+    accum=should_accumulate,
+    dispatch="tcgen05",
+    cta_group=CTA_GROUP,
+)
+
+p_ready_2.wait(i_q, phase_tmem)
+
+Tx.warp.gemm_async(
+    O_region[SMEM_PIPE_DEPTH_Q + i_q, :, :],
+    P_region[i_q, 1, :, K_SPLIT:BLK_N],
+    V_smem[kv_stage, K_SPLIT:BLK_N, 0:HEAD_DIM],
+    transB=True,
+    accum=True,
+    dispatch="tcgen05",
+    cta_group=CTA_GROUP,
+)
+```
+
+每个参数的角色是：
+
+| 参数 | 数据位置 | 含义 |
+|---|---|---|
+| `O_region[...]` | TMEM | fp32 accumulator |
+| `P_region[i_q, 1, ...]` | TMEM | fp16 attention weights |
+| `V_smem[...]` | SMEM | fp16 value tile |
+| `transB=True` | descriptor 语义 | 让 SMEM operand 按 PV MMA 需要的遍历方式解释 |
+| `accum` | MMA 状态 | 覆盖初始化或继续累加到 `O` |
+| `dispatch="tcgen05"` | 指令路径 | Blackwell Tensor Core MMA |
+| `cta_group` | scope | 单 CTA 或两 CTA cooperative MMA |
+
+`transB=True` 不是因为目标数学公式变成了 `P @ V^T`。逻辑计算仍然是
+`P @ V`；该标志配合 descriptor，告诉 lowering 如何从 V 的 SMEM layout
+读取 B operand。
+
+默认 `CTA_GROUP=1` 时，WG3 warp 0 中由一个 elected lane 发起该
+warp-scoped tile operation；Tensor Core 执行实际的矩阵乘加。
+
+### 三、K_SPLIT 为什么不是固定的 128
+
+`P` 的四个 32-column chunks 是分批写回 TMEM 的。若 PV MMA 必须等待全部
+128 列写完，Tensor Core 会长时间空转。FA4 因此把 inner-K 分成两段：
+
+| 路径 | `K_SPLIT` | 分段 | 第一段含义 |
+|---|---:|---|---|
+| Causal | 64 | 64 + 64 | 与 causal mask 的处理粒度对齐 |
+| Non-causal | 96 | 96 + 32 | 前三块 P 写完就提前启动 |
+
+`MMA_K=16`。Non-causal 的第一段是：
+
+```text
+96 / 16 = 6 个 MMA K-steps
+```
+
+第二段是：
+
+```text
+(128 - 96) / 16 = 2 个 MMA K-steps
+```
+
+Causal 的两段各为：
+
+```text
+64 / 16 = 4 个 MMA K-steps
+```
+
+第一段使用：
+
+```python
+P[:, 0:K_SPLIT] @ V[0:K_SPLIT, :]
+```
+
+第二段使用：
+
+```python
+P[:, K_SPLIT:128] @ V[K_SPLIT:128, :]
+```
+
+两段相加仍等于完整的：
+
+```python
+P[:, 0:128] @ V[0:128, :]
+```
+
+拆分的意义只是让 Tensor Core 提前处理已经准备好的一部分 P，不改变
+attention 数学。
+
+### 四、accum 的三段状态
+
+`O` 的生命周期比单个 KV block 长。设当前 CTA 正在处理 KV block `t`：
+
+```text
+t = 0: 旧 O 不存在，第一段必须初始化 O
+t > 0: 旧 O 存在，第一段必须继续累加
+```
+
+实际标志如下：
+
+| 场景 | 第一段 `accum` | 第二段 `accum` | 原因 |
+|---|---:|---:|---|
+| 第一个 KV block | `False` | `True` | 第一段初始化；第二段累加到第一段结果 |
+| 后续 KV block | `True` | `True` | 两段都累加到旧 O |
+
+这里最容易误解的一点是：第一个 K/V block 的第二段也不能使用
+`accum=False`。第一段已经产生了 `O_partial`，若第二段覆盖它，就只剩
+`P[:, 96:128] @ V[96:128, :]`，前面的 96 个归约位置全部丢失。
+
+在底层，一个 segment 又由多个 `MMA_K=16` steps 组成。以第一个 KV
+block 的第一段为例：
+
+```text
+ki = 0: accum = False，初始化 O
+ki = 1: accum = True，累加
+ki = 2: accum = True，累加
+...
+```
+
+所以 `accum=False` 只适用于整块 `O` 的第一次 MMA step，不是该 segment
+内每个 step 都覆盖。
+
+### 五、P 的 fp16 地址怎样映射到 TMEM columns
+
+`P` 的逻辑 shape 是 `[128, 128]`，但 fp16 两个 values 打包在一个
+32-bit TMEM cell 中。源码中 A operand 的列地址为：
+
+```text
+i_q * MMA_N + MMA_N // 2 + ki * (MMA_K // 2)
+```
+
+代入 `MMA_N=128`、`MMA_K=16`：
+
+```text
+physical column = i_q * 128 + 64 + ki * 8
+```
+
+Stage 0 的 P 地址是：
+
+| `ki` | 覆盖的逻辑 P columns | 起始 physical column |
+|---:|---:|---:|
+| 0 | `[0, 16)` | 64 |
+| 1 | `[16, 32)` | 72 |
+| 2 | `[32, 48)` | 80 |
+| 3 | `[48, 64)` | 88 |
+| 4 | `[64, 80)` | 96 |
+| 5 | `[80, 96)` | 104 |
+| 6 | `[96, 112)` | 112 |
+| 7 | `[112, 128)` | 120 |
+
+Stage 0 的完整 `P0` 占用 physical columns `[64, 128)`。Stage 1 加上
+基础偏移 128，占用 `[192, 256)`。因此：
+
+```text
+non-causal 第一段: ki = 0..5 -> physical columns [64, 112)
+non-causal 第二段: ki = 6..7 -> physical columns [112, 128)
+```
+
+### 六、PV MMA 的完整 barrier 协议
+
+第一段开始前需要两组条件：
+
+```text
+kv_load.full
+    -> 完整 V block 已进入 SMEM
+
+p_o_rescale
+    -> P[:, 0:K_SPLIT] 已在 TMEM
+    -> 旧 O 已完成必要的 rescale，或首轮可以直接初始化
+```
+
+默认单 CTA 路径中，`p_o_rescale` 的 expected arrival count 是 256：
+
+| Producer | arrivals | 证明 |
+|---|---:|---|
+| Softmax warpgroup | 128 | 前 `K_SPLIT` 个 P columns 已写入 TMEM |
+| WG2 | 128 | O slot 已初始化、已 rescale，或确认无需 rescale |
+
+第一段发出后，MMA warp 等待：
+
+```text
+p_ready_2
+    -> P[:, K_SPLIT:128] 已写入 TMEM
+```
+
+`p_ready_2` 的 expected arrival count 是 128，由 softmax warpgroup
+提供。第二段不需要再次等待 `kv_load.full`，因为完整 V 在第一段开始前
+已经确认到达 SMEM。
+
+完整的稳态顺序是：
+
+```text
+softmax 写 P[:, 0:K_SPLIT]
+WG2 准备旧 O
+        |
+        v
+p_o_rescale 放行
+        |
+        v
+第一段 PV MMA: accum=should_accumulate
+        |
+        v
+p_ready_2 放行
+        |
+        v
+第二段 PV MMA: accum=True
+```
+
+最后一个 K/V block 的尾段 PV MMA 完成后，elected lane 执行：
+
+```python
+commit(o_ready, i_q)
+```
+
+`o_ready` 表示对应 Q stage 的 `O` 已经完成所有累积，可以由 WG2 做最终
+normalization 或 epilogue。它不是“O 的第一个部分写完了”，而是“这个
+output tile 不再接受新的 PV MMA”。
+
+### 七、完整可运行的分段累加模拟
+
+下面的脚本用 `2×4` 的 `P`、`4×2` 的 `V` 和 `K_SPLIT=2` 模拟两个
+KV blocks。它完整展示第一轮初始化、第二轮 rescale、两段累加和
+`o_ready`。文件名：`flash_attention_pv_mma_trace.py`
+
+```python
+from __future__ import annotations
+
+
+def matmul(a: list[list[int]], b: list[list[int]]) -> list[list[int]]:
+    rows_a = len(a)
+    inner = len(a[0])
+    cols_b = len(b[0])
+
+    if len(b) != inner:
+        raise ValueError("shape mismatch")
+
+    result = [[0] * cols_b for _ in range(rows_a)]
+    for row in range(rows_a):
+        for col in range(cols_b):
+            result[row][col] = sum(
+                a[row][k] * b[k][col]
+                for k in range(inner)
+            )
+    return result
+
+
+def add_into(dst: list[list[int]], src: list[list[int]]) -> None:
+    for row in range(len(dst)):
+        for col in range(len(dst[0])):
+            dst[row][col] += src[row][col]
+
+
+def scale(values: list[list[int]], factor: float) -> list[list[int]]:
+    return [
+        [int(value * factor) for value in row]
+        for row in values
+    ]
+
+
+P0 = [
+    [1, 2, 3, 4],
+    [0, 1, 1, 0],
+]
+V0 = [
+    [1, 0],
+    [0, 1],
+    [1, 1],
+    [2, 0],
+]
+K_SPLIT = 2
+
+print("iteration 0")
+print("kv_load.full -> V0 is in SMEM")
+print("p_o_rescale -> P0[:, :2] is in TMEM; O0 may initialize")
+
+part1 = matmul(
+    [row[:K_SPLIT] for row in P0],
+    V0[:K_SPLIT],
+)
+print("accum=False")
+print("part1 =", part1)
+
+O = [row[:] for row in part1]
+print("O after part1 =", O)
+print("p_ready_2 -> P0[:, 2:] is in TMEM")
+
+part2 = matmul(
+    [row[K_SPLIT:] for row in P0],
+    V0[K_SPLIT:],
+)
+print("accum=True")
+print("part2 =", part2)
+add_into(O, part2)
+print("O after part2 =", O)
+print("full product =", matmul(P0, V0))
+print()
+
+P1 = [
+    [1, 0, 0, 1],
+    [0, 1, 1, 0],
+]
+V1 = [
+    [1, 0],
+    [0, 1],
+    [1, 0],
+    [0, 1],
+]
+acc_scale = 2.0
+
+print("iteration 1")
+print("softmax sends acc_scale =", acc_scale)
+O = scale(O, acc_scale)
+print("WG2 rescales old O =", O)
+print("p_o_rescale -> part1 may accumulate")
+
+part1 = matmul(
+    [row[:K_SPLIT] for row in P1],
+    V1[:K_SPLIT],
+)
+print("accum=True")
+print("part1 =", part1)
+add_into(O, part1)
+print("O after part1 =", O)
+
+part2 = matmul(
+    [row[K_SPLIT:] for row in P1],
+    V1[K_SPLIT:],
+)
+print("p_ready_2 -> part2 may accumulate")
+print("part2 =", part2)
+add_into(O, part2)
+print("O after part2 =", O)
+print()
+print("after final KV block: tcgen05.commit -> o_ready")
+print("epilogue waits o_ready and reads O")
+```
+
+运行：
+
+```bash
+python3 flash_attention_pv_mma_trace.py
+```
+
+预期输出：
+
+```text
+iteration 0
+kv_load.full -> V0 is in SMEM
+p_o_rescale -> P0[:, :2] is in TMEM; O0 may initialize
+accum=False
+part1 = [[1, 2], [0, 1]]
+O after part1 = [[1, 2], [0, 1]]
+p_ready_2 -> P0[:, 2:] is in TMEM
+accum=True
+part2 = [[11, 3], [1, 1]]
+O after part2 = [[12, 5], [1, 2]]
+full product = [[12, 5], [1, 2]]
+
+iteration 1
+softmax sends acc_scale = 2.0
+WG2 rescales old O = [[24, 10], [2, 4]]
+p_o_rescale -> part1 may accumulate
+accum=True
+part1 = [[1, 0], [0, 1]]
+O after part1 = [[25, 10], [2, 5]]
+p_ready_2 -> part2 may accumulate
+part2 = [[0, 1], [1, 0]]
+O after part2 = [[25, 11], [3, 5]]
+
+after final KV block: tcgen05.commit -> o_ready
+epilogue waits o_ready and reads O
+```
+
+脚本验证了分段乘加、初始化与累加规则，以及 rescale 必须发生在第一段
+PV MMA 之前。它不执行真实 `tcgen05.mma`；真实 kernel 需要 Blackwell
+硬件、TIRx 和完整的 `flash_attention4.py`。
+
+### 八、常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 |
+|---|---|---|
+| 第一个 KV block 的总结果只用第一段计算 | 丢了 `P[:, K_SPLIT:] @ V[K_SPLIT:]` | O 的所有列都偏小，且误差随 block 内容变化 |
+| 第一轮第二段使用 `accum=False` | 覆盖第一段产生的 partial O | O 只反映后 32 或 64 个 K positions |
+| 后续轮第一段使用 `accum=False` | 丢掉所有之前 KV blocks 的贡献 | 最终只保留最后一个 KV block 的 attention |
+| 未等 `p_ready_2` 就发第二段 | 后 32 个 P columns 可能尚未写完 | 非确定性错误集中在最后 32 个 K positions |
+| 未等 `p_o_rescale` 就发第一段 | P 前半或重缩放后的 O 尚未准备好 | 首段读到旧 P 或未 rescale 的 O |
+| 认为 `transB=True` 表示要计算 `P @ V^T` | 它描述 SMEM operand 遍历方式 | 数学 shape 理解错误，进而误判切片方向 |
+| 最后一个 KV block 后没有 `commit(o_ready)` | epilogue 不知道 O 已完成 | WG2/epilogue 永久等待或读到未完成 O |
+
+### 九、自测题与答案
+
+#### 1. 为什么 `P` 在 TMEM，而 `V` 仍在 SMEM，两者可以直接做 MMA？
+
+答：Blackwell `tcgen05.mma` 支持 TMEM operand。当前调用把 TMEM 中的
+`P` 作为 A operand，把 SMEM 中的 `V` 作为 B operand，输出和 accumulator
+仍放在 TMEM 的 `O_region`。
+
+#### 2. Non-causal 为什么选择 `96 + 32`，而不是始终 `128 + 0`？
+
+答：Softmax 已按四个 32-column chunks 写 P。前三块写完时，PV MMA 就能
+处理前 96 个 K positions。其余 32 positions 由 `p_ready_2` 单独放行，
+这样 Tensor Core 不必等待全部 P writeback。
+
+#### 3. 为什么第一个 K/V block 的第二段必须使用 `accum=True`？
+
+答：第一段已经以 `accum=False` 初始化了 `O_partial`。第二段需要使用
+`O_partial + P[:, K_SPLIT:] @ V[K_SPLIT:]`，所以必须累加，不能覆盖。
+
+#### 4. `p_o_rescale` 与 `p_ready_2` 分别证明什么？
+
+答：`p_o_rescale` 证明 P 的前 `K_SPLIT` columns 已就绪，并且旧 O 已
+初始化、已完成 rescale 或确认无需 rescale。`p_ready_2` 只证明 P 的
+剩余 columns 已经写入 TMEM，不再等待 O 状态。
+
+#### 5. `o_ready` 在什么时候报告，为什么它和 `p_ready_2` 不是一回事？
+
+答：`o_ready` 在某个 Q stage 的最后一个 K/V block 的尾段 PV MMA
+完成后，通过 `tcgen05.commit` 报告，表示 O 已完成全部累积。
+`p_ready_2` 只表示当前 block 的剩余 P columns 已可用于第二段 MMA。
+
+## 十五、下一知识点
+
+下一步进入 `5. Warp 角色、register 分配与 barrier 分工`：逐项说明
+WG0/WG1 的 softmax、WG2 的 correction/epilogue、WG3 的 TMA/MMA issue
+如何分工，为什么双 softmax stage 需要 `200` registers，以及
+`setmaxnreg`、named barrier 和 staged barriers 如何共同保证角色之间
+不互相覆盖数据。
