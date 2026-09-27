@@ -8,10 +8,10 @@ persistent scheduling、warp specialization 和 two-CTA cooperative MMA
 QK^T MMA -> softmax -> PV MMA
 ```
 
-前两部分先讲最基础、也是后面所有 FA4 优化共同依赖的两个知识点：
-不保存完整 score matrix，如何按 K/V block 计算等价的 attention 输出；
-以及 FA4 如何用 `delta`、阈值 8 和 `acc_scale` 减少 TMEM 中 `O` 的
-重缩放次数。
+目前已经讲完三个知识点：不保存完整 score matrix，如何按 K/V block
+计算等价的 attention 输出；FA4 如何用 `delta`、阈值 8 和
+`acc_scale` 减少 TMEM 中 `O` 的重缩放次数；以及 `S`、`P`、`O`
+如何共享同一块 512-column TMEM allocation。
 
 ## 本次讲解位置
 
@@ -31,7 +31,7 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
 ```text
 [x] 1. Tile 分解与 online softmax 三状态
 [x] 2. FA4 conditional rescaling、delta 与 acc_scale
-[ ] 3. S / P / O 的 TMEM layout 与分时复用
+[x] 3. S / P / O 的 TMEM layout 与分时复用
 [ ] 4. QK^T MMA、softmax、PV MMA 的数据路径
 [ ] 5. Warp 角色、register 分配与 barrier 分工
 [ ] 6. Q / K / V pipeline 时间线
@@ -1249,16 +1249,429 @@ conditional rescaling
 warp-collective tile operations。只要当前 warp 有一行需要重缩放，该
 warp 的 32 行就统一执行；`acc_scale = 1` 的行只是乘 1。
 
-## 十一、下一知识点
+## 十一、S / P / O 的 TMEM layout 与分时复用
 
-下一步进入 `S / P / O` 的 TMEM layout 与分时复用：
+### 本次讲解位置
 
 ```text
-S、P、O 分别使用哪些 TMEM rows / columns
-fp32 accumulator 与 fp16 MMA operand 如何共享同一块物理 TMEM
-两个 Q stages 如何轮流复用 S、P、O regions
-哪些 region 会重叠，哪些 barrier 防止过早读取或覆盖
+本次讲解位置
+章节：chapter_flash_attention
+小节：TMEM 布局与复用
+知识点：S / P / O 的 512-column 划分，以及 fp16 P 对 fp32 S 后半块的分时复用
+上次：Conditional rescaling、delta、阈值 8 与 acc_scale
+下次：QK^T MMA、softmax、PV MMA 的数据路径
+PTX：tcgen05.mma、tcgen05.ld / tcgen05.st、tcgen05.commit、
+     tcgen05.wait::ld / wait::st
 ```
 
-这会连接前面的 online softmax 数学更新和后面 QKᵀ / PV MMA、epilogue
-的具体数据路径。
+### 一、这一节解决的问题
+
+FA4 kernel 为每个 CTA 申请：
+
+```text
+128 TMEM rows × 512 physical columns
+每个 physical column = 32 bits
+```
+
+Q pipeline 有两个 stages，分别由 WG0 和 WG1 处理。每个 stage 至少需要：
+
+| buffer | logical shape | fp32 physical columns |
+|---|---:|---:|
+| `S` | `128 × 128` fp32 scores | 128 |
+| `O` | `128 × 128` fp32 accumulator | 128 |
+
+`S` 和 `O` 合计：
+
+```text
+2 stages × (128 + 128) = 512 columns
+```
+
+也就是说，仅 `S` 和 `O` 就已经把 512-column allocation 全部用完。
+如果 `P` 再单独申请一块 fp32 空间，需要额外的 256 columns；即使
+`P` 用 fp16，也需要额外的 128 physical columns。两者都放不下。
+
+解法不是扩大 TMEM，而是利用 softmax 的数据生命周期：
+
+```text
+QK^T MMA 写出完整 S
+        ↓
+softmax 将完整 S 读入 registers
+        ↓
+S 在 TMEM 中的旧内容不再需要
+        ↓
+把 fp16 P 写回 S 的后半部分
+```
+
+因此，`P` 与 `S` 的物理范围重叠，但它们不是同时活着。这种关系是
+**分时复用**，不是把 `S` 和 `P` 同时塞进同一列。
+
+### 二、physical column 与 fp16 alias
+
+源码先建立 fp32 buffer：
+
+```text
+tmem: 128 × 512 fp32
+```
+
+然后执行 `move_base_to(0)`，让第二个 buffer 从同一个物理起点开始：
+
+```text
+tmem_as_f16: 128 × 1024 fp16
+```
+
+两个 buffer 每行包含的总 bits 相同：
+
+```text
+tmem:         512 × 32 bits = 16384 bits
+tmem_as_f16: 1024 × 16 bits = 16384 bits
+```
+
+所以 `tmem_as_f16` 不是额外申请的一块 TMEM，而是同一块 bits 的 fp16
+索引方式。一个 32-bit physical column 包含两个 fp16 slots：
+
+```text
+physical column p
+┌────────────────┬────────────────┐
+│ fp16 slot 2p   │ fp16 slot 2p+1 │
+└────────────────┴────────────────┘
+```
+
+映射公式是：
+
+```text
+fp16 logical slot s
+    -> physical column s // 2
+    -> fp16 half     s % 2
+```
+
+例如：
+
+```text
+slot 128 -> physical column 64, low half
+slot 129 -> physical column 64, high half
+slot 130 -> physical column 65, low half
+slot 131 -> physical column 65, high half
+```
+
+### 三、源码中的三个 views
+
+课程完整布局定义如下：
+
+```python
+tmem_pool = T.TMEMPool(
+    pool,
+    total_cols=N_COLS_TMEM,
+    cta_group=CTA_GROUP,
+    tmem_addr=tmem_addr,
+    alloc_warp=12,
+    dealloc_warp=0,
+)
+tmem = tmem_pool.alloc((128, N_COLS_TMEM), "float32")
+tmem_pool.move_base_to(0)
+tmem_as_f16 = tmem_pool.alloc((128, N_COLS_TMEM * 2), "float16")
+tmem_pool.commit()
+
+S_region = T.meta_var(
+    tmem.rearrange("m (s n) -> s m n", n=MMA_N)
+)
+O_region = S_region
+P_region = T.meta_var(
+    tmem_as_f16.rearrange("m (s two n) -> s two m n", two=2, n=MMA_N)
+)
+```
+
+其中：
+
+```text
+N_COLS_TMEM = 512
+MMA_N = BLK_N = 128
+stage 数量 = 2
+```
+
+`S_region` 把 fp32 第二维 `512` 分解成：
+
+```text
+4 × 128 fp32 blocks
+```
+
+于是：
+
+```text
+S0 = S_region[0]
+S1 = S_region[1]
+O0 = S_region[2]
+O1 = S_region[3]
+```
+
+`P_region` 把 fp16 第二维 `1024` 分解成：
+
+```text
+4 stages × 2 halves × 128 fp16 values
+```
+
+源码实际使用每个 stage 的 high half：
+
+```text
+P0 = P_region[0, 1, :, :]
+P1 = P_region[1, 1, :, :]
+```
+
+因此各区域的物理 column 范围是：
+
+| Region | 数据 | 逻辑来源 | 物理 columns |
+|---|---|---|---:|
+| `S0` | 128 个 fp32 scores | `tmem[:, 0:128]` | `[0, 128)` |
+| `P0` | 128 个 fp16 weights | `tmem_as_f16[:, 128:256]` | `[64, 128)` |
+| `S1` | 128 个 fp32 scores | `tmem[:, 128:256]` | `[128, 256)` |
+| `P1` | 128 个 fp16 weights | `tmem_as_f16[:, 384:512]` | `[192, 256)` |
+| `O0` | 128 个 fp32 accumulators | `tmem[:, 256:384]` | `[256, 384)` |
+| `O1` | 128 个 fp32 accumulators | `tmem[:, 384:512]` | `[384, 512)` |
+
+用一张物理列图表示：
+
+```text
+columns:  0        63 64        127 128       191 192       255 256       383 384       511
+          |----------|-------------|-----------|-------------|-------------|-------------|
+S/O:       S0 first  S0 second     S1 first    S1 second     O0            O1
+alias:                P0                         P1
+```
+
+`stage` 的下标来自 Q pipeline：
+
+```text
+WG0 处理 q_stage 0 -> 使用 S0 / P0 / O0
+WG1 处理 q_stage 1 -> 使用 S1 / P1 / O1
+```
+
+### 四、完整可运行地址计算脚本
+
+下面的程序不依赖 CUDA，用纯 Python 复现课程中的 view 分解和 physical
+column 映射。文件名：
+`flash_attention_tmem_layout_demo.py`
+
+```python
+from __future__ import annotations
+
+
+PHYSICAL_COLS = 512
+FP16_LOGICAL_COLS = PHYSICAL_COLS * 2
+MMA_N = 128
+STAGES = 2
+
+
+def fp16_slot_to_physical(slot: int) -> tuple[int, int]:
+    if not 0 <= slot < FP16_LOGICAL_COLS:
+        raise ValueError(
+            f"fp16 slot {slot} outside [0, {FP16_LOGICAL_COLS})"
+        )
+    return slot // 2, slot % 2
+
+
+def fp32_region(stage: int, kind: str) -> tuple[int, int]:
+    if stage not in (0, 1):
+        raise ValueError("stage must be 0 or 1")
+    if kind == "S":
+        start = stage * MMA_N
+        return start, start + MMA_N
+    if kind == "O":
+        start = (STAGES + stage) * MMA_N
+        return start, start + MMA_N
+    raise ValueError(kind)
+
+
+def p_slot(stage: int, n: int, half: int = 1) -> int:
+    if stage not in (0, 1):
+        raise ValueError("stage must be 0 or 1")
+    if not 0 <= n < MMA_N:
+        raise ValueError(f"n must be in [0, {MMA_N})")
+    if half not in (0, 1):
+        raise ValueError("half must be 0 or 1")
+    return stage * (2 * MMA_N) + half * MMA_N + n
+
+
+def p_physical(stage: int, n: int) -> tuple[int, int]:
+    return fp16_slot_to_physical(p_slot(stage, n))
+
+
+print("regions")
+for stage in range(STAGES):
+    for kind in ("S", "P", "O"):
+        if kind == "P":
+            lo = p_physical(stage, 0)[0]
+            hi = p_physical(stage, MMA_N - 1)[0]
+            print(f"{kind}{stage}: physical columns [{lo}, {hi + 1})")
+        else:
+            lo, hi = fp32_region(stage, kind)
+            print(f"{kind}{stage}: physical columns [{lo}, {hi})")
+
+print("\nfp16 alias trace")
+for stage in range(STAGES):
+    for n in (0, 1, 2, 3, 126, 127):
+        slot = p_slot(stage, n)
+        col, half = fp16_slot_to_physical(slot)
+        print(
+            f"P{stage}[n={n:3d}] -> fp16 slot {slot:4d} "
+            f"-> physical column {col:3d}, half {half}"
+        )
+
+print("\noverlap check")
+for stage in range(STAGES):
+    s_lo, s_hi = fp32_region(stage, "S")
+    p_lo = p_physical(stage, 0)[0]
+    p_hi = p_physical(stage, MMA_N - 1)[0] + 1
+    overlap = range(max(s_lo, p_lo), min(s_hi, p_hi))
+    print(f"S{stage} intersect P{stage} = [{overlap.start}, {overlap.stop})")
+```
+
+运行：
+
+```bash
+python3 flash_attention_tmem_layout_demo.py
+```
+
+预期输出：
+
+```text
+regions
+S0: physical columns [0, 128)
+P0: physical columns [64, 128)
+O0: physical columns [256, 384)
+S1: physical columns [128, 256)
+P1: physical columns [192, 256)
+O1: physical columns [384, 512)
+
+fp16 alias trace
+P0[n=  0] -> fp16 slot  128 -> physical column  64, half 0
+P0[n=  1] -> fp16 slot  129 -> physical column  64, half 1
+P0[n=  2] -> fp16 slot  130 -> physical column  65, half 0
+P0[n=  3] -> fp16 slot  131 -> physical column  65, half 1
+P0[n=126] -> fp16 slot  254 -> physical column 127, half 0
+P0[n=127] -> fp16 slot  255 -> physical column 127, half 1
+P1[n=  0] -> fp16 slot  384 -> physical column 192, half 0
+P1[n=  1] -> fp16 slot  385 -> physical column 192, half 1
+P1[n=  2] -> fp16 slot  386 -> physical column 193, half 0
+P1[n=  3] -> fp16 slot  387 -> physical column 193, half 1
+P1[n=126] -> fp16 slot  510 -> physical column 255, half 0
+P1[n=127] -> fp16 slot  511 -> physical column 255, half 1
+
+overlap check
+S0 intersect P0 = [64, 128)
+S1 intersect P1 = [192, 256)
+```
+
+### 五、stage 0 的完整执行顺序
+
+以 `S0` 和 `P0` 为例，一个 K/V block 中的数据流是：
+
+```text
+1. QK^T MMA 写 S0
+   physical columns [0, 128)
+
+2. tcgen05.commit 通知 s_ready
+
+3. softmax wait s_ready
+   通过四次 tcgen05.ld 将完整 S0 读入 registers
+
+4. softmax 在 registers 中计算 fp16 P0
+
+5. tcgen05.st 将 P0 写入
+   physical columns [64, 128)
+   这会覆盖 S0 的后 64 columns
+
+6. tcgen05.wait::st 确认 P0 stores 完成
+
+7. softmax 通知 p_o_rescale / p_ready_2
+
+8. PV MMA 读取 P0 并更新 O0
+
+9. P0 已消费后，后续 QK^T MMA 才能重新使用
+   S0/P0 共用的物理区域
+```
+
+这里每一步都同时涉及三类约束：
+
+| 约束 | 本课中的含义 |
+|---|---|
+| Layout | 同一个 logical `(row, n)` 由哪个 view、哪个 physical column 保存 |
+| Lifetime | `S0` 的旧 fp32 内容何时失去价值，`P0` 何时可以覆盖它 |
+| Synchronization | 哪个 consumer 必须等哪次 completion，何时才能读或覆盖 |
+
+`tcgen05.ld` 和 `tcgen05.st` 是异步 issue 的。等待 `s_ready` 只表示
+QKᵀ MMA 已经写完 `S`；它不表示 softmax 的 TMEM loads 已经完成。
+同理，softmax 发出 TMEM stores 后，必须以 `tcgen05.wait::st()` 确认
+这些 stores 完成，才能向 PV MMA 报告 `P` 已可用。
+
+`P0` 写完后，PV MMA 和下一轮 QKᵀ MMA 也不能只依赖 Python 源码的
+先后顺序。课程 kernel 由 WG3 warp 0 的同一个 issuing thread 按固定
+序列发出两类 MMA，lowering 必须保留必要的 `tcgen05` 依赖，确保下一
+轮写 `S0` 不会先于本轮消费完 `P0`。
+
+### 六、常见错误与可观察症状
+
+| 错误 | 破坏的约束 | 可观察症状 |
+|---|---|---|
+| 认为 `tmem_as_f16` 是第二块 1024-column allocation | 总容量超过 512 columns | allocation 冲突、越界或 kernel 无法按预期启动 |
+| 把 `P0` 按 fp32 计算为 128 physical columns | 误以为 `P0` 占用 `[0, 128)` 或 `[128, 256)` | 地址推导和覆盖范围全部错误 |
+| 将 `P_region[i_q, 1]` 改成未同步的另一个 half | producer 与 consumer view 不一致 | PV MMA 读到旧数据、零值或错误 scores |
+| `P` 覆盖前没有把完整 `S` 读入 registers | 后半 scores 被提前破坏 | attention 后半 keys 的贡献错误或归零 |
+| 写完 `P` 后省略 `tcgen05.wait::st()` | PV MMA 可能读取尚未完成的 stores | 偶发错误、部分列错误、数据竞争 |
+| 当前 `P` 尚未消费就让下一轮 QKᵀ 覆盖同一区域 | write-after-read hazard | 输出随调度和时序变化，表现为非确定性错误 |
+| 把 overlap 当成“两个 tile 同时有效” | 混淆分时复用与并行存储 | 错误地同时读取 S/P，或漏掉必须的 barrier |
+
+### 七、自测题与答案
+
+#### 1. 为什么 `P` 不需要第三块 128-column 独立空间？
+
+答：softmax 先把完整 `S` 读入 registers，之后 TMEM 中的旧 `S` 不再
+需要。每个 stage 的 `P` 是 `128` 个 fp16 values，只占
+`128 × 16 / 32 = 64` 个 physical columns，因此可以覆盖同一个 stage
+中 `S` 的后 64 columns。
+
+#### 2. `P0` 的逻辑列 `n=10` 对应哪个 physical column 和 half？
+
+答：
+
+```text
+P_region[0, 1, :, 10]
+    -> tmem_as_f16[:, 128 + 10]
+    -> fp16 slot 138
+    -> physical column 138 // 2 = 69
+    -> half 138 % 2 = 0
+```
+
+所以它位于 physical column 69 的 low half。
+
+#### 3. `S0` 和 `P0` 的物理范围重叠，为什么不会互相破坏？
+
+答：因为它们的生命周期经过同步后错开。QKᵀ MMA 先把 `S0` 写入
+`[0, 128)`，softmax 等到 `s_ready` 后把完整 `S0` 读走；只有在这之后
+`P0` 才覆盖 `[64, 128)`。重叠的是存储位置，不是同时有效的数据。
+
+#### 4. 下一轮 QKᵀ MMA 重新写 `S0` 前，至少必须保证什么？
+
+答：必须保证本轮 PV MMA 已经消费完 `P0`，因为 `P0` 位于 `S0` 的后
+半部分。否则下一轮 QKᵀ 写 `[0, 128)` 时可能覆盖尚未被 PV MMA 读取的
+`P0`。
+
+#### 5. 为什么不能只根据源码先后顺序判断 `S`、`P`、`O` 的复用安全？
+
+答：QKᵀ MMA、TMEM load/store 和 PV MMA 都可能异步执行。源码顺序只
+描述 issuing thread 发出的顺序，不自动证明 Tensor Core stores、
+softmax loads 或 MMA reads 已经完成。必须结合 `s_ready`、
+`tcgen05.wait::st()`、`p_o_rescale`、`p_ready_2` 以及 `tcgen05`
+的 issuing 依赖共同判断。
+
+## 十二、下一知识点
+
+下一步进入 QKᵀ MMA、softmax、PV MMA 的完整数据路径：
+
+```text
+Q/K/V 从 GMEM 或 SMEM 进入两次 MMA
+S 的 TMEM -> registers 读取
+P 的 registers -> TMEM 写回
+O 的 TMEM 累加、correction 与最终 epilogue
+每一步的 scope、layout、dispatch 和 barrier 交接
+```
+
+这会继续连接本课的 TMEM 地址映射与下一课的线程角色、barrier 和
+pipeline 时间线。
