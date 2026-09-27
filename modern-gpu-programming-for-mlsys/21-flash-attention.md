@@ -12,7 +12,8 @@ QK^T MMA -> softmax -> PV MMA
 的 TMEM layout、QKᵀ MMA、softmax 和 PV MMA 数据路径，也已经把
 softmax、correction、TMA 与 MMA issue 映射到具体 warp 角色。现在补上
 角色之间的两项执行契约：每个 warpgroup 能拿到多少 registers，以及每个
-共享 buffer 通过哪个 barrier、由谁 arrive、由谁 wait。
+共享 buffer 通过哪个 barrier、由谁 arrive、由谁 wait，并把 Q、K/V 与
+TMEM 三条流水线排成完整时间线。
 
 ## 本次讲解位置
 
@@ -41,7 +42,7 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
     [x] 5.1 Warp 角色地图
     [x] 5.2 Register 分配与 setmaxnreg
     [x] 5.3 Barrier 分工与角色交接
-[ ] 6. Q / K / V pipeline 时间线
+[x] 6. Q / K / V pipeline 时间线
 [ ] 7. Correction、最终归一化与 epilogue
 [ ] 8. Causal mask、GQA、tile scheduling 与验证
 ```
@@ -4481,10 +4482,620 @@ stage 顺序 commit 的情况，就是 stage 0 已完成，因此可以先归还
 stage 0 的 `O_smem`；之后再执行 `wait_group(0)`，等待全部 store 完成
 并归还 stage 1。
 
-## 十七、下一知识点
+## 十七、Q / K / V Pipeline 时间线
 
-下一步进入 `6. Q / K / V pipeline 时间线`。前面的数据路径、角色地图、
-register 契约和 barrier 契约已经分别成立，下一节把这些 edge 按时间
-排成完整流水：Q 双 buffer、K/V 三槽 ring、prologue、steady state、
-tail、barrier phase，以及每一轮中 TMA、QKᵀ、softmax、WG2、PV、
-store 的并行与依赖关系。
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：Pipeline 时间线
+知识点：Q 双 buffer、K/V 三槽 ring、prologue、steady state、tail 与 phase
+上次：5.2 Register 分配与 setmaxnreg；5.3 Barrier 分工与角色交接
+下次：7. Correction、最终归一化与 epilogue
+PTX：mbarrier、tcgen05.commit、cp.async.bulk、
+     cp.async.bulk.commit_group / wait_group
+```
+
+### 为什么现在讲这个
+
+`5.3` 已经给出了所有 barrier 的 arrive/wait 方向，但 barrier 表只说明
+“谁依赖谁”，不说明“哪些角色可以同时工作”。只按 barrier 表从上到下
+理解代码，容易错误地把 FA4 想成下面的串行流程：
+
+```text
+完成所有 QK^T MMA
+-> 完成所有 softmax
+-> 完成所有 PV MMA
+-> 最后 store
+```
+
+真实 kernel 不是这样。FA4 让 QKᵀ score、softmax、PV value 和 correction
+同时在不同的 K/V blocks 上向前推进。要理解性能与挂死位置，就必须把
+三件事分开：
+
+```text
+dependency edge: 某个操作开始前必须满足哪些 barrier
+scheduling:      在依赖允许后，不同角色可以并行执行什么
+pipeline state:  buffer 下一轮落到哪个 slot，使用哪个 phase
+```
+
+这一节建立三者之间的对应关系，并解释 prologue、steady state、tail
+为什么不能使用同一套循环边界。
+
+### 一、心智模型：三条独立 cursor，而不是一个全局进度
+
+FA4 至少维护三条独立进度：
+
+| Stream | Depth | 推进单位 | 状态 |
+|---|---:|---|---|
+| Q | 2 stages | Q tile | `q_epoch` |
+| K/V | 3 slots | 每一次 K load 或 V load | `kv_pipe` |
+| TMEM | 2 Q-stage groups | 一轮 S/P/O 使用 | `tmem_epoch` |
+
+它们不是同一个循环变量：
+
+```text
+Q0 / Q1 在整个 K/V loop 中持续存在
+K/V blocks 从最后一个有效 block 倒序流向第一个 block
+S/P/O slots 随两个 query tiles 在两个 stages 间交替
+```
+
+这就是 FA4 没有统一 pipeline depth 的原因。Q ring 只有两块，因为一个
+CTA 固定处理两个 query tiles；KV ring 有三块，让 TMA、MMA 和 consumer
+交错时有额外在途空间；TMEM 有两个 S/P/O slot groups，分别服务 Q0 与
+Q1。
+
+### 二、`stage` 与 `phase` 不是一回事
+
+`stage` 回答“使用哪块物理 buffer”：
+
+```text
+0, 1, 2, 0, 1, 2, ...
+```
+
+`phase` 回答“这是该 buffer 的第几个复用周期”：
+
+```text
+0, 0, 0, 1, 1, 1, 0, 0, 0, ...
+```
+
+源码中的状态推进可以完整写成：
+
+```python
+def advance(state):
+    if state.depth > 1:
+        state.stage += 1
+        if state.stage == state.depth:
+            state.stage = 0
+            state.phase ^= 1
+    else:
+        state.phase ^= 1
+```
+
+对 depth 为 3 的 KV ring：
+
+```text
+stage 0, phase 0
+stage 1, phase 0
+stage 2, phase 0
+stage 0, phase 1   <- wrap 时翻转 phase
+stage 1, phase 1
+stage 2, phase 1
+stage 0, phase 0   <- 再次 wrap
+```
+
+对 depth 为 1 的 `q_epoch`：
+
+```text
+phase 0 -> phase 1 -> phase 0
+```
+
+`q_epoch` 不是 Q slot 的物理 stage。Q 的物理 stage 由 `i_q` 或 WG id
+决定，`q_epoch` 表示 Q0、Q1 这一对 tile 已经完成了几轮交接。
+
+### 三、KV ring 实际如何装载 K 和 V
+
+一个容易忽略的实现细节是：`kv_pipe.advance()` 在每一次 `load_kv` 后
+都会执行，无论这次 load 的是 K 还是 V。因此 K 和 V 占用的是同一个三槽
+ring，而不是两个独立的三槽 ring。
+
+设有效 K/V block 数量为 `n=5`，block index 为 `4,3,2,1,0`。装载顺序是：
+
+```text
+Q0
+K[4]
+Q1
+V[4]
+K[3]
+V[3]
+K[2]
+V[2]
+K[1]
+V[1]
+K[0]
+V[0]
+```
+
+对应的 KV ring 状态是：
+
+| Tensor | 当前 slot | phase | advance 后 |
+|---|---:|---:|---|
+| `K[4]` | 0 | 0 | slot 1, phase 0 |
+| `V[4]` | 1 | 0 | slot 2, phase 0 |
+| `K[3]` | 2 | 0 | slot 0, phase 1 |
+| `V[3]` | 0 | 1 | slot 1, phase 1 |
+| `K[2]` | 1 | 1 | slot 2, phase 1 |
+| `V[2]` | 2 | 1 | slot 0, phase 0 |
+| `K[1]` | 0 | 0 | slot 1, phase 0 |
+| `V[1]` | 1 | 0 | slot 2, phase 0 |
+| `K[0]` | 2 | 0 | slot 0, phase 1 |
+| `V[0]` | 0 | 1 | slot 1, phase 1 |
+
+### 四、Prologue：建立前两种 operand
+
+Load warp 的 prologue 顺序是：
+
+```text
+load Q0
+load K[n-1]
+load Q1
+advance q_epoch
+load V[n-1]
+```
+
+这里先处理 `K[n-1]`，是因为 QKᵀ 必须先生成 S，softmax 才能生成 P，
+PV 才能读取 V。V 因此可以比 K 稍晚到达。
+
+MMA warp 的 prologue 顺序是：
+
+```text
+wait Q0 full
+wait K[n-1] full
+QK^T: S0 = Q0 * K[n-1]^T
+
+wait Q1 full
+QK^T: S1 = Q1 * K[n-1]^T
+
+commit s_ready[0]
+commit s_ready[1]
+advance kv_pipe
+```
+
+此时两个 S TMEM slots 都会被 softmax warpgroup 消费。PV MMA 还不能开始，
+因为 P0、P1 尚未从 softmax 统计和转换路径返回。
+
+### 五、Steady state：PV 当前 V，同时 QK 下一个 K
+
+源码中的主循环写成：
+
+```python
+for i_kv in range(mma_trip_count - 1):
+    stage_v = kv_pipe.stage
+    phase_v = kv_pipe.phase
+    kv_pipe.advance()
+
+    for i_q in range(SMEM_PIPE_DEPTH_Q):
+        if i_q == 0:
+            kv_load.full.wait(stage_v, phase_v)
+
+        p_o_rescale.wait(i_q, tmem_epoch.phase)
+        gemm_pv(i_q, stage_v, acc, v_desc, v_desc_steady_hi)
+
+        if i_q == 1:
+            kv_load.empty.arrive(stage_v)
+
+        if i_q == 0:
+            kv_load.full.wait(kv_pipe.stage, kv_pipe.phase)
+
+        gemm_qk(i_q, kv_pipe.stage, q_desc_steady, k_desc_steady)
+
+        if i_q == 1:
+            kv_load.empty.arrive(kv_pipe.stage)
+
+    acc = 1
+    kv_pipe.advance()
+    tmem_epoch.advance()
+```
+
+核心交错是：
+
+```text
+PV P0*V[current]
+QK Q0*K[next]
+PV P1*V[current]
+QK Q1*K[next]
+```
+
+按照源码的 `q=0`、`q=1` 顺序，实际事件是：
+
+```text
+PV P0*V[current]
+QK Q0*K[next]
+PV P1*V[current]
+QK Q1*K[next]
+```
+
+第一次 steady iteration 中：
+
+```text
+current V = V[4]
+next K    = K[3]
+```
+
+所以交错序列是：
+
+```text
+PV P0*V[4]
+QK Q0*K[3]
+PV P1*V[4]
+QK Q1*K[3]
+```
+
+如果把所有 QKᵀ 都提前做完，softmax 和 PV 在前期只能空闲；如果把所有
+PV 都放到最后，V SMEM 会被长时间占住，KV ring 也失去 overlap 的作用。
+
+### 六、Tail：处理最后 V，交还 O
+
+主循环处理的是 `n-1` 对 K/V 的前向依赖。最后由 tail 消耗 `V[0]`：
+
+```python
+for i_q in range(SMEM_PIPE_DEPTH_Q):
+    p_o_rescale.wait(i_q, tmem_epoch.phase)
+    gemm_pv(i_q, kv_pipe.stage, acc, v_desc_tail_lo, v_desc_tail_hi)
+    commit(o_ready, i_q)
+```
+
+逻辑顺序是：
+
+```text
+PV P0*V[0]
+PV P1*V[0]
+commit o_ready[0]
+commit o_ready[1]
+```
+
+只有这些 PV MMA 完成后，O0 和 O1 里的 accumulated values 才是最终值。
+WG2 随后执行最终 normalization，把 O 写入 `O_smem`，再通过
+`corr_epi.full` 放行 TMA store。
+
+### 七、完整可运行时间线模拟器
+
+下面的脚本不依赖 CUDA，只模拟 FA4 的 ring 状态和各角色的逻辑事件顺序。
+它可以验证：
+
+- 每次 K 或 V load 都推进 KV ring。
+- K 与 V 交替使用三个物理 slots。
+- phase 只在 ring wrap 时翻转。
+- MMA 交错执行当前 V 的 PV 和下一个 K 的 QKᵀ。
+- prologue 与 tail 的边界不会多执行或少执行一次。
+
+文件名：`flash_attention_pipeline_timeline.py`
+
+```python
+from dataclasses import dataclass
+
+
+@dataclass
+class PipelineState:
+    name: str
+    depth: int
+    stage: int = 0
+    phase: int = 0
+
+    def advance(self):
+        old = (self.stage, self.phase)
+
+        if self.depth > 1:
+            self.stage += 1
+            if self.stage == self.depth:
+                self.stage = 0
+                self.phase ^= 1
+        else:
+            self.phase ^= 1
+
+        return old, (self.stage, self.phase)
+
+
+def kv_trace(depth=3, pairs=5):
+    state = PipelineState("kv", depth)
+    rows = []
+
+    for i in range(pairs - 1, -1, -1):
+        for tensor in ("K", "V"):
+            old_stage = state.stage
+            old_phase = state.phase
+            state.advance()
+            rows.append(
+                (
+                    f"{tensor}[{i}]",
+                    old_stage,
+                    old_phase,
+                    state.stage,
+                    state.phase,
+                )
+            )
+
+    return rows
+
+
+def event_sequences(n=5):
+    load = ["Q0", f"K[{n - 1}]", "Q1", f"V[{n - 1}]"]
+
+    for i in range(n - 2, -1, -1):
+        load += [f"K[{i}]", f"V[{i}]"]
+
+    mma = [
+        f"QK Q0*K[{n - 1}]",
+        f"QK Q1*K[{n - 1}]",
+    ]
+
+    for j in range(n - 1):
+        v = n - 1 - j
+        k = v - 1
+        mma += [
+            f"PV P0*V[{v}]",
+            f"QK Q0*K[{k}]",
+            f"PV P1*V[{v}]",
+            f"QK Q1*K[{k}]",
+        ]
+
+    mma += [
+        "PV P0*V[0]",
+        "PV P1*V[0]",
+        "commit o_ready[0]",
+        "commit o_ready[1]",
+    ]
+
+    softmax = []
+    for i in range(n - 1, -1, -1):
+        softmax += [f"S0*K[{i}] -> P0", f"S1*K[{i}] -> P1"]
+
+    return load, mma, softmax
+
+
+if __name__ == "__main__":
+    rows = kv_trace()
+
+    print("KV ring placement, n_kv=5")
+    print("tensor   slot  phase_before  next_slot  phase_after")
+    for tensor, old_stage, old_phase, new_stage, new_phase in rows:
+        print(
+            f"{tensor:6s}   {old_stage:4d}  {old_phase:11d}  "
+            f"{new_stage:9d}  {new_phase:11d}"
+        )
+
+    load, mma, softmax = event_sequences()
+
+    print()
+    print("Per-role logical order, n_kv=5")
+    for name, sequence in (
+        ("load", load),
+        ("mma", mma),
+        ("softmax", softmax),
+    ):
+        print(f"{name}:")
+        for index, event in enumerate(sequence):
+            print(f"  {index:02d} {event}")
+```
+
+运行：
+
+```bash
+python3 flash_attention_pipeline_timeline.py
+```
+
+预期输出：
+
+```text
+KV ring placement, n_kv=5
+tensor   slot  phase_before  next_slot  phase_after
+K[4]        0            0          1            0
+V[4]        1            0          2            0
+K[3]        2            0          0            1
+V[3]        0            1          1            1
+K[2]        1            1          2            1
+V[2]        2            1          0            0
+K[1]        0            0          1            0
+V[1]        1            0          2            0
+K[0]        2            0          0            1
+V[0]        0            1          1            1
+
+Per-role logical order, n_kv=5
+load:
+  00 Q0
+  01 K[4]
+  02 Q1
+  03 V[4]
+  04 K[3]
+  05 V[3]
+  06 K[2]
+  07 V[2]
+  08 K[1]
+  09 V[1]
+  10 K[0]
+  11 V[0]
+mma:
+  00 QK Q0*K[4]
+  01 QK Q1*K[4]
+  02 PV P0*V[4]
+  03 QK Q0*K[3]
+  04 PV P1*V[4]
+  05 QK Q1*K[3]
+  06 PV P0*V[3]
+  07 QK Q0*K[2]
+  08 PV P1*V[3]
+  09 QK Q1*K[2]
+  10 PV P0*V[2]
+  11 QK Q0*K[1]
+  12 PV P1*V[2]
+  13 QK Q1*K[1]
+  14 PV P0*V[1]
+  15 QK Q0*K[0]
+  16 PV P1*V[1]
+  17 QK Q1*K[0]
+  18 PV P0*V[0]
+  19 PV P1*V[0]
+  20 commit o_ready[0]
+  21 commit o_ready[1]
+softmax:
+  00 S0*K[4] -> P0
+  01 S1*K[4] -> P1
+  02 S0*K[3] -> P0
+  03 S1*K[3] -> P1
+  04 S0*K[2] -> P0
+  05 S1*K[2] -> P1
+  06 S0*K[1] -> P0
+  07 S1*K[1] -> P1
+  08 S0*K[0] -> P0
+  09 S1*K[0] -> P1
+```
+
+输出中的编号是每个角色内部的逻辑顺序，不是 GPU cycle。真实执行时
+load warp 可能远远领先，softmax 和 correction 会在 PV MMA 之间交错。
+
+### 八、把依赖表放回时间线
+
+以 `n=5` 为例，一轮中关键元素的位置可以写成：
+
+```text
+load warp:
+  Q0 K4 Q1 V4 K3 V3 K2 V2 K1 V1 K0 V0
+
+MMA warp:
+  QK Q0*K4
+  QK Q1*K4
+  PV P0*V4
+  QK Q0*K3
+  PV P1*V4
+  QK Q1*K3
+  PV P0*V3
+  ...
+  PV P0*V0
+  PV P1*V0
+  commit o_ready[0]
+  commit o_ready[1]
+
+softmax WG0:
+  S0*K4 -> P0
+  S0*K3 -> P0
+  ...
+  S0*K0 -> P0
+
+softmax WG1:
+  S1*K4 -> P1
+  S1*K3 -> P1
+  ...
+  S1*K0 -> P1
+
+WG2:
+  预先放行 O0/O1
+  每轮读取 acc_scale
+  按需 rescale O0/O1
+  最后 normalization 与 O_smem 写入
+
+store warp:
+  wait corr_epi.full[0]
+  TMA store O0
+  wait corr_epi.full[1]
+  TMA store O1
+  commit_group / wait_group
+```
+
+这张时间线回答“谁可以并行”，而 `5.3` 的 barrier 表回答“并行前必须
+满足什么”。
+
+### 九、为什么 prologue、steady、tail 必须分开
+
+如果只写一个 K/V loop，会遇到三个边界问题：
+
+1. 第一次 QKᵀ 需要 `K[n-1]`，此时还没有 `V[n-1]` 可以供 PV 使用。
+2. Steady state 同时需要当前 V 和下一个 K，因此要同时持有两个 operand。
+3. 最后一个 V 没有“下一个 K”可以配对，不能继续按 steady state 迭代。
+
+最终代码把边界拆成：
+
+```text
+prologue:
+  Q0*K[n-1], Q1*K[n-1]
+
+steady:
+  PV current V + QK next K
+
+tail:
+  PV V[0] for both Q stages
+  commit o_ready
+```
+
+数量检查：
+
+```text
+QK MMA 次数:
+  2 prologue + 2 * (n - 1) steady
+= 2n
+
+PV MMA 次数:
+  2 * (n - 1) steady + 2 tail
+= 2n
+```
+
+每个 query stage 对每个 K/V block 恰好做一次 QKᵀ 和一次 PV。多一次会
+重复累加，少一次会漏掉 V[0] 或漏掉最后的 score。
+
+### 十、常见错误与症状
+
+| 错误 | 原因 | 可观察症状 |
+|---|---|---|
+| 把 K/V ring 当成两个独立 ring | 每次 K/V load 都能 advance | stage 与 phase 对不上，MMA 误读 slot |
+| 认为 `kv_pipe.stage` 在 K 和 V 间保持相同 | 源码每次 load 都调用 advance | 到第二个 K/V block 后开始挂死或读错数据 |
+| 为三个 slots 共用一个 phase | phase 属于 slot 的复用周期 | 第二个 wrap 后 wait 永远不满足 |
+| 只用 `n-1` 次 steady loop 且没有 tail | V[0] 永远不会累加 | 输出漏掉最后一个 KV block |
+| Tail 再做一次 QKᵀ | QKᵀ 已经在最后一次 steady 处理 | S/P 被重复覆盖，结果错误 |
+| PV 不等 `p_o_rescale` | P 尚未就绪或 O 未完成 rescale | 读到半成品 P/O，错误与调度有关 |
+| 把 `commit o_ready` 放在 tail PV 前 | O 还没有最终值 | epilogue 提前读 O |
+| TMA store 在主循环中提前启动 | `corr_epi.full` 尚未由 WG2 完成 | store 读半成品 `O_smem` |
+
+### 十一、自测题与答案
+
+#### 1. FA4 的三个 pipeline depth 分别是什么，为什么不能合并成一个 depth？
+
+答：Q depth 是 2，KV depth 是 3，TMEM S/P/O 的 Q-stage depth 是 2。
+它们服务的资源不同，推进单位也不同。Q 以 query tile 推进，KV 以每次
+K 或 V load 推进，TMEM 以一轮 S/P/O 交接推进。合并成一个 cursor 无法
+表达某一个 stream 可以领先或落后。
+
+#### 2. 为什么 `K[4]` 和 `V[4]` 不落在同一个 KV ring slot？
+
+答：`load_kv` 每次装载完成都会执行 `kv_pipe.advance()`。因此 `K[4]`
+使用 slot 0，advance 后 `V[4]` 使用 slot 1，再 advance 后 `K[3]` 使用
+slot 2。K 和 V 共享同一个三槽 ring，但各自占用独立 slot。
+
+#### 3. 为什么第一次 steady state 是 `PV P0*V[4]` 和 `QK Q0*K[3]` 交错？
+
+答：Q0、Q1 与 `K[4]` 的 QKᵀ 已经在 prologue 产生 S0、S1。WG0/WG1
+完成 softmax 后产生 P0、P1，PV 可以开始。同时 load warp 已经准备
+`K[3]`，MMA warp 利用 PV 之后的 Tensor Core 时间继续生成下一个 S。
+
+#### 4. 如果 K/V block 数是 `n`，QKᵀ 和 PV MMA 各执行多少次？
+
+答：每个 Q stage 对每个 K/V block 做一次 QKᵀ 和一次 PV，所以每个
+Q stage 各有 `n` 次。两个 Q stages 总共各 `2n` 次。
+
+#### 5. 为什么 tail 只做 PV，不再做 QKᵀ？
+
+答：最后一次 steady iteration 已经使用 `K[0]` 生成最后一批 S，tail 的
+任务只是消费 `V[0]` 并完成 O 的累加。因此 tail 只需要 PV，
+随后 commit `o_ready`。
+
+#### 6. 为什么 prologue 中 `V[n-1]` 可以晚于 `K[n-1]` 到达？
+
+答：`K[n-1]` 先用于 QKᵀ 生成 S，随后 softmax 把 S 转成 P，PV 才需要
+V。把 V 放在 Q1 和 `q_epoch.advance()` 之后，可以让 load warp 优先
+建立 score 计算所需 operand，同时让 Q0 的后续 QK 尽早进入准备阶段。
+
+## 十八、下一知识点
+
+下一步进入 `7. Correction、最终归一化与 epilogue`：解释 WG2 如何读取
+`acc_scale`、选择性 rescale TMEM O、处理 non-causal 的最终 `row_sum`，
+完成 normalization、cast 到 `O_smem`，以及 TMA store 如何按 stage
+归还 `corr_epi.empty`。
