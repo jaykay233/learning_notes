@@ -15,6 +15,8 @@ softmax、correction、TMA 与 MMA issue 映射到具体 warp 角色。现在补
 共享 buffer 通过哪个 barrier、由谁 arrive、由谁 wait，并把 Q、K/V 与
 TMEM 三条流水线排成完整时间线。
 本节的最后补上 KV block 为什么从最后一个有效 block 反向遍历。
+现在继续补上 K/V loop 结束后的 epilogue：`row_sum` 如何归一化 TMEM
+中的 `O`，写入 `O_smem`，再交给 TMA store。
 
 ## 本次讲解位置
 
@@ -44,7 +46,7 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
     [x] 5.2 Register 分配与 setmaxnreg
     [x] 5.3 Barrier 分工与角色交接
 [x] 6. Q / K / V pipeline 时间线
-[ ] 7. Correction、最终归一化与 epilogue
+[x] 7. Correction、最终归一化与 epilogue
 [ ] 8. Causal mask、GQA、tile scheduling 与验证
 ```
 
@@ -5234,9 +5236,666 @@ Q stage 各有 `n` 次。两个 Q stages 总共各 `2n` 次。
 V。把 V 放在 Q1 和 `q_epoch.advance()` 之后，可以让 load warp 优先
 建立 score 计算所需 operand，同时让 Q0 的后续 QK 尽早进入准备阶段。
 
-## 十八、下一知识点
+## 十八、Correction、最终归一化与 epilogue
 
-下一步进入 `7. Correction、最终归一化与 epilogue`：解释 WG2 如何读取
-`acc_scale`、选择性 rescale TMEM O、处理 non-causal 的最终 `row_sum`，
-完成 normalization、cast 到 `O_smem`，以及 TMA store 如何按 stage
-归还 `corr_epi.empty`。
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：重缩放与结果写回
+知识点：correction 后的最终 row_sum 归一化，以及 O TMEM -> O_smem -> TMA store 的 epilogue
+上次：Q / K / V pipeline 时间线，以及 KV block 反向遍历
+下次：Causal mask、GQA、tile scheduling 与验证
+PTX：tcgen05.ld / tcgen05.wait.ld、rcp.approx.ftz.f32、
+     cp.async.bulk.commit_group / cp.async.bulk.wait_group
+```
+
+### 为什么现在讲这个
+
+上一节已经把 K/V loop 的时间线排完：QKᵀ 产生 S，softmax 产生 P，
+PV 把 `P @ V` 累加到 TMEM 中的 O。但此时的 O 还不是最终输出。它是
+同一个 exponential reference 下的未归一化加权和：
+
+```text
+O_i = sum_j 2^((s_ij - r_i) * scale_log2) * V_j
+row_sum_i = sum_j 2^((s_ij - r_i) * scale_log2)
+```
+
+最终要写的 output 是：
+
+```text
+O_final[i, :] = O_i / row_sum_i
+```
+
+Correction 只解决“多个 K/V block 必须使用同一个参考值”的问题；它不会
+完成这次逐行除法。缺了 epilogue，TMEM 里的 O 会整体大 `row_sum_i` 倍，
+而且仍然是 fp32、还没有进入 TMA 能读取的 SMEM staging。这个知识点要
+把最后一段数据路径补齐，并解释两个同步点：什么时候可以读 O，什么
+时候可以覆盖 `O_smem`。
+
+### 一、心智模型：correction 保持参考系，epilogue 做最终归一化
+
+把 attention 的数值状态想成两本账：
+
+```text
+row_sum: 每一行已经累加了多少指数权重
+O:       每一行用这些权重加权求和得到的 value
+```
+
+处理新 K/V block 时，如果新的最大值比旧的 reference 大很多，softmax
+会切换 reference。此时旧账本必须整体乘上：
+
+```text
+acc_scale = 2^((r_old - r_new) * scale_log2)
+```
+
+这就是 correction。它让旧 `row_sum` 和旧 `O` 与新 block 落在同一个
+reference 下，但不会改变“O 仍未除以 row_sum”这个事实。
+
+所有 K/V block 处理完后，epilogue 才做三件事：
+
+```text
+1. 读取最终 row_sum
+2. O <- O * (1 / row_sum)
+3. cast 到输出 dtype，写入 O_smem，交给 TMA store
+```
+
+### 二、参与者、资源和生命周期
+
+| 名称 | 含义 | 位置 | 生产者 | 消费者 |
+|---|---|---|---|---|
+| `row_sum` | 每行的指数权重和 `ℓ_i` | softmax registers；non-causal 写入 `sScale` | softmax WG | WG2 或 WG0/WG1 |
+| `sScale` | 每个 Q stage 128 个 fp32；先存 `acc_scale`，最后存 `row_sum` | SMEM | softmax WG | WG2 |
+| `O` | 未归一化的加权和 | TMEM，stage 0 从 column 256 开始，stage 1 从 384 开始 | PV MMA / correction | epilogue |
+| `O_smem` | fp16 staging，供 TMA store 读取 | SMEM，两个 stage | epilogue WG | TMA store warp |
+| `o_ready` | “最后一段 PV 已经完成，TMEM O 可读” | mbarrier，init 1 | MMA `tcgen05.commit` | epilogue WG |
+| `corr_epi.full` | “O_smem stage 已写好” | mbarrier，full count 128 | epilogue WG 的 128 threads | store warp |
+| `corr_epi.empty` | “O_smem stage 可以复用” | mbarrier，empty count 32 | store warp 的 32 threads | epilogue WG |
+| `tmem_epoch` | O slot 跨 task 复用的 phase | pipeline state | store warp advance | epilogue wait |
+
+这里最容易混的是 `o_ready` 和 `corr_epi.empty`：
+
+```text
+o_ready:        TMEM 里的 O 是否已经算完
+corr_epi.empty: O_smem 这块 staging 是否已经被 TMA 读完
+```
+
+一个保护 TMEM 的读，一个保护 SMEM 的写。
+
+### 三、完整可运行模拟
+
+完整文件：`modern-gpu-programming-for-mlsys/code/flash_attention_epilogue_sim.py`
+
+```python
+#!/usr/bin/env python3
+"""Simulate the FA4 epilogue math: row_sum -> normalize -> fp16 O_smem."""
+
+from __future__ import annotations
+
+import math
+import struct
+from typing import Any
+
+
+def f32(value: float) -> float:
+    """Round a Python float to IEEE-754 binary32."""
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def f16(value: float) -> float:
+    """Round a Python float to IEEE-754 binary16."""
+    return struct.unpack("<e", struct.pack("<e", value))[0]
+
+
+def rcp_approx_ftz(value: float) -> float:
+    """Reference for PTX rcp.approx.ftz.f32.
+
+    Python has no reciprocal-approximation instruction, so this function uses
+    1 / value as the reference result. On Blackwell the PTX instruction is a
+    single approximate reciprocal with flush-to-zero handling.
+    """
+    if value == 0.0:
+        return math.inf
+    return f32(1.0 / value)
+
+
+def online_update(
+    row_max_old: float,
+    row_sum_old: float,
+    o_old: list[float],
+    s_block: list[float],
+    v_block: list[list[float]],
+    scale_log2: float = 1.0,
+    rescale_threshold: float = 8.0,
+) -> tuple[float, list[float], dict[str, Any]]:
+    """Apply one FA4 conditional-rescaling update.
+
+    The reference implementation uses base-2 exponentials:
+        P = 2 ** ((S - new_ref) * scale_log2)
+    """
+    candidate_max = max(s_block)
+    delta = (row_max_old - candidate_max) * scale_log2
+
+    if delta >= -rescale_threshold:
+        new_ref = row_max_old
+        acc_scale = 1.0
+        kept_old_reference = True
+    else:
+        new_ref = candidate_max
+        acc_scale = 2.0**delta
+        kept_old_reference = False
+
+    p = [2.0 ** ((score - new_ref) * scale_log2) for score in s_block]
+    block_row_sum = sum(p)
+    block_o = [
+        sum(p[k] * v_block[k][d] for k in range(len(p)))
+        for d in range(len(v_block[0]))
+    ]
+
+    row_sum_new = row_sum_old * acc_scale + block_row_sum
+    o_new = [
+        o_old[d] * acc_scale + block_o[d]
+        for d in range(len(o_old))
+    ]
+    trace = {
+        "candidate_max": candidate_max,
+        "delta": delta,
+        "new_ref": new_ref,
+        "acc_scale": acc_scale,
+        "kept_old_reference": kept_old_reference,
+        "p": p,
+        "block_row_sum": block_row_sum,
+        "block_o": block_o,
+    }
+    return row_sum_new, o_new, trace
+
+
+def normalize_row(
+    o_row: list[float],
+    row_sum: float,
+) -> tuple[list[float], float, bool]:
+    """Apply the FA4 epilogue normalization and zero/NaN guard."""
+    zero_or_nan = (row_sum == 0.0) or math.isnan(row_sum)
+    selected = 1.0 if zero_or_nan else row_sum
+    norm_scale = rcp_approx_ftz(selected)
+    normalized = [f32(value * norm_scale) for value in o_row]
+    return normalized, norm_scale, zero_or_nan
+
+
+def cast_row_to_f16(o_row: list[float]) -> list[float]:
+    """Simulate cast_f32x2_f16x2 for one row."""
+    return [f16(value) for value in o_row]
+
+
+def print_epilogue(title: str, row_sum: float, o_row: list[float]) -> None:
+    normalized, norm_scale, zero_or_nan = normalize_row(o_row, row_sum)
+    o_f16 = cast_row_to_f16(normalized)
+    print(f"== {title} ==")
+    print(f"row_sum        = {row_sum!r}")
+    print(f"O              = {o_row}")
+    print(f"zero_or_nan    = {zero_or_nan}")
+    print(f"norm_scale     = {norm_scale}")
+    print(f"O * norm_scale = {normalized}")
+    print(f"O_smem (fp16)  = {o_f16}")
+    print()
+
+
+def print_update(title: str, s_block: list[float]) -> None:
+    row_sum_new, o_new, trace = online_update(
+        row_max_old=2.0,
+        row_sum_old=3.0,
+        o_old=[4.0, 6.0],
+        s_block=s_block,
+        v_block=[[1.0, 0.0], [0.0, 1.0]],
+    )
+    print(f"== {title} ==")
+    print(f"S                 = {s_block}")
+    print(f"candidate_max     = {trace['candidate_max']}")
+    print(f"delta             = {trace['delta']}")
+    print(f"new_ref           = {trace['new_ref']}")
+    print(f"acc_scale         = {trace['acc_scale']}")
+    print(f"P                 = {trace['p']}")
+    print(f"block_row_sum     = {trace['block_row_sum']}")
+    print(f"block_O           = {trace['block_o']}")
+    print(f"row_sum_new       = {row_sum_new}")
+    print(f"O_new             = {o_new}")
+    print()
+    print_epilogue(title, row_sum_new, o_new)
+
+
+def main() -> None:
+    print_update("case 1: delta >= -8, keep old reference", [5.0, 4.0])
+    print_update("case 2: delta < -8, switch reference", [11.0, 10.0])
+    print_epilogue("guard: row_sum == 0", 0.0, [0.0, 0.0])
+    print_epilogue("guard: row_sum == NaN", float("nan"), [0.0, 0.0])
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python3 modern-gpu-programming-for-mlsys/code/flash_attention_epilogue_sim.py
+```
+
+预期输出：
+
+```text
+== case 1: delta >= -8, keep old reference ==
+S                 = [5.0, 4.0]
+candidate_max     = 5.0
+delta             = -3.0
+new_ref           = 2.0
+acc_scale         = 1.0
+P                 = [8.0, 4.0]
+block_row_sum     = 12.0
+block_O           = [8.0, 4.0]
+row_sum_new       = 15.0
+O_new             = [12.0, 10.0]
+
+== case 1: delta >= -8, keep old reference ==
+row_sum        = 15.0
+O              = [12.0, 10.0]
+zero_or_nan    = False
+norm_scale     = 0.06666667014360428
+O * norm_scale = [0.8000000715255737, 0.6666666865348816]
+O_smem (fp16)  = [0.7998046875, 0.66650390625]
+
+== case 2: delta < -8, switch reference ==
+S                 = [11.0, 10.0]
+candidate_max     = 11.0
+delta             = -9.0
+new_ref           = 11.0
+acc_scale         = 0.001953125
+P                 = [1.0, 0.5]
+block_row_sum     = 1.5
+block_O           = [1.0, 0.5]
+row_sum_new       = 1.505859375
+O_new             = [1.0078125, 0.51171875]
+
+== case 2: delta < -8, switch reference ==
+row_sum        = 1.505859375
+O              = [1.0078125, 0.51171875]
+zero_or_nan    = False
+norm_scale     = 0.6640726327896118
+O * norm_scale = [0.6692606806755066, 0.33981841802597046]
+O_smem (fp16)  = [0.66943359375, 0.33984375]
+
+== guard: row_sum == 0 ==
+row_sum        = 0.0
+O              = [0.0, 0.0]
+zero_or_nan    = True
+norm_scale     = 1.0
+O * norm_scale = [0.0, 0.0]
+O_smem (fp16)  = [0.0, 0.0]
+
+== guard: row_sum == NaN ==
+row_sum        = nan
+O              = [0.0, 0.0]
+zero_or_nan    = True
+norm_scale     = 1.0
+O * norm_scale = [0.0, 0.0]
+O_smem (fp16)  = [0.0, 0.0]
+```
+
+这份模拟只模拟数值和 guard，不模拟 TMEM/SMEM 的真实物理布局；下面
+把每一步映射回 FA4 的实际角色、barrier 和代理路径。它不依赖临时
+clone，任何有 Python 3.10+ 的机器都能运行。
+
+### 四、逐阶段数据路径
+
+#### 1. MMA 完成最后的 PV，commit `o_ready`
+
+当某个 Q stage 的最后一个 `PV` 完成后，MMA warp 用 `tcgen05.commit`
+对 `o_ready[i_q]` 报告一次完成。`o_ready` 的 expected count 是 1，
+因为它是矩阵引擎的一次 commit，不是 128 个线程各自 arrive。
+
+```text
+MMA 侧：最后一次 PV 完成
+    -> tcgen05.commit(o_ready[i_q])
+Epilogue 侧：o_ready.wait(i_q, phase)
+```
+
+#### 2. Epilogue 同时等待 `o_ready` 和 `corr_epi.empty`
+
+Non-causal 路径的 WG2 在读取 O 之前等两个条件：
+
+```python
+o_ready.wait(i_q, tmem_epoch.phase)
+corr_epi.empty.wait(i_q, tmem_epoch.phase)
+```
+
+两者保护的不是同一块内存：
+
+```text
+o_ready:        TMEM O 是否已经由最后一次 PV 写好
+corr_epi.empty: O_smem stage 是否已经被上一轮 TMA store 释放
+```
+
+如果只等 `o_ready`，epilogue 可能覆盖还在被 TMA 读取的 `O_smem`；
+如果只等 `corr_epi.empty`，可能读到尚未完成的 TMEM O。
+
+#### 3. 读取最终 `row_sum`
+
+Non-causal 路径中，softmax WG 在 K/V loop 结束后把最终 `row_sum[0]`
+写到 `sScale`：
+
+```python
+txl.ptx.st.shared.f32(
+    sScale.ptr_to([ROW_SUM_BASE + tid_in_wg + wg_id * BLK_M]),
+    row_sum[0],
+)
+```
+
+WG2 再按 Q stage 读回来：
+
+```python
+txl.ptx.ld.shared.f32(
+    row_sum_c,
+    sScale.ptr_to([ROW_SUM_BASE + tid_in_wg + i_q * BLK_M]),
+)
+```
+
+Causal 路径不同：`EPI_ON_SOFTMAX = True`，WG0/WG1 本来就持有
+`row_sum[0]`，所以直接在寄存器里做 epilogue，不再走这次 SMEM 往返。
+
+#### 4. zero/NaN guard 与 `rcp.approx.ftz.f32`
+
+```python
+zero_or_nan = (row_sum_c == 0.0) or (row_sum_c != row_sum_c)
+norm_scale = rcp.approx.ftz.f32(zero_or_nan ? 1.0 : row_sum_c)
+```
+
+`row_sum != row_sum` 是 NaN 检测。guard 必须放在 reciprocal 之前：
+如果先算 `1 / 0`，会得到 `inf`；紧接着 `O * inf` 在全零行上会得到
+`0 * inf = NaN`，最终输出出现 NaN。当前逻辑把这种行换成
+`norm_scale = 1.0`，保持 O 的现有值（有效情况下应为 0）。
+
+`rcp.approx.ftz.f32` 是硬件近似倒数，不是精确除法。它把逐元素除法
+变成“一次倒数 + 多次乘法”：
+
+```text
+row_sum = 15
+norm_scale = rcp.approx.ftz.f32(15) ~= 0.06666667
+O = [12, 10]
+O_final = [12 * norm_scale, 10 * norm_scale]
+        ~= [0.80000007, 0.66666669]
+```
+
+#### 5. TMEM -> registers：`tcgen05.ld`
+
+Epilogue 按 `d_tile` 分块从 TMEM 读 O。Non-causal 用
+`TMEM_EPI_LD_SIZE = 16`，causal 用 `EPI_LD_SM = 32`：
+
+```python
+for d_tile in range(ceildiv(HEAD_DIM, TMEM_EPI_LD_SIZE)):
+    d_start = d_tile * TMEM_EPI_LD_SIZE
+    tmem_load(
+        o_row_f32,
+        0,
+        tmem((SMEM_PIPE_DEPTH_Q + i_q) * MMA_N + d_start),
+        TMEM_EPI_LD_SIZE,
+    )
+```
+
+地址展开代入 `SMEM_PIPE_DEPTH_Q = 2`、`MMA_N = 128`：
+
+```text
+stage 0 O 起点 = (2 + 0) * 128 = 256
+stage 1 O 起点 = (2 + 1) * 128 = 384
+```
+
+TMEM 的前 256 columns 被 S/P 使用，O 从 column 256 开始。每个 `d_tile`
+读 16 或 32 个 fp32 到寄存器，`HEAD_DIM = 128` 时 non-causal 需要
+`128 / 16 = 8` 次，causal 需要 `128 / 32 = 4` 次。
+
+#### 6. registers -> O_smem：乘法、cast、shared store
+
+读到寄存器后，先做 fp32 乘法：
+
+```python
+for i in range(TMEM_EPI_LD_SIZE // 2):
+    mul_f32x2(o_row_f32, 2 * i, norm_scale)
+```
+
+`mul_f32x2` 一次处理两个 fp32。随后把两个 fp32 打包成两个 fp16：
+
+```python
+for i in range(TMEM_EPI_LD_SIZE // 2):
+    cast_f32x2_f16x2(o_row_f16, o_row_f32, 2 * i)
+```
+
+最后每个线程用 `st.shared.v4.u32` 一次写 4 个 u32，也就是 8 个 fp16：
+
+```python
+for i in range(TMEM_EPI_LD_SIZE // 8):
+    txl.ptx.st.shared.v4.u32(
+        o_smem[i_q].ptr_to(tid_in_wg, d_start + i * 8),
+        o_row_f16[i * 4],
+        o_row_f16[i * 4 + 1],
+        o_row_f16[i * 4 + 2],
+        o_row_f16[i * 4 + 3],
+    )
+```
+
+`TMEM_EPI_LD_SIZE = 16` 时循环 2 次，写入 16 个 fp16；
+`EPI_LD_SM = 32` 时循环 4 次，写入 32 个 fp16。
+
+#### 7. `fence.proxy.async_.shared__cta`
+
+共享内存写入发生在 generic proxy 上，TMA 读取发生在 async proxy 上。
+写完 `O_smem` 后必须有：
+
+```python
+txl.ptx.fence.proxy.async_.shared__cta()
+```
+
+它不搬运数据，也不等待 TMA。它保证 generic proxy 的 shared-memory
+写入对 async proxy 可见。少了这条 fence，TMA 可能读到旧数据或半成品。
+
+#### 8. `corr_epi.full.arrive` 与 TMA store
+
+Epilogue WG 的 128 个线程写完并 fence 后，全部对 `corr_epi.full`
+arrive：
+
+```python
+corr_epi.full.arrive(i_q)
+```
+
+Store warp 等到对应的 full：
+
+```python
+corr_epi.full.wait(0, tmem_epoch.phase)
+# TMA store stage 0
+txl.ptx.cp.async_.bulk.commit_group()
+
+corr_epi.full.wait(1, tmem_epoch.phase)
+# TMA store stage 1
+txl.ptx.cp.async_.bulk.commit_group()
+```
+
+每个 stage 的 TMA store 是一个 bulk async group。`corr_epi.full`
+的 expected count 是 128，因为整个 epilogue warpgroup 共同完成
+`O_smem` 的写入；`corr_epi.empty` 的 expected count 是 32，因为
+只有 32 个 store-warp 线程负责发起和等待 TMA store。
+
+#### 9. `wait_group` 分两步归还 stage
+
+两个 store group 提交后，store warp 不一次性等完，而是分两步：
+
+```python
+txl.ptx.cp.async_.bulk.wait_group(1)
+corr_epi.empty.arrive(0)
+txl.ptx.cp.async_.bulk.wait_group(0)
+corr_epi.empty.arrive(1)
+```
+
+含义是：
+
+```text
+wait_group(1): 最多还有 1 组未完成
+                -> 较早提交的 stage 0 已完成
+                -> 归还 stage 0
+wait_group(0): 所有组都已完成
+                -> 归还 stage 1
+```
+
+这样 epilogue 可以在 stage 1 的 store 还在途中时，先复用 stage 0。
+最后 store warp 执行 `tmem_epoch.advance()`，翻转 O slot 的 phase，
+让下一个 task 的 epilogue 按新 phase 等待。
+
+### 五、Causal 与 non-causal 的分工
+
+| 维度 | Non-causal | Causal |
+|---|---|---|
+| epilogue 执行者 | WG2 | WG0/WG1 |
+| row_sum 来源 | `sScale` SMEM，softmax 写完最后一块后存入 | softmax registers |
+| TMEM load 宽度 | `TMEM_EPI_LD_SIZE = 16` | `EPI_LD_SM = 32` |
+| WG2 职责 | correction + epilogue | 只做 correction |
+| 额外同步 | `row_sum` 经 `sScale` 交给 WG2 | 无最后一块 `row_sum` 往返 |
+| 典型收益 | 把 epilogue 从 softmax WG 剥离，让 WG0/WG1 继续接下一轮 softmax | 省掉一次 SMEM 往返和 WG2 的 epilogue 阶段 |
+
+Causal 路径的 WG0/WG1 代码形状：
+
+```python
+o_ready.wait(wg_id, o_epi_epoch.phase)
+corr_epi.empty.wait(wg_id, o_epi_epoch.phase)
+...
+norm_scale = rcp.approx.ftz.f32(
+    select(zero_or_nan, 1.0, row_sum[0])
+)
+...
+corr_epi.full.arrive(wg_id)
+p_o_rescale_remote.arrive(wg_id)
+o_epi_epoch.advance()
+```
+
+它和 non-causal 的数学完全相同，只是 producer 从 WG2 换成
+softmax warpgroup，`row_sum` 从 SMEM 读取换成寄存器直接使用。
+
+### 六、具体数值 trace
+
+输入：
+
+```text
+scale_log2 = 1
+rescale_threshold = 8
+row_max_old = 2
+row_sum_old = 3
+O_old = [4, 6]
+V = [[1, 0], [0, 1]]
+```
+
+#### Case 1：`delta >= -8`，保留旧 reference
+
+```text
+S = [5, 4]
+candidate_max = 5
+delta = (2 - 5) * 1 = -3
+-3 >= -8  -> keep old reference
+new_ref = 2
+acc_scale = 1
+P = 2^([5,4] - 2) = [8, 4]
+block_row_sum = 8 + 4 = 12
+block_O = P @ V = [8, 4]
+row_sum_new = 3 * 1 + 12 = 15
+O_new = [4, 6] * 1 + [8, 4] = [12, 10]
+```
+
+最终：
+
+```text
+norm_scale = rcp(15) ~= 0.06666667
+O_final = [12, 10] * norm_scale
+        ~= [0.80000007, 0.66666669]
+O_smem(fp16) = [0.7998046875, 0.66650390625]
+```
+
+#### Case 2：`delta < -8`，切换 reference
+
+```text
+S = [11, 10]
+candidate_max = 11
+delta = (2 - 11) * 1 = -9
+-9 < -8  -> switch reference
+new_ref = 11
+acc_scale = 2^-9 = 0.001953125
+P = 2^([11,10] - 11) = [1, 0.5]
+block_row_sum = 1.5
+block_O = P @ V = [1, 0.5]
+row_sum_new = 3 * 0.001953125 + 1.5 = 1.505859375
+O_new = [4, 6] * 0.001953125 + [1, 0.5]
+      = [1.0078125, 0.51171875]
+```
+
+最终：
+
+```text
+norm_scale = rcp(1.505859375) ~= 0.66407263
+O_final = [1.0078125, 0.51171875] * norm_scale
+        ~= [0.66926068, 0.33981842]
+O_smem(fp16) = [0.66943359375, 0.33984375]
+```
+
+这个 trace 的关键是：Case 2 中旧 O 和旧 row_sum 都乘了
+`acc_scale`，所以最终归一化仍然正确。如果只乘 row_sum 不乘 O，
+输出会偏大；如果只乘 O 不乘 row_sum，输出会偏小。
+
+### 七、常见错误与症状
+
+| 错误 | 原因 | 可观察症状 |
+|---|---|---|
+| 在 `o_ready` 之前读 O | 最后一次 PV 还没提交 | 读到尚未完成的 O，错误与调度时序有关 |
+| 不 wait `corr_epi.empty` 就写 `O_smem` | 上一轮 TMA store 还没读完 | TMA 读到新旧混合的 staging |
+| 忘记 `fence.proxy.async_.shared__cta` | generic proxy 写对 async proxy 不可见 | TMA store 读到旧数据 |
+| 没有 zero/NaN guard | 全 mask 行得到 `1/0` 或 `1/NaN` | 输出出现 `inf` 或 `NaN` |
+| 把 `corr_epi.full` 当 32 arrivals | 少算了 epilogue warpgroup 的线程数 | store warp 永远等不到 full |
+| 把 `corr_epi.empty` 当 128 arrivals | 少算了 store warp 的线程数 | epilogue 永远等不到 empty |
+| 只 `wait_group(0)` 就归还两个 stage | 无法区分 stage 0 和 stage 1 的完成 | 提前复用 stage 1，TMA 读半成品 |
+| 把 correction 当成最终归一化 | correction 只换参考系，不除以 row_sum | O 大了 `row_sum` 倍 |
+| Causal 路径再让 WG2 读 `row_sum` | causal 已经由 WG0/WG1 做 epilogue | 多余 SMEM 往返或等不到数据 |
+
+### 八、自测题与答案
+
+#### 1. Correction 和 epilogue 的区别是什么？
+
+答：Correction 在 reference 改变时，把旧 `row_sum` 和旧 `O` 乘以
+`acc_scale`，让它们与新 block 处在同一个参考系；epilogue 在所有
+K/V block 处理完后，用最终 `row_sum` 对 O 做逐行除法，再 cast 到
+输出类型并写入 `O_smem`。前者解决尺度一致性，后者解决最终归一化和
+写回。
+
+#### 2. `o_ready` 和 `corr_epi.empty` 分别保护什么资源？
+
+答：`o_ready` 保护 TMEM 中的 O，epilogue 必须等最后一次 PV commit
+后才能读；`corr_epi.empty` 保护 SMEM 中的 `O_smem` staging，epilogue
+必须等上一轮 TMA store 读完该 stage 后才能覆盖它。
+
+#### 3. 为什么 `norm_scale` 使用 `rcp.approx.ftz.f32`，而 zero/NaN guard 必须放在它之前？
+
+答：`rcp.approx.ftz.f32` 是硬件的近似倒数，配合逐元素乘法比完整除法
+更便宜。如果先对 0 或 NaN 做倒数，会得到 `inf` 或 NaN，随后
+`O * inf` 或 `O * NaN` 会污染输出；guard 先把输入替换为 1.0，得到
+`norm_scale = 1.0`，保持全 mask 行的 0 输出。
+
+#### 4. 为什么 `corr_epi.full` 是 128 arrivals，而 `corr_epi.empty` 是 32？
+
+答：`corr_epi.full` 表示 `O_smem` 已经写好，整个 epilogue warpgroup
+的 128 个线程都参与写和 fence，因此需要 128 arrivals；`corr_epi.empty`
+表示 TMA store 已经读完并释放 stage，只有 store warp 的 32 个线程
+发起和等待 bulk async group，因此是 32 arrivals。
+
+#### 5. Non-causal 和 causal 的 epilogue 分工有什么不同？
+
+答：Non-causal 由 WG2 做 correction 和 epilogue，最终 `row_sum` 从
+softmax 经 `sScale` 传到 WG2；causal 由 WG0/WG1 直接做 epilogue，
+`row_sum` 留在寄存器里，WG2 只做 correction。Causal 因此省掉了最后
+一次 `row_sum` 的 SMEM 往返。
+
+## 十九、下一知识点
+
+下一步进入 `8. Causal mask、GQA、tile scheduling 与验证`：解释
+non-causal kernel 如何专门化为 causal、右对齐 mask 如何映射到 block
+和 element 两层判断、GQA 如何复用 K/V、LPT tile scheduler 如何安排
+Q block，以及如何用 reference implementation 和容差验证最终结果。
