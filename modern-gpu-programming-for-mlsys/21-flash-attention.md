@@ -17,6 +17,8 @@ TMEM 三条流水线排成完整时间线。
 本节的最后补上 KV block 为什么从最后一个有效 block 反向遍历。
 现在继续补上 K/V loop 结束后的 epilogue：`row_sum` 如何归一化 TMEM
 中的 `O`，写入 `O_smem`，再交给 TMA store。
+接下来进入 causal 特化，先补上两层 causal mask：任务级 KV block
+裁剪，以及对角线 block 内的逐行列屏蔽。
 
 ## 本次讲解位置
 
@@ -48,6 +50,10 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
 [x] 6. Q / K / V pipeline 时间线
 [x] 7. Correction、最终归一化与 epilogue
 [ ] 8. Causal mask、GQA、tile scheduling 与验证
+    [x] 8.1 Causal mask：block 跳过与块内列屏蔽
+    [ ] 8.2 GQA packed Q rows 与 K/V 复用
+    [ ] 8.3 Causal LPT tile scheduling
+    [ ] 8.4 Reference 与容差验证
 ```
 
 ## 一、问题：完整 attention 为什么会产生平方级中间量
@@ -5893,9 +5899,591 @@ softmax 经 `sScale` 传到 WG2；causal 由 WG0/WG1 直接做 epilogue，
 `row_sum` 留在寄存器里，WG2 只做 correction。Causal 因此省掉了最后
 一次 `row_sum` 的 SMEM 往返。
 
-## 十九、下一知识点
+## 十九、Causal mask：block 跳过与块内列屏蔽
 
-下一步进入 `8. Causal mask、GQA、tile scheduling 与验证`：解释
-non-causal kernel 如何专门化为 causal、右对齐 mask 如何映射到 block
-和 element 两层判断、GQA 如何复用 K/V、LPT tile scheduler 如何安排
-Q block，以及如何用 reference implementation 和容差验证最终结果。
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：Causal Mask
+知识点：右对齐 causal mask 的任务级 KV block 裁剪，以及对角线 block 内的列屏蔽
+上次：Correction、最终 row_sum 归一化与 epilogue
+下次：GQA packed Q rows 与 K/V 复用
+PTX/SASS：lane predicate、predicated select，以及 R2P register-to-predicate 路径
+```
+
+### 为什么现在讲这个
+
+上一节把 attention 的输出写回补齐了，但那个数据路径仍然是 non-causal。
+Causal attention 多了一条硬约束：
+
+```text
+query position q 只能读取 key position k <= q 的位置
+```
+
+如果直接把未来位置的 score 送入 online softmax，这些 token 会进入
+`row_max`、`row_sum` 和 `O`，造成信息泄露。只在最后把输出清零是
+不够的，因为未来 token 已经污染了归一化分母。
+
+另一方面，如果每个 query row 都单独判断 128 个 columns，又会引入大量
+标量分支。FA4 因此把 causal mask 拆成两层：
+
+```text
+block 层：整块没有有效 key，直接跳过 TMA / MMA
+element 层：对角线附近的 block 同时包含有效和无效 columns，在 softmax
+            registers 中把无效 columns 改成 -inf
+```
+
+block 层主要减少无意义工作；element 层保证数值正确。
+
+### 一、心智模型：先找任务边界，再找行内边界
+
+一个 causal attention task 对应：
+
+```text
+(batch, kv_head, m_block)
+```
+
+其中 `m_block` 不是一条 query，而是一组 packed Q rows。当前 FA4 的
+`m_block` 包含两个 Q stages：
+
+```text
+SMEM_PIPE_DEPTH_Q = 2
+每个 stage 有 SEQ_Q_PER_TILE 个 sequence positions
+```
+
+所以需要先回答两个问题：
+
+```text
+任务级：
+  这个 Q group 中最靠后的 query 最多看到哪个 key block？
+
+行级：
+  在对角线 block 中，这一 query row 最多看到哪个 local column？
+```
+
+第一层决定：
+
+```text
+for n_block in 0 .. n_block_max - 1
+```
+
+第二层决定：
+
+```text
+local column c 是否要写成 -inf
+```
+
+### 二、右对齐 causal mask
+
+当 `SEQ_LEN_Q != SEQ_LEN_KV` 时，当前实现采用右对齐
+（bottom-right-aligned）规则：
+
+```text
+max_valid_key(q) = q + SEQ_LEN_KV - SEQ_LEN_Q
+```
+
+当两个序列等长时：
+
+```text
+max_valid_key(q) = q
+```
+
+这表示 query `q` 可以读取 key `0 .. q`。
+
+### 三、第一层：任务级 block 上界
+
+源码中的 `n_block_max_of(m_block_idx)` 处理一个包含
+`SEQ_Q_PER_TILE * SMEM_PIPE_DEPTH_Q` 个 query positions 的 group：
+
+```python
+def n_block_max_of(m_block_idx):
+    nbm = num_kv_blocks
+    if not is_causal:
+        return nbm
+    m_idx_max = (m_block_idx + 1) * SEQ_Q_PER_TILE * SMEM_PIPE_DEPTH_Q
+    n_idx = m_idx_max + SEQ_LEN_KV - SEQ_LEN_Q
+    return txl.min(nbm, ceildiv(n_idx, BLK_N))
+```
+
+这里 `m_idx_max` 是 group 末尾的 exclusive query boundary。`n_idx`
+是从该 boundary 推出的 exclusive key boundary。`ceildiv(..., BLK_N)`
+把它转换成需要读取的 KV block 数量。
+
+K/V loop 因此只访问：
+
+```text
+0, 1, ..., n_block_max - 1
+```
+
+更高的 blocks 完全不可能被这个 Q group 中任何 query 看到，可以直接
+不执行 TMA 和 MMA。
+
+注意这是整个 Q group 的边界，不是每一行的边界。group 末尾的 query
+可能看到对角 block，而 group 开头的 query 对该 block 完全不可见。
+Kernel 为了同时服务 group 中所有 rows，仍然会读取这个对角 block，
+再在寄存器里对较早的 rows 做列 mask。
+
+### 四、第二层：对角线 block 内的 column limit
+
+对于 KV block `n_block`，其 global key 起点是：
+
+```text
+n_start = n_block * BLK_N
+```
+
+query `q` 对应的 exclusive local column limit 为：
+
+```text
+col_limit_right
+  = q + 1 + SEQ_LEN_KV - SEQ_LEN_Q - n_start
+```
+
+于是：
+
+```text
+local column c  valid  <=>  c < col_limit_right
+```
+
+源码先根据 `wg_id` 和 `tid_in_wg` 还原 packed Q row 的 sequence
+position：
+
+```python
+seq_pos_in_wg = tid_in_wg // GQA_RATIO
+row_idx = (
+    m_blk_idx * SEQ_Q_PER_TILE * SMEM_PIPE_DEPTH_Q
+    + wg_id * SEQ_Q_PER_TILE
+    + seq_pos_in_wg
+)
+causal_row_offset = 1 + SEQ_LEN_KV - n_blk_idx * BLK_N - SEQ_LEN_Q
+col_limit_right = row_idx + causal_row_offset
+mask_r2p(s_chunk, col_limit_right, BLK_N)
+```
+
+`GQA_RATIO` 暂时设为 1 时，`tid_in_wg` 直接对应 sequence offset。
+下一节会解释为什么 packed Q rows 中每 `GQA_RATIO` 行共享一个 K/V
+head。
+
+### 五、`mask_r2p` 如何在 registers 中屏蔽整段列
+
+如果逐个 column 写条件分支，会产生大量 predicate 和比较指令。
+`mask_r2p` 按 32 columns 一组处理，先把 column limit 转成 bit mask：
+
+```python
+k_keep = max(col_limit - chunk * 32, 0)
+mask_inv = 0xFFFFFFFF << k_keep
+in_bound = (~mask_inv) & (1 << lane)
+```
+
+例如 `col_limit_right = 3`：
+
+```text
+k_keep = 3
+mask_inv = 0xFFFFFFF8
+~mask_inv = 0x00000007
+
+lane 0 -> bit 0 有效
+lane 1 -> bit 1 有效
+lane 2 -> bit 2 有效
+lane 3 -> bit 3 无效
+lane 4..31 -> 无效
+```
+
+每个 lane 得到 predicate 后，源码执行：
+
+```python
+txl.Select(in_bound, s_chunk[c], NEG_INF)
+```
+
+有效列保留原 score，无效列写成 `-inf`。随后 online softmax 再做
+row max 和 `exp2`，因此无效位置满足：
+
+```text
+score = -inf
+exp2(score - row_max) = 0
+```
+
+它们不会影响 `row_max`，也不会进入 `row_sum` 和 P。
+
+### 六、完整可运行模拟
+
+完整文件：
+`modern-gpu-programming-for-mlsys/code/flash_attention_causal_mask_sim.py`
+
+```python
+#!/usr/bin/env python3
+"""Simulate the two-layer causal mask used by the FA4 kernel."""
+
+from __future__ import annotations
+
+import math
+
+
+NEG_INF = float("-inf")
+
+
+def ceildiv(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def max_valid_key(
+    query_pos: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+) -> int:
+    """Return the largest key visible to a right-aligned query position."""
+    return query_pos + seq_len_kv - seq_len_q
+
+
+def task_n_block_max(
+    m_block: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    block_n: int,
+    seq_q_per_tile: int = 128,
+    q_stages: int = 2,
+) -> int:
+    """Mirror flash_attention4.py::n_block_max_of for GQA_RATIO=1."""
+    num_kv_blocks = ceildiv(seq_len_kv, block_n)
+    m_idx_max = (m_block + 1) * seq_q_per_tile * q_stages
+    n_idx = m_idx_max + seq_len_kv - seq_len_q
+    return min(num_kv_blocks, ceildiv(n_idx, block_n))
+
+
+def r2p_keep_column(
+    block_col: int,
+    col_limit_right: int,
+    chunk_size: int = 32,
+) -> bool:
+    """Reproduce mask_r2p's low-k-bits predicate for one column."""
+    chunk = block_col // chunk_size
+    lane = block_col % chunk_size
+    k_keep = max(col_limit_right - chunk * chunk_size, 0)
+    k_keep = min(k_keep, chunk_size)
+    mask_inv = (0xFFFFFFFF << k_keep) & 0xFFFFFFFF
+    in_bound = ((~mask_inv) & 0xFFFFFFFF) & (1 << lane)
+    return bool(in_bound)
+
+
+def apply_mask_r2p(
+    s_chunk: list[float],
+    col_limit_right: int,
+) -> list[float]:
+    """Keep columns with index < col_limit_right and mask the rest."""
+    return [
+        score if r2p_keep_column(i, col_limit_right) else NEG_INF
+        for i, score in enumerate(s_chunk)
+    ]
+
+
+def apply_causal_mask_for_row(
+    s_chunk: list[float],
+    m_block: int,
+    wg_id: int,
+    seq_pos_in_wg: int,
+    n_block: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    block_n: int,
+    seq_q_per_tile: int = 128,
+) -> tuple[list[float], int]:
+    """Mirror apply_causal_mask for GQA_RATIO=1 and q_stages=2."""
+    row_idx = (
+        m_block * seq_q_per_tile * 2
+        + wg_id * seq_q_per_tile
+        + seq_pos_in_wg
+    )
+    col_limit_right = (
+        row_idx + 1 + seq_len_kv - n_block * block_n - seq_len_q
+    )
+    return apply_mask_r2p(s_chunk, col_limit_right), col_limit_right
+
+
+def classify_block(
+    query_pos: int,
+    n_block: int,
+    block_n: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+) -> tuple[str, list[int]]:
+    key_limit = max_valid_key(query_pos, seq_len_q, seq_len_kv)
+    keys = list(range(n_block * block_n, (n_block + 1) * block_n))
+    valid = [key for key in keys if key <= key_limit]
+    if not valid:
+        return "skip", valid
+    if len(valid) == block_n:
+        return "full", valid
+    return "partial", valid
+
+
+def softmax2_after_mask(scores: list[float]) -> list[float]:
+    finite = [score for score in scores if score != NEG_INF]
+    row_max = max(finite)
+    numerators = [
+        0.0 if score == NEG_INF else math.pow(2.0, score - row_max)
+        for score in scores
+    ]
+    denominator = sum(numerators)
+    return [value / denominator for value in numerators]
+
+
+def print_small_example() -> None:
+    seq_len_q = 6
+    seq_len_kv = 8
+    block_n = 4
+
+    print("== right-aligned block view ==")
+    for query_pos in (0, 5):
+        key_limit = max_valid_key(query_pos, seq_len_q, seq_len_kv)
+        print(f"query {query_pos}: max_valid_key = {key_limit}")
+        for n_block in range(ceildiv(seq_len_kv, block_n)):
+            kind, valid = classify_block(
+                query_pos, n_block, block_n, seq_len_q, seq_len_kv
+            )
+            print(
+                f"  block {n_block} keys "
+                f"{n_block * block_n}..{(n_block + 1) * block_n - 1}: "
+                f"{kind}, valid={valid}"
+            )
+    print()
+
+
+def print_mask_example() -> None:
+    scores = [6.0, 5.0, 4.0, 3.0]
+    seq_len_q = 6
+    seq_len_kv = 8
+    block_n = 4
+    masked, col_limit = apply_causal_mask_for_row(
+        scores,
+        m_block=0,
+        wg_id=0,
+        seq_pos_in_wg=0,
+        n_block=0,
+        seq_len_q=seq_len_q,
+        seq_len_kv=seq_len_kv,
+        block_n=block_n,
+    )
+    probabilities = softmax2_after_mask(masked)
+
+    print("== register-level mask and softmax ==")
+    print(f"row_idx        = 0")
+    print(f"col_limit_right = {col_limit}")
+    print(f"S              = {scores}")
+    print(f"masked S       = {masked}")
+    print(f"P              = {probabilities}")
+    print()
+
+
+def print_task_bound_example() -> None:
+    seq_len_q = 1024
+    seq_len_kv = 1024
+    block_n = 128
+    seq_q_per_tile = 128
+    q_stages = 2
+
+    print("== FA4 task-level n_block_max ==")
+    for m_block in (0, 1, 2, 3):
+        n_block_max = task_n_block_max(
+            m_block,
+            seq_len_q,
+            seq_len_kv,
+            block_n,
+            seq_q_per_tile,
+            q_stages,
+        )
+        min_query = m_block * seq_q_per_tile * q_stages
+        max_query = min_query + seq_q_per_tile * q_stages - 1
+        print(
+            f"m_block={m_block}, query_rows={min_query}..{max_query}, "
+            f"n_block_max={n_block_max}"
+        )
+
+
+def main() -> None:
+    print_small_example()
+    print_mask_example()
+    print_task_bound_example()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python3 modern-gpu-programming-for-mlsys/code/flash_attention_causal_mask_sim.py
+```
+
+预期输出：
+
+```text
+== right-aligned block view ==
+query 0: max_valid_key = 2
+  block 0 keys 0..3: partial, valid=[0, 1, 2]
+  block 1 keys 4..7: skip, valid=[]
+query 5: max_valid_key = 7
+  block 0 keys 0..3: full, valid=[0, 1, 2, 3]
+  block 1 keys 4..7: full, valid=[4, 5, 6, 7]
+
+== register-level mask and softmax ==
+row_idx        = 0
+col_limit_right = 3
+S              = [6.0, 5.0, 4.0, 3.0]
+masked S       = [6.0, 5.0, 4.0, -inf]
+P              = [0.5714285714285714, 0.2857142857142857, 0.14285714285714285, 0.0]
+
+== FA4 task-level n_block_max ==
+m_block=0, query_rows=0..255, n_block_max=2
+m_block=1, query_rows=256..511, n_block_max=4
+m_block=2, query_rows=512..767, n_block_max=6
+m_block=3, query_rows=768..1023, n_block_max=8
+```
+
+### 七、逐项解释执行结果
+
+#### 1. 不同 query 的可见 key 上限不同
+
+输入：
+
+```text
+SEQ_LEN_Q = 6
+SEQ_LEN_KV = 8
+```
+
+右对齐后：
+
+```text
+query 0: max_valid_key = 0 + 8 - 6 = 2
+query 5: max_valid_key = 5 + 8 - 6 = 7
+```
+
+因此 query 0 只能看到 keys 0、1、2，而 query 5 能看到全部 keys。
+
+#### 2. 同一个 KV block 对不同 query 可能是不同类别
+
+设置 `BLK_N = 4` 后：
+
+| Query | Block 0，keys 0..3 | Block 1，keys 4..7 |
+|---|---|---|
+| q=0 | partial，只保留 0..2 | skip |
+| q=5 | full | full |
+
+这也是 FA4 不按单个 query 建立 block bound 的原因。一个 Q group
+同时包含很多 rows，`n_block_max` 必须覆盖 group 中最靠后的 query。
+对较小的 query rows，多出来的 diagonal block 再由 element mask 处理。
+
+#### 3. `col_limit_right = 3` 为什么保留 0、1、2
+
+因为它是 exclusive boundary：
+
+```text
+valid local columns = 0 <= c < 3
+                    = {0, 1, 2}
+```
+
+所以：
+
+```text
+S        = [6, 5, 4, 3]
+masked S = [6, 5, 4, -inf]
+```
+
+经过 `softmax2`：
+
+```text
+row_max = 6
+P = [2^0, 2^-1, 2^-2, 2^-inf] / (1 + 0.5 + 0.25)
+  = [0.5714286, 0.2857143, 0.1428571, 0]
+```
+
+#### 4. FA4 的 task bound 为什么随 `m_block` 增长
+
+当 `SEQ_LEN_Q = SEQ_LEN_KV = 1024`、`BLK_N = 128` 时，每个
+`m_block` 覆盖 256 query positions：
+
+```text
+m_block=0，query_rows=0..255，   n_block_max=2
+m_block=1，query_rows=256..511， n_block_max=4
+m_block=2，query_rows=512..767， n_block_max=6
+m_block=3，query_rows=768..1023，n_block_max=8
+```
+
+较早的 Q group 只需要很少的 KV blocks，较晚的 Q group 才需要全部
+KV blocks。这正是 causal tasks 计算量不均衡的来源，也是下一页 LPT
+scheduler 要解决的问题。
+
+### 八、为什么 KV loop 从对角 block 开始反向遍历
+
+上一节已经解释过 KV 反向遍历，现在可以用 mask 结构重新理解：
+
+```text
+n_block_max - 1:
+  对角线附近，通常包含部分被 mask 的 columns
+
+n_block_max - 2 .. 0:
+  更老的 KV blocks，通常全部有效，不需要 element mask
+```
+
+反向遍历让 kernel 先处理需要特殊 mask 的 diagonal block，再进入
+连续的全有效 block。这样 mask 逻辑只出现在少数 iterations 中，
+而不是每一轮 K/V step 都执行。
+
+但要注意因果关系：
+
+```text
+causal mask 决定哪些 columns 有效
+KV 反向遍历只是实现选择
+```
+
+不能把反向遍历当作 causal 正确性的必要条件。顺序遍历同样可以正确，
+只是会失去 FA4 为 diagonal block 和全有效 blocks 建立的快路径结构。
+
+### 九、常见错误与症状
+
+| 错误 | 原因 | 可观察症状 |
+|---|---|---|
+| 把 `col_limit_right` 当成 inclusive 上界 | 错误地保留一个未来 key | 对角线上多出一个未来 token |
+| mask 放在 `row_max` 之后 | `-inf` 没有先参与 max 计算 | 无效列仍可能污染 row max |
+| 用 0 代替 `-inf` 屏蔽 | `exp2(0 - row_max)` 可能非零 | 无效 key 进入 row_sum 和 O |
+| 只用 block bound，不做 element mask | diagonal block 中部分 columns 无效 | 边界附近输出错误，远端位置可能正常 |
+| 只做 element mask，不用 block bound | 仍加载并计算完全无效的 blocks | 结果正确但 causal 性能接近 non-causal |
+| 用最小 query 计算 task `n_block_max` | 对角 block 被提前跳过 | 晚 query 读取不到应可见的 key |
+| 用最大 query 逐行做 element mask | 过早 query 保留未来 columns | 与 block bound 配合错误时发生信息泄露 |
+
+### 十、自测题与答案
+
+#### 1. 为什么 causal mask 要分成 block 层和 element 层？
+
+答：block 层用于跳过完全没有有效 key 的 KV blocks，减少 TMA 和 MMA；
+element 层用于处理对角线附近的 block，因为同一个 block 中可能只有
+一部分 columns 对某些 rows 有效。前者是性能裁剪，后者是正确性要求。
+
+#### 2. 右对齐下，`SEQ_LEN_Q=6`、`SEQ_LEN_KV=8` 时 query 3 最多访问哪个 key？
+
+答：`3 + 8 - 6 = 5`，所以 query 3 最多访问 key 5。
+
+#### 3. 为什么 `col_limit_right=3` 保留本地 columns 0、1、2？
+
+答：它是 exclusive 上界，条件为 `c < 3`。所以有效 column 是
+`0, 1, 2`，column 3 以及更高位置都写到 `-inf`。
+
+#### 4. 为什么对角线 block 仍然要执行 QKᵀ MMA？
+
+答：这个 block 对 Q group 中较晚的 query rows 可能完全或部分有效。
+Block 级不能因为它只对较早 rows 部分有效就整体跳过。Kernel 先计算
+整块 score，再在 softmax registers 中按 row 屏蔽无效 columns。
+
+#### 5. 为什么 KV loop 从 `n_block_max - 1` 开始更自然？
+
+答：它先处理带 diagonal mask 的最近 block，再连续处理更老的全有效
+blocks。这样可以把 mask 逻辑限制在少数 iterations 中，同时符合
+prologue、steady state、tail 的流水线结构。它不是 causal 语义本身，
+而是当前 FA4 的实现选择。
+
+## 二十、下一知识点
+
+下一步进入 `8.2 GQA packed Q rows 与 K/V 复用`：解释
+`GQA_RATIO = num_qo_heads / num_kv_heads` 如何把多个 query heads
+打包进 128 条 Q rows，为什么这些 rows 可以共享同一份 K/V tile，
+以及 Q-load、causal mask 和 O-store 如何解释 `(sequence, query head)`
+坐标。
