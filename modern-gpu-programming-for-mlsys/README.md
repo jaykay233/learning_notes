@@ -34,7 +34,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、`work_id` / `init(bx)` / stride 148、M 优先与 N 优先的完整编号对照、`l2_group_size=8` 的 L2 locality、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
 | [19-gemm-warp-specialization.md](19-gemm-warp-specialization.md) | `chapter_gemm_advanced` Step 7 的 `hgemm_v7`、TMA producer / MMA consumer / writeback 三角色拆分、`tma2mma` / `mma2tma` 的 SMEM full-empty 协议、`mma2ld` / `ld2mma` 的 TMEM result-reuse 协议、named barrier、完整代码与 `PIPE_DEPTH=2` 交接 trace |
 | [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8-9 的 `hgemm_v8` / `hgemm_v9`、Two-CTA cooperative MMA、`cta_mask=3`、跨 CTA TMEM 复用、Multi-Consumer Warp Specialization、共享 staged B、`512 x 256` cluster tile、按 consumer 索引的 TMEM / barriers、`98304`-byte K-stage TMA transaction，以及完整 GPU 与静态验证代码 |
-| [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、`row_max` / `row_sum` / `O` online softmax 三状态、逐轮 rescale 公式、完整 CPU 数值验证代码，以及与 FA4 conditional rescaling 的衔接 |
+| [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、`row_max` / `row_sum` / `O` online softmax 三状态、FA4 conditional rescaling 的 `delta` / 阈值 8 / `acc_scale`、WG2 两级重缩放筛选、完整 CPU 数值验证代码 |
 
 ## 当前进度
 
@@ -339,6 +339,18 @@ O 是已处理 positions 的指数加权 V
 row_sum 与 O 必须使用同一个 alpha 缩放到新尺度
 最终输出 O / row_sum
 完整 CPU 示例与标准 attention 的 max error 为 6.661338147750939e-16
+chapter_flash_attention 第 2 个知识点完成：Conditional rescaling、delta 与 acc_scale
+candidate_max = max(row_max, rowmax(S))
+delta = (row_max_old - candidate_max) * scale_log2，且 delta <= 0
+delta >= -8 时保留旧参考值，acc_scale = 1
+delta < -8 时切换到 candidate_max，acc_scale = exp2(delta)
+阈值 8 表示新旧 base-2 尺度最多相差 2^8 = 256 倍
+row_sum 在 softmax registers 中使用同一个 acc_scale 更新
+O 在 TMEM 中由 WG2 按需读入 registers，乘 acc_scale 后写回
+WG2 先按 row 生成 should_rescale，再用 any_sync 汇总每个 warp 的 32 行
+如果整个 warp 的 32 行都 acc_scale = 1，则跳过 TMEM -> registers -> TMEM 数据操作
+即使跳过数据操作，也必须完成 p_o_rescale 与 softmax_corr.empty 的 barrier arrivals
+完整 CPU 示例验证 delta = -3 走 keep 快路径，delta = -9 走 switch 慢路径
 ```
 
 ## 下一知识点
@@ -359,7 +371,7 @@ chapter_tirx_layout_api 完成
 -> chapter_gemm_advanced 第 8 步第 5 个知识点完成：跨 CTA TMEM 复用
 -> chapter_gemm_advanced 第 9 步完成：Multi-Consumer Warp Specialization
 -> chapter_flash_attention 第 1 个知识点完成：Tile 分解与 online softmax 三状态
--> chapter_flash_attention 第 2 个知识点：Conditional rescaling、delta 与 acc_scale
+-> chapter_flash_attention 第 3 个知识点：S / P / O 的 TMEM layout 与分时复用
 ```
 
 ## 核心主线

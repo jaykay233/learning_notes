@@ -1,4 +1,4 @@
-# Flash Attention：Tile 分解与 Online Softmax 三状态
+# Flash Attention：Tile 分解、Online Softmax 与 Conditional Rescaling
 
 这篇笔记开始 `chapter_flash_attention`。上一章已经把 TMA、软件流水线、
 persistent scheduling、warp specialization 和 two-CTA cooperative MMA
@@ -8,8 +8,10 @@ persistent scheduling、warp specialization 和 two-CTA cooperative MMA
 QK^T MMA -> softmax -> PV MMA
 ```
 
-本节先讲最基础、也是后面所有 FA4 优化共同依赖的一个知识点：
-不保存完整 score matrix，如何按 K/V block 计算等价的 attention 输出。
+前两部分先讲最基础、也是后面所有 FA4 优化共同依赖的两个知识点：
+不保存完整 score matrix，如何按 K/V block 计算等价的 attention 输出；
+以及 FA4 如何用 `delta`、阈值 8 和 `acc_scale` 减少 TMEM 中 `O` 的
+重缩放次数。
 
 ## 本次讲解位置
 
@@ -28,7 +30,7 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
 
 ```text
 [x] 1. Tile 分解与 online softmax 三状态
-[ ] 2. FA4 conditional rescaling、delta 与 acc_scale
+[x] 2. FA4 conditional rescaling、delta 与 acc_scale
 [ ] 3. S / P / O 的 TMEM layout 与分时复用
 [ ] 4. QK^T MMA、softmax、PV MMA 的数据路径
 [ ] 5. Warp 角色、register 分配与 barrier 分工
@@ -666,15 +668,597 @@ alpha = exp(old_row_max - new_row_max)
 通常只应满足很小的数值误差。本文例子得到的 max error 是
 `6.661338147750939e-16`。
 
-## 下一知识点
+## 十、FA4 conditional rescaling：delta、阈值 8 与 acc_scale
 
-下一步进入 FA4 的 conditional rescaling：
+### 本次讲解位置
 
 ```text
-delta = (row_max_old - candidate_max) * scale_log2
-delta >= -8：保留旧参考值，acc_scale = 1
-delta < -8：切换到 candidate_max，acc_scale = exp2(delta)
+本次讲解位置
+章节：chapter_flash_attention
+小节：算法结构 / 重缩放与结果写回
+知识点：Conditional rescaling、delta、阈值 8、acc_scale 与两级重缩放筛选
+上次：Tile 分解与 online softmax 的 row_max / row_sum / O 三状态
+下次：S / P / O 的 TMEM layout 与分时复用
+PTX：tcgen05.ld / tcgen05.st 读取和写回 O；
+     statistics named barrier 传递逐行 acc_scale
 ```
 
-重点解释阈值为什么取 8、旧 `O` 是否需要在 TMEM 与 registers 之间
-往返，以及 WG2 如何只重缩放真正需要 correction 的行。
+### 一、这一节解决的问题
+
+基础 online softmax 每读一个 K/V block，都会做：
+
+```text
+candidate_max = max(row_max, rowmax(S))
+new_ref = candidate_max
+alpha = exp(row_max - new_ref)
+row_sum = row_sum * alpha + sum(P)
+O = O * alpha + P @ V
+```
+
+这种做法总是把参考值推进到当前真实最大值，因此只要出现更大的
+score，就必须重缩放已经累计的 `O`。在 FlashAttention 的 GPU kernel
+中，`O` 位于 TMEM，重缩放不是一次简单的寄存器乘法，而是：
+
+```text
+O in TMEM
+    -> tcgen05.ld
+O in registers
+    -> multiply by acc_scale
+O in registers
+    -> tcgen05.st
+O in TMEM
+```
+
+如果每个 K/V block 都触发这条路径，会增加 TMEM load、register
+压力、乘法、TMEM store 和同步开销。
+
+FA4 的关键观察是：
+
+> 指数参考值不必每一轮都等于真实最大值。只要 `row_sum` 和 `O` 使用
+> 同一个参考值，最终 `O / row_sum` 的比值就正确。
+
+因此可以先保留旧参考值。只有候选最大值比旧参考值高出太多时，才
+切换到候选值并执行 correction。
+
+这不是近似答案。不同参考值会让 `P`、`row_sum` 和 `O` 同时乘上一个
+公共尺度，最终归一化时这个尺度会被约掉。真正会引入误差的是指数近似
+和浮点舍入，不是选择哪一个公共参考值。
+
+### 二、数学定义
+
+代码使用 base-2 指数：
+
+```text
+scale_log2 = log2(e) / sqrt(d)
+
+exp((s - r) / sqrt(d))
+= 2 ** ((s - r) * scale_log2)
+```
+
+定义：
+
+```text
+r_old        = 当前已经使用的指数参考值
+candidate    = max(r_old, rowmax(S))
+delta        = (r_old - candidate) * scale_log2
+```
+
+因为：
+
+```text
+candidate >= r_old
+```
+
+所以：
+
+```text
+delta <= 0
+```
+
+`-delta` 表示候选参考值比旧参考值高出了多少个 base-2 exponent units。
+
+FA4 使用：
+
+```text
+rescale_threshold = 8
+```
+
+判断规则是：
+
+```text
+delta >= -8：保留旧参考值，acc_scale = 1
+delta <  -8：切换到 candidate，acc_scale = exp2(delta)
+```
+
+### 三、为什么阈值是 8
+
+如果继续使用旧参考值，当前 block 中最大的 `P` 元素最多可能是：
+
+```text
+max(P)
+= 2 ** ((candidate - r_old) * scale_log2)
+= 2 ** (-delta)
+```
+
+当 `-delta = 8` 时：
+
+```text
+max(P) = 2 ** 8 = 256
+```
+
+也就是说，允许新 block 相对于旧参考值最多放大 256 倍。
+
+如果切换到候选参考值，旧状态需要乘：
+
+```text
+acc_scale = 2 ** delta = 2 ** -8 = 1 / 256
+```
+
+所以阈值 8 的两边是同一个尺度的两种表达：
+
+```text
+继续使用旧参考值：
+    新 block 的 P 最大可以到旧尺度的 256 倍
+
+切换到新参考值：
+    旧 row_sum 和旧 O 要缩小到新尺度的 1/256
+```
+
+阈值取 8 是在两个成本之间折中：
+
+```text
+阈值越大：
+    越少触发 O correction
+    但 P 的指数范围越大，精度和溢出风险越大
+
+阈值越小：
+    P 的范围更受控
+    但更频繁地执行 TMEM -> registers -> TMEM
+```
+
+### 四、三个分支
+
+| 情况 | `new_ref` | `acc_scale` | 当前 block 的 `P` | 旧 `O` 的处理 |
+|---|---|---:|---|---|
+| 第一个 K/V block | `candidate_max` | `1` | `2 ** ((S - candidate) * scale_log2)` | 没有旧 `O`，直接初始化 |
+| `delta >= -8` | 保留 `r_old` | `1` | `2 ** ((S - r_old) * scale_log2)` | 直接累加，不读回 `O` |
+| `delta < -8` | `candidate_max` | `2 ** delta` | `2 ** ((S - candidate) * scale_log2)` | 先缩放旧 `O`，再累加 |
+
+统一状态更新可以写成：
+
+```text
+row_max_safe = 0 if new_ref == -inf else new_ref
+P = exp2((S - row_max_safe) * scale_log2)
+
+row_sum = row_sum * acc_scale + sum(P)
+O = O * acc_scale + P @ V_block
+```
+
+第一块需要单独处理，因为此时没有旧状态。后续两个分支都能套用同一个
+状态更新公式，只是 `acc_scale` 是 `1` 或一个更小的正数。
+
+还要处理全 mask 行的边界情况。如果旧参考值和当前 block 最大值都是
+`-inf`，直接计算 `S - new_ref` 会得到 `-inf - (-inf)`。当前实现使用
+`row_max_safe = 0`，让全部被 mask 的 scores 产生零权重。
+
+### 五、完整可运行示例
+
+下面的程序逐行模拟一个 query row 的 conditional rescaling。它不是 GPU
+kernel，而是用于验证阈值分支、指数尺度和 `O` 更新公式。
+
+文件名：`flash_attention_conditional_rescale_demo.py`
+
+```python
+import math
+
+import numpy as np
+
+
+def conditional_rescale_step(
+    row_ref,
+    row_sum,
+    O,
+    S,
+    V,
+    scale_log2=1.0,
+    rescale_threshold=8.0,
+    is_first=False,
+):
+    candidate_max = max(row_ref, float(np.max(S)))
+
+    if is_first:
+        new_ref = candidate_max
+        acc_scale = 1.0
+        decision = "first_block"
+    else:
+        delta = (row_ref - candidate_max) * scale_log2
+        if delta >= -rescale_threshold:
+            new_ref = row_ref
+            acc_scale = 1.0
+            decision = "keep_old_reference"
+        else:
+            new_ref = candidate_max
+            acc_scale = 2.0 ** delta
+            decision = "switch_to_candidate_max"
+
+    safe_ref = 0.0 if new_ref == -math.inf else new_ref
+    P = np.exp2((S - safe_ref) * scale_log2)
+    block_O = P @ V
+    new_row_sum = row_sum * acc_scale + float(np.sum(P))
+    new_O = block_O if is_first else O * acc_scale + block_O
+
+    return {
+        "candidate_max": candidate_max,
+        "delta": None if is_first else (row_ref - candidate_max) * scale_log2,
+        "decision": decision,
+        "new_ref": new_ref,
+        "acc_scale": acc_scale,
+        "P": P.tolist(),
+        "block_O": block_O.tolist(),
+        "row_sum": new_row_sum,
+        "O": new_O.tolist(),
+    }
+
+
+def print_step(label, result):
+    print(label)
+    for key in (
+        "candidate_max",
+        "delta",
+        "decision",
+        "new_ref",
+        "acc_scale",
+        "P",
+        "block_O",
+        "row_sum",
+        "O",
+    ):
+        print(f"{key}: {result[key]}")
+    print()
+
+
+def main():
+    V = np.array([[1.0, 0.0], [0.0, 1.0]])
+
+    keep = conditional_rescale_step(
+        row_ref=2.0,
+        row_sum=3.0,
+        O=np.array([4.0, 6.0]),
+        S=np.array([5.0, 4.0]),
+        V=V,
+    )
+    print_step("case 1: delta >= -8, keep old reference", keep)
+
+    switch = conditional_rescale_step(
+        row_ref=2.0,
+        row_sum=3.0,
+        O=np.array([4.0, 6.0]),
+        S=np.array([11.0, 10.0]),
+        V=V,
+    )
+    print_step("case 2: delta < -8, switch reference", switch)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python flash_attention_conditional_rescale_demo.py
+```
+
+预期输出：
+
+```text
+case 1: delta >= -8, keep old reference
+candidate_max: 5.0
+delta: -3.0
+decision: keep_old_reference
+new_ref: 2.0
+acc_scale: 1.0
+P: [8.0, 4.0]
+block_O: [8.0, 4.0]
+row_sum: 15.0
+O: [12.0, 10.0]
+
+case 2: delta < -8, switch reference
+candidate_max: 11.0
+delta: -9.0
+decision: switch_to_candidate_max
+new_ref: 11.0
+acc_scale: 0.001953125
+P: [1.0, 0.5]
+block_O: [1.0, 0.5]
+row_sum: 1.505859375
+O: [1.0078125, 0.51171875]
+```
+
+### 六、逐项数值推导
+
+初始状态：
+
+```text
+row_ref = 2
+row_sum = 3
+O = [4, 6]
+V = [[1, 0],
+     [0, 1]]
+scale_log2 = 1
+rescale_threshold = 8
+```
+
+#### Case 1：`S = [5, 4]`
+
+候选最大值：
+
+```text
+candidate = max(2, max(5, 4)) = 5
+```
+
+有符号差距：
+
+```text
+delta = (2 - 5) * 1 = -3
+```
+
+因为：
+
+```text
+-3 >= -8
+```
+
+所以保留旧参考值：
+
+```text
+new_ref = 2
+acc_scale = 1
+```
+
+当前 block 继续相对于旧参考值计算：
+
+```text
+P = [2 ** (5 - 2), 2 ** (4 - 2)]
+  = [8, 4]
+```
+
+这里 `P` 可以大于 1，这并不错误。它只是因为当前 block 暂时使用了
+一个比真实最大值更小的参考值。最终 `O / row_sum` 会把公共尺度消掉。
+
+当前 block 对 output 的贡献：
+
+```text
+block_O = P @ V
+        = [8, 4]
+```
+
+更新分母：
+
+```text
+row_sum = 3 * 1 + (8 + 4)
+        = 15
+```
+
+更新 output：
+
+```text
+O = [4, 6] * 1 + [8, 4]
+  = [12, 10]
+```
+
+这条路径没有读取或写回 TMEM 中的旧 `O`，只执行普通累加。
+
+#### Case 2：`S = [11, 10]`
+
+候选最大值：
+
+```text
+candidate = max(2, 11) = 11
+```
+
+有符号差距：
+
+```text
+delta = (2 - 11) * 1 = -9
+```
+
+因为：
+
+```text
+-9 < -8
+```
+
+所以切换到候选参考值，并计算旧状态的转换系数：
+
+```text
+new_ref = 11
+acc_scale = 2 ** -9
+          = 1 / 512
+          = 0.001953125
+```
+
+当前 block 的权重改为相对于 `11` 计算：
+
+```text
+P = [2 ** (11 - 11), 2 ** (10 - 11)]
+  = [1, 0.5]
+```
+
+当前 block 的贡献：
+
+```text
+block_O = [1, 0.5]
+```
+
+旧分母先换到新尺度：
+
+```text
+old row_sum * acc_scale
+= 3 / 512
+= 0.005859375
+```
+
+再加入当前 block：
+
+```text
+row_sum = 0.005859375 + 1.5
+        = 1.505859375
+```
+
+旧 output 也使用完全相同的 `acc_scale`：
+
+```text
+old O * acc_scale
+= [4, 6] / 512
+= [0.0078125, 0.01171875]
+```
+
+加入当前 block：
+
+```text
+O = [0.0078125, 0.01171875] + [1, 0.5]
+  = [1.0078125, 0.51171875]
+```
+
+`row_sum` 和 `O` 都换到了 `new_ref = 11` 的尺度，因此后续 block
+可以继续累加；最后的 `O / row_sum` 仍然是正确的 attention 输出。
+
+### 七、真实 kernel 的两级筛选
+
+Softmax 的 `row_sum` 位于 WG0/WG1 的 registers 中，直接在更新时乘
+`acc_scale`。`O` 位于 TMEM 中，由 WG2 负责 correction。
+
+Softmax 将逐行 `acc_scale` 写入 `sScale`：
+
+```text
+softmax WG0/WG1
+    row_sum *= acc_scale
+    sScale[row] = acc_scale
+    statistics named barrier arrive
+
+WG2
+    wait statistics named barrier
+    read acc_scale
+    rescale O when needed
+    p_o_rescale.arrive
+    softmax_corr.empty.arrive
+```
+
+第一级筛选是逐行阈值判断：
+
+```python
+should_rescale = T.Select(acc_scale < T.float32(1.0), 1, 0)
+```
+
+只要 `acc_scale < 1`，说明这一行确实切换了参考值，需要 correction。
+
+第二级筛选发生在 WG2 的一个 warp 内。WG2 有 128 个 threads，每个 warp
+负责 32 行。由于 TMEM load/store 是 warp-collective 操作，不能只让
+32 行中任意几个 lane 单独执行：
+
+```python
+any_needs_rescale = T.ptx.any_sync(0xFFFFFFFF, should_rescale)
+
+if any_needs_rescale != 0:
+    # 当前 warp 的 32 行统一走 TMEM -> registers -> TMEM
+    # 其中 acc_scale == 1 的行只是乘 1
+```
+
+这两级筛选的效果是：
+
+```text
+某个 warp 的 32 行全部 acc_scale = 1
+    -> 完全跳过 O 的 TMEM load / multiply / store
+
+某个 warp 只要有一行 acc_scale < 1
+    -> 该 warp 的 32 行统一执行数据路径
+      不需要变化的行乘以 1
+```
+
+即使跳过数据操作，barrier arrivals 也不能跳过。因为 WG2 还要完成：
+
+```text
+p_o_rescale.arrive(i_q)
+```
+
+这允许 PV MMA 继续使用初始化或重缩放后的 `O`。
+
+以及：
+
+```text
+softmax_corr.empty.arrive(1 - i_q)
+```
+
+这允许 softmax 重新写入对应的 `sScale` slot。
+
+因此最准确的 mental model 是：
+
+```text
+conditional rescaling
+= 先决定是否需要换尺度
++ 再决定当前 warp 是否真的搬运 O
++ 无论是否搬运，都继续推进生产者和消费者之间的 barrier 协议
+```
+
+### 八、常见错误与可观察症状
+
+| 错误 | 破坏的约束 | 可观察症状 |
+|---|---|---|
+| 把 `delta` 当自然指数尺度 | 阈值 8 的含义改变 | 重缩放次数和指数范围与设计不符 |
+| 认为保留旧参考值是近似计算 | 公共参考尺度可以在最终除法中约掉 | 误以为只有更新真实最大值才正确 |
+| 切换参考值但只缩放 `row_sum` | softmax 分子与分母尺度不一致 | 行输出整体缩放错误 |
+| 当前 block 的 `P` 仍使用旧参考值 | `P` 与已经 rescale 的旧状态不在同一尺度 | 新 block 贡献比例错误 |
+| 阈值判断后跳过 barrier arrival | pipeline 的下一个等待者永远得不到信号 | kernel 卡住或超时 |
+| `any_sync` 为 0 时跳过整个 WG2 | 其他 warp 的等待协议也无法完成 | 后续 MMA 或 softmax 停滞 |
+| warp 内只让需要 rescale 的 lane 执行 | TMEM load/store 是 warp-collective | 编译失败、结果不完整或行为未定义 |
+
+### 九、自测题与答案
+
+#### 1. 保留旧参考值时，为什么 `P` 可以大于 1？
+
+答：参考值只是所有指数共同减去的偏移量。只要旧的 `row_sum`、旧的
+`O` 和当前 block 的 `P` 都使用同一个旧参考值，最终 `O / row_sum`
+仍然正确。`P` 大于 1 只是说明当前 block 的最大 score 高于这个暂时
+保留的参考值。
+
+#### 2. 阈值 8 对应的最大尺度差是多少？
+
+答：
+
+```text
+2 ** 8 = 256
+```
+
+也就是最多允许新 block 相对于旧参考值放大 256 倍。
+
+#### 3. `acc_scale` 为什么必须同时作用于 `row_sum` 和 `O`？
+
+答：它们分别是 softmax 的未归一化分母和分子。只缩放其中一个会改变
+两者比例，最终 `O / row_sum` 就不再对应同一个 softmax 分布。
+
+#### 4. 如果某个 warp 的 32 行都不需要 correction，WG2 可以完全不做事吗？
+
+答：不可以。它可以跳过 TMEM load、multiply 和 store，但必须继续执行
+`p_o_rescale.arrive` 与 `softmax_corr.empty.arrive`，否则 PV MMA
+无法继续，softmax 也无法复用 `sScale` slot。
+
+#### 5. 为什么 WG2 不是只让真正需要重缩放的那些 lane 执行？
+
+答：`O` 的 correction 使用 `tcgen05.ld` 和 `tcgen05.st`，它们都是
+warp-collective tile operations。只要当前 warp 有一行需要重缩放，该
+warp 的 32 行就统一执行；`acc_scale = 1` 的行只是乘 1。
+
+## 十一、下一知识点
+
+下一步进入 `S / P / O` 的 TMEM layout 与分时复用：
+
+```text
+S、P、O 分别使用哪些 TMEM rows / columns
+fp32 accumulator 与 fp16 MMA operand 如何共享同一块物理 TMEM
+两个 Q stages 如何轮流复用 S、P、O regions
+哪些 region 会重叠，哪些 barrier 防止过早读取或覆盖
+```
+
+这会连接前面的 online softmax 数学更新和后面 QKᵀ / PV MMA、epilogue
+的具体数据路径。
