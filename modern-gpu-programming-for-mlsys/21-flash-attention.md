@@ -33,6 +33,9 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
 [x] 2. FA4 conditional rescaling、delta 与 acc_scale
 [x] 3. S / P / O 的 TMEM layout 与分时复用
 [ ] 4. QK^T MMA、softmax、PV MMA 的数据路径
+    [x] 4.1 QK^T MMA：SMEM 中的 Q/K -> TMEM 中的 S
+    [ ] 4.2 Softmax：S TMEM -> registers -> P TMEM
+    [ ] 4.3 PV MMA：P TMEM + V SMEM -> O TMEM
 [ ] 5. Warp 角色、register 分配与 barrier 分工
 [ ] 6. Q / K / V pipeline 时间线
 [ ] 7. Correction、最终归一化与 epilogue
@@ -1696,17 +1699,382 @@ softmax loads 或 MMA reads 已经完成。必须结合 `s_ready`、
 `tcgen05.wait::st()`、`p_o_rescale`、`p_ready_2` 以及 `tcgen05`
 的 issuing 依赖共同判断。
 
-## 十二、下一知识点
+## 十二、QKᵀ MMA 数据路径
 
-下一步进入 QKᵀ MMA、softmax、PV MMA 的完整数据路径：
+### 本次讲解位置
 
 ```text
-Q/K/V 从 GMEM 或 SMEM 进入两次 MMA
-S 的 TMEM -> registers 读取
-P 的 registers -> TMEM 写回
-O 的 TMEM 累加、correction 与最终 epilogue
-每一步的 scope、layout、dispatch 和 barrier 交接
+本次讲解位置
+章节：chapter_flash_attention
+小节：QKᵀ MMA 与 PV MMA / QKᵀ MMA
+知识点：SMEM 中的 Q、K 如何经过 tcgen05.mma 生成 TMEM 中的 S
+上次：S / P / O 的 TMEM layout 与分时复用
+下次：TMEM 中的 S 如何读入 registers 并计算 P
+PTX：tcgen05.mma、tcgen05.commit、tcgen05.wait
 ```
 
-这会继续连接本课的 TMEM 地址映射与下一课的线程角色、barrier 和
-pipeline 时间线。
+### 为什么现在讲这个
+
+上一节已经知道 `S0` 位于 physical columns `[0, 128)`、`S1` 位于
+`[128, 256)`，但地址正确并不代表数据会正确到达。QKᵀ MMA 是第一个真正向
+这些 `S` region 写入数据的 producer，它同时涉及 SMEM 输入、TMEM 输出和
+异步完成通知。
+
+如果只知道 `Tx.warp.gemm_async` 的名字，很容易误以为函数返回时 `S` 已经
+可用，直接在下一行读取；也可能误以为 `K` 需要先复制一份转置矩阵，或者
+把 `s_ready.arrive` 理解成普通线程写完数据后的软件到达。这些误解都会导致
+错误结果、偶发数据竞争或 barrier 死锁。本节把“谁发起、硬件读哪里、写到
+哪里、何时通知消费者”连接成一条完整的数据路径。
+
+### 一、心智模型
+
+固定一个 Q stage 和一个 K block，QKᵀ MMA 完成的是：
+
+```text
+Q_block [128, HEAD_DIM] @ K_block^T [HEAD_DIM, 128]
+    -> S [128, 128]
+```
+
+矩阵元素之间的关系是：
+
+```text
+S[row, col] = sum_d Q[row, d] * K[col, d]
+```
+
+这里：
+
+| 名称 | 含义 |
+|---|---|
+| `row` | Q tile 中的 query 行 |
+| `col` | 当前 K tile 中的 key 行，也是 S 的列 |
+| `d` | head dimension |
+| `q_stage` | 当前 Q pipeline slot，取值 0 或 1 |
+| `kv_stage` | 当前 K/V pipeline slot |
+| `S_region[q_stage]` | 当前 MMA 的 TMEM 输出区域 |
+
+Q 和 K 都保存在 SMEM。矩阵计算由 Blackwell Tensor Core 执行，结果直接写入
+TMEM。普通 threads 不负责逐元素执行这个矩阵乘法，也不把 S 从 Tensor Core
+逐项搬运到 TMEM。
+
+### 二、课程中的真实调用
+
+课程代码对这一过程的表达是：
+
+```python
+Tx.warp.gemm_async(
+    S_region[q_stage, :, :],
+    Q_smem[q_stage, 0:BLK_M, 0:HEAD_DIM],
+    K_smem[kv_stage, 0:BLK_N, 0:HEAD_DIM],
+    dispatch="tcgen05",
+    cta_group=CTA_GROUP,
+)
+if T.ptx.elect_sync():
+    s_ready.arrive(q_stage)
+```
+
+这里的参数含义是：
+
+| 参数 | 作用 | 所在位置 |
+|---|---|---|
+| `S_region[q_stage]` | MMA 的目的地 | TMEM |
+| `Q_smem[q_stage]` | A operand | SMEM |
+| `K_smem[kv_stage]` | B operand | SMEM |
+| `dispatch="tcgen05"` | 选择 Blackwell MMA 路径 | hardware dispatch |
+| `cta_group=CTA_GROUP` | 选择单 CTA 或 CTA-pair 范围 | MMA scope |
+
+`K_smem` 仍然按 `[BLK_N, HEAD_DIM]` 保存，并不需要软件预先生成一份转置
+矩阵。`gemm_async` 知道这是 `Q @ K^T`，SMEM descriptor 会告诉 Tensor Core
+怎样遍历 K tile。多复制一次转置矩阵只会浪费 SMEM 和搬运带宽。
+
+Q、K 能安全作为 operand 读取，还必须先满足：
+
+```text
+q_load.full 确认 Q_smem[q_stage] 已由 TMA 写入
+kv_load.full 确认 K_smem[kv_stage] 已由 TMA 写入
+```
+
+这两个条件由 MMA issuing warp 在发起 MMA 前等待。源码顺序本身不能证明
+TMA 已经完成。
+
+### 三、Scope、layout 与 dispatch
+
+这个 tile operation 的执行边界如下：
+
+```text
+Scope：WG3 warp 0 中的 elected lane 发起
+输入： SMEM 中的 Q tile 和 K tile
+输出： TMEM 中的 S tile
+Dispatch：tcgen05.mma
+交接：s_ready -> softmax warpgroup
+```
+
+`Tx.warp.gemm_async` 是 tile primitive，不等价于 32 个 lanes 各自计算一部分
+标量乘法。底层 `tcgen05.mma` 具有 single-thread issue 语义：一个 elected
+lane 发出矩阵级操作，Tensor Core 随后异步执行。
+
+`S_region[q_stage, :, :]` 的逻辑 shape 是 `[128, 128]`。它不申请新的
+TMEM，而是上一节已经建立的 fp32 view：
+
+```text
+q_stage = 0 -> S0 使用 physical columns [0, 128)
+q_stage = 1 -> S1 使用 physical columns [128, 256)
+```
+
+QKᵀ MMA 每次为当前 K/V block **重新产生** S，不累加到上一轮的 S。PV MMA
+才会把结果累加到长期存在的 `O` accumulator。
+
+### 四、`s_ready.arrive` 不是普通软件到达
+
+`s_ready` 是跟踪 Tensor Core 完成事件的 `TCGen05Bar`。这里的
+`s_ready.arrive(q_stage)` 应理解为发出 `tcgen05.commit`：
+
+```text
+1. elected lane 发起 QKᵀ MMA
+2. elected lane 执行 commit
+3. Tensor Core 继续异步写 S
+4. S 写完后，硬件向 s_ready[q_stage] 报告完成
+5. softmax warpgroup 等待到对应 phase 后读取 S
+```
+
+因此下面两条时间线并不相同：
+
+```text
+gemm_async 返回
+    != S 已经写完
+
+线程执行到 s_ready.arrive
+    != 线程已经写完 S
+```
+
+前者只表示 MMA 已提交给硬件；后者只表示 issuing lane 已登记完成通知。
+只有 `s_ready` 的硬件 phase 发生翻转，才表示 QKᵀ MMA 的结果可以安全读取。
+如果所有 lanes 都执行 `s_ready.arrive`，barrier 的 expected arrival count
+也会错误。
+
+### 五、完整可运行数据路径模拟
+
+下面的脚本不依赖 CUDA，用纯 Python 计算一个小型 `QK^T`，并复现课程中的
+stage-to-column 映射和完成通知顺序。文件名：
+`flash_attention_qk_mma_trace.py`
+
+```python
+from __future__ import annotations
+
+
+MMA_N = 128
+
+
+def qk_mma(
+    q: list[list[int]],
+    k: list[list[int]],
+) -> list[list[int]]:
+    rows_q = len(q)
+    rows_k = len(k)
+    head_dim_q = len(q[0])
+    head_dim_k = len(k[0])
+
+    if head_dim_q != head_dim_k:
+        raise ValueError("Q and K must have the same head dimension")
+    if rows_q > MMA_N or rows_k > MMA_N:
+        raise ValueError("demo tile exceeds the real MMA_N")
+
+    result = [[0] * rows_k for _ in range(rows_q)]
+    for row in range(rows_q):
+        for col in range(rows_k):
+            result[row][col] = sum(
+                q[row][d] * k[col][d]
+                for d in range(head_dim_q)
+            )
+    return result
+
+
+def s_region_column(q_stage: int, n: int) -> int:
+    if q_stage not in (0, 1):
+        raise ValueError("q_stage must be 0 or 1")
+    if not 0 <= n < MMA_N:
+        raise ValueError("S column must be in [0, 128)")
+    return q_stage * MMA_N + n
+
+
+class ReadyBarrierTrace:
+    def __init__(self) -> None:
+        self.phase = 0
+        self.committed = False
+        self.completed = False
+
+    def issue_and_commit(self) -> None:
+        self.committed = True
+        self.completed = False
+        print("WG3 elected lane: issue tcgen05.mma")
+        print("WG3 elected lane: tcgen05.commit -> s_ready")
+        print("consumer: wait(phase=0) would spin")
+
+    def tensor_core_complete(self) -> None:
+        if not self.committed:
+            raise RuntimeError("complete before commit")
+        self.completed = True
+        self.phase ^= 1
+        print("Tensor Core: S write complete; s_ready phase -> 1")
+
+    def wait(self, expected_phase: int) -> None:
+        if self.phase == expected_phase:
+            raise RuntimeError("barrier phase has not advanced")
+        print("WG0/WG1: s_ready wait returned; S may be read")
+
+
+Q = [
+    [1, 2, 0],
+    [0, 1, 2],
+]
+K = [
+    [1, 0, 1],
+    [0, 1, 1],
+    [2, 1, 0],
+]
+
+S = qk_mma(Q, K)
+
+print("S = Q @ K^T")
+for row, values in enumerate(S):
+    print(f"S row {row}: {values}")
+
+print("\nS[0, 2] calculation")
+print("= Q[0,0]*K[2,0] + Q[0,1]*K[2,1] + Q[0,2]*K[2,2]")
+print(f"= {Q[0][0]}*{K[2][0]} + {Q[0][1]}*{K[2][1]} + {Q[0][2]}*{K[2][2]}")
+print(f"= {S[0][2]}")
+
+print("\nstage 0 column mapping")
+print(f"S0[0, 2] -> physical column {s_region_column(0, 2)}")
+
+print("\nstage 1 column mapping")
+print(f"S1[1, 2] -> physical column {s_region_column(1, 2)}")
+
+print("\nbarrier trace")
+ready = ReadyBarrierTrace()
+ready.issue_and_commit()
+ready.tensor_core_complete()
+ready.wait(expected_phase=0)
+```
+
+运行：
+
+```bash
+python3 flash_attention_qk_mma_trace.py
+```
+
+预期输出：
+
+```text
+S = Q @ K^T
+S row 0: [1, 2, 4]
+S row 1: [2, 3, 1]
+
+S[0, 2] calculation
+= Q[0,0]*K[2,0] + Q[0,1]*K[2,1] + Q[0,2]*K[2,2]
+= 1*2 + 2*1 + 0*0
+= 4
+
+stage 0 column mapping
+S0[0, 2] -> physical column 2
+
+stage 1 column mapping
+S1[1, 2] -> physical column 130
+
+barrier trace
+WG3 elected lane: issue tcgen05.mma
+WG3 elected lane: tcgen05.commit -> s_ready
+consumer: wait(phase=0) would spin
+Tensor Core: S write complete; s_ready phase -> 1
+WG0/WG1: s_ready wait returned; S may be read
+```
+
+这个脚本验证的是矩阵公式、TMEM 列映射和完成顺序。它不执行真实
+`tcgen05.mma`；真实 kernel 需要 Blackwell 硬件、TIRx 和完整的
+`flash_attention4.py`。
+
+### 六、完整数据路径
+
+把上面的部分连起来，一次 QKᵀ MMA 的完整顺序是：
+
+```text
+TMA: Q tile -> Q_smem[q_stage]
+TMA: K tile -> K_smem[kv_stage]
+        |
+        v
+q_load.full / kv_load.full 分别确认 Q、K 已到达
+        |
+        v
+WG3 warp 0 的 elected lane 发起 Tx.warp.gemm_async
+输入: Q_smem[q_stage] + K_smem[kv_stage]
+输出: S_region[q_stage] in TMEM
+        |
+        v
+elected lane 执行 s_ready.arrive(q_stage)
+底层: tcgen05.commit
+        |
+        v
+Tensor Core 异步计算并写 S
+        |
+        v
+硬件翻转 s_ready[q_stage] 的 phase
+        |
+        v
+WG0 或 WG1 的 softmax 等待成功
+        |
+        v
+softmax 可以通过 tcgen05.ld 读取 S
+```
+
+这里最重要的一点是：`gemm_async` 负责提交计算，`s_ready` 负责证明计算已经
+完成并允许消费者读取结果；二者缺一不可。
+
+### 七、常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 |
+|---|---|---|
+| 认为 `gemm_async` 返回后 S 已可读 | 它只表示异步 MMA 已提交 | 读到旧值、零值或部分更新结果 |
+| 软件复制一份 K 转置后再传给 MMA | `K_smem` 已可直接作为 `K^T` operand | 浪费 SMEM 和带宽，甚至转置两次 |
+| 所有 lanes 都执行 `s_ready.arrive` | barrier arrival count 与初始化不一致 | 提早放行或永久等待 |
+| 把 `q_stage` 与 `kv_stage` 对调 | 选择错误的 operand 和 S region | operand 越界或 S 写到错误 stage |
+| 在 QKᵀ MMA 内提前乘 `1/sqrt(d)`，softmax 又乘一次 | scaling 被重复应用 | score 过小、attention 分布异常 |
+| Q/K TMA 尚未完成就发 MMA | SMEM descriptor 读取未完成数据 | 非确定性错误或 kernel hang |
+
+QKᵀ MMA 产生的是原始 dot-product scores。课程把 softmax 的
+`1/sqrt(d)` 缩放折入后面的 `scale_log2 = log2(e) / sqrt(d)`，本节不需要
+额外缩放 S。
+
+### 八、自测题与答案
+
+#### 1. 为什么 `Q_block [128, HEAD_DIM]` 与 `K_block [128, HEAD_DIM]` 产生的是 `[128, 128]` S tile？
+
+答：`K_block` 被解释成转置后的 `[HEAD_DIM, 128]`。矩阵乘法得到
+`[128, HEAD_DIM] @ [HEAD_DIM, 128] = [128, 128]`，行是 query，列是当前
+K block 中的 key。
+
+#### 2. 谁执行 QKᵀ MMA，哪些 threads 不执行？
+
+答：WG3 warp 0 中由 `elect_sync()` 选出的一个 lane 发起。其他 lanes
+不各自提交一份 MMA；Tensor Core 执行矩阵级操作。
+
+#### 3. 为什么不需要先把 `K_smem` 转置成 `[HEAD_DIM, BLK_N]`？
+
+答：SMEM descriptor 和 `gemm_async` 的 B operand 语义已经描述如何把
+`[BLK_N, HEAD_DIM]` 的行解释为 `K^T` 的列。软件复制转置矩阵不是必需步骤。
+
+#### 4. `s_ready.arrive(q_stage)` 为什么不能理解成“这个线程写完 S”？
+
+答：S 由 Tensor Core 异步写入，不由 issuing lane 写。`arrive` 的底层
+作用是 `tcgen05.commit`，硬件只有在 MMA 完成后才真正向 barrier 报告
+完成。
+
+#### 5. QKᵀ MMA 为什么不累加到上一轮的 S，而 PV MMA 要累加到 O？
+
+答：每个 K/V block 的 scores 是相互独立的中间结果，新的 S 可以覆盖旧
+S；O 则是所有 K/V blocks 的累计输出，因此 PV MMA 要持续累加到同一块
+`O_region`，期间还可能执行 correction。
+
+## 十三、下一知识点
+
+下一步讲解 softmax 的读出阶段：WG0 或 WG1 如何等待 `s_ready`，再通过
+`tcgen05.ld` 把 128×128 的 S 分块读入 registers，以及为什么不能把
+TMEM 当作普通数组逐线程读取。
