@@ -1264,6 +1264,24 @@ PTX：tcgen05.mma、tcgen05.ld / tcgen05.st、tcgen05.commit、
      tcgen05.wait::ld / wait::st
 ```
 
+### 为什么现在讲这个
+
+前面的课程已经说明 `S`、`P`、`O` 各自的数学作用，但仅知道三种 tile 的
+含义，仍然无法回答一个关键问题：FA4 为什么能在固定的 512-column TMEM
+中同时支持两个 Q stages。
+
+32-bit fp32 view 与 16-bit fp16 view 的 alias，正是这个容量问题的
+答案。`S` 和 `O` 已经占满 512 columns，如果不知道同一个 physical
+column 可以按两个 fp16 slots 重新索引，就会误以为 `P` 必须再申请
+128 个独立 columns；如果不知道逻辑 slot `s` 映射到
+`column s // 2`、`half s % 2`，也无法推导 `P0` 为什么恰好占用
+`[64, 128)` 并覆盖 `S0` 的后半部分。
+
+因此，本知识点不是单纯介绍一个 dtype 转换，而是把逻辑 tile 的形状、
+TMEM 的物理容量和 `P` 对 `S` 的分时复用连接起来。掌握它之后，才能
+判断哪些 region 可以重叠、哪些数据必须长期保留，以及后续 barrier
+究竟在保护哪一段物理存储。
+
 ### 一、这一节解决的问题
 
 FA4 kernel 为每个 CTA 申请：
