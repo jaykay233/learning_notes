@@ -35,9 +35,10 @@ PTX：tcgen05.mma、tcgen05.commit、mbarrier、
 
 ```text
 [x] Step 7：Warp Specialization 与完整 Load / Compute / Writeback overlap
-[ ] Step 8：Two-CTA Cluster（进行中；8.1 见
+[x] Step 8：Two-CTA Cluster（见
     `20-gemm-two-cta-cluster.md`）
-[ ] Step 9：Multi-Consumer Warp Specialization
+[x] Step 9：Multi-Consumer Warp Specialization（见
+    `20-gemm-two-cta-cluster.md`）
 ```
 
 ## 一、为什么一个 warpgroup 仍然会互相等待
@@ -989,15 +990,12 @@ warpgroup 都完成 release。
 
 ## 下一知识点
 
-`chapter_gemm_advanced` 的 Step 8.1-8.2 已经记录在
+`chapter_gemm_advanced` 的 Step 8 和 Step 9 已经完整记录在
 [`20-gemm-two-cta-cluster.md`](20-gemm-two-cta-cluster.md)：
 
 ```text
-两个 CTA 的 A/B slice 所有权
-256 x 256 output tile 与 128 x 256 per-CTA TMEM
-m_st / n_st / n_st_epi 的三条地址生命周期
-epilogue 为什么拆成两段 128-column 写回
+Step 8：Two-CTA cooperative MMA、cta_mask completion 与跨 CTA TMEM 复用
+Step 9：Multi-Consumer Warp Specialization、共享 staged B 与 512 x 256 tile
 ```
 
-下一步进入 Step 8.3：CTA0 集中式 `tma2mma` barrier 与
-65536-byte K-stage transaction。
+`chapter_gemm_advanced` 已完成。下一章进入 `chapter_flash_attention`。

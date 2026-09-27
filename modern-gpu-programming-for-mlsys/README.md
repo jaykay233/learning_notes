@@ -33,7 +33,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [17-gemm-software-pipeline.md](17-gemm-software-pipeline.md) | `hgemm_v5` 的 `PIPE_DEPTH=2` 双缓冲、prologue prefetch、stage ring、每 stage 独立 TMA barrier、`phase_tma` / `phase_mma` 翻转规则，以及 `K_TILES=5` 的完整执行 trace |
 | [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、`work_id` / `init(bx)` / stride 148、M 优先与 N 优先的完整编号对照、`l2_group_size=8` 的 L2 locality、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
 | [19-gemm-warp-specialization.md](19-gemm-warp-specialization.md) | `chapter_gemm_advanced` Step 7 的 `hgemm_v7`、TMA producer / MMA consumer / writeback 三角色拆分、`tma2mma` / `mma2tma` 的 SMEM full-empty 协议、`mma2ld` / `ld2mma` 的 TMEM result-reuse 协议、named barrier、完整代码与 `PIPE_DEPTH=2` 交接 trace |
-| [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8.1-8.3 的 `hgemm_v8`、CTA0/CTA1 的 A/B slice 所有权、`m_st` / `n_st` / `n_st_epi` 地址路径、cooperative MMA 生成的 `256 x 256` output tile、两段 `128-column` epilogue、CTA0 集中式 `tma2mma` barrier、`remote_view(0)`、1 次 arrival 与 65536-byte TMA transaction，以及 `cta_mask=3` completion 与 256-arrival `ld2mma` |
+| [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8-9 的 `hgemm_v8` / `hgemm_v9`、Two-CTA cooperative MMA、`cta_mask=3`、跨 CTA TMEM 复用、Multi-Consumer Warp Specialization、共享 staged B、`512 x 256` cluster tile、按 consumer 索引的 TMEM / barriers、`98304`-byte K-stage TMA transaction，以及完整 GPU 与静态验证代码 |
 
 ## 当前进度
 
@@ -307,6 +307,23 @@ tma2mma.init(1) 统计一次软件 arrival，不统计 CTA 或 TMA engine 数量
 只有 CTA0 的 producer lane 执行 arrive(stage, 65536)
 只有 CTA0 的 MMA consumer 等待 tma2mma[stage]
 chapter_gemm_advanced 第 8 步第 3 个知识点完成：CTA0 集中式 tma2mma barrier
+cta_group=2 的 cooperative MMA 读取 CTA pair 的 SMEM 并更新两侧 TMEM
+cta_mask=3 将一次 MMA completion multicast 到两个 CTA 的 barrier
+TMEM allocation、MMA、commit、deallocation 必须使用一致的 cta_group
+两个 writeback warpgroup 共 256 个 arrivals，才能释放跨 CTA TMEM
+chapter_gemm_advanced 第 8 步第 4 个知识点完成：Cooperative MMA 与 Completion
+ld2mma 从 CTA0 的集中式 fan-in 收集 CTA0 与 CTA1 的 writeback arrivals
+每侧 128 个 writer，CTA pair 合计 256 arrivals，phase 才翻转
+chapter_gemm_advanced 第 8 步第 5 个知识点完成：跨 CTA TMEM 复用
+NUM_CONSUMER=2 将 cluster output tile 从 256 x 256 扩展为 512 x 256
+Asmem 增加 consumer 轴，Bsmem 保持单份并被两个 consumers 共享
+mma2tma 每个 stage 等待 NUM_CONSUMER 个 MMA-read completion
+mma2ld / ld2mma 按 consumer 索引，分别保护 TMEM [0:256] 与 [256:512]
+每个 Stage 的 TMA transaction 从 65536 增至 98304 bytes，新增部分是两份 A block
+EPI_N=64 让每个 writeback warpgroup 用四轮写回 256 columns
+WG0 / WG1 分别使用 named barrier 10 / 11 隔离 Dsmem 生命周期
+chapter_gemm_advanced 第 9 步完成：Multi-Consumer Warp Specialization
+chapter_gemm_advanced 完成
 ```
 
 ## 下一知识点
@@ -323,7 +340,10 @@ chapter_tirx_layout_api 完成
 -> chapter_gemm_advanced 第 8 步第 1 个知识点完成：Two-CTA Tile Ownership
 -> chapter_gemm_advanced 第 8 步第 2 个知识点完成：Tile Address 与 Epilogue
 -> chapter_gemm_advanced 第 8 步第 3 个知识点完成：CTA0 集中式 tma2mma barrier
--> chapter_gemm_advanced 第 8 步第 4 个知识点：cta_group=2 cooperative MMA 与 cta_mask=3 completion
+-> chapter_gemm_advanced 第 8 步第 4 个知识点完成：cooperative MMA 与 cta_mask=3 completion
+-> chapter_gemm_advanced 第 8 步第 5 个知识点完成：跨 CTA TMEM 复用
+-> chapter_gemm_advanced 第 9 步完成：Multi-Consumer Warp Specialization
+-> chapter_flash_attention
 ```
 
 ## 核心主线
@@ -360,5 +380,5 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 Two-CTA Cluster 的 cooperative MMA 与 remote barrier
-Multi-Consumer Warp Specialization
+FlashAttention 的 tile 分解与 online softmax
 ```
