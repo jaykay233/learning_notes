@@ -14,6 +14,7 @@ softmax、correction、TMA 与 MMA issue 映射到具体 warp 角色。现在补
 角色之间的两项执行契约：每个 warpgroup 能拿到多少 registers，以及每个
 共享 buffer 通过哪个 barrier、由谁 arrive、由谁 wait，并把 Q、K/V 与
 TMEM 三条流水线排成完整时间线。
+本节的最后补上 KV block 为什么从最后一个有效 block 反向遍历。
 
 ## 本次讲解位置
 
@@ -5042,7 +5043,147 @@ PV MMA 次数:
 每个 query stage 对每个 K/V block 恰好做一次 QKᵀ 和一次 PV。多一次会
 重复累加，少一次会漏掉 V[0] 或漏掉最后的 score。
 
-### 十、常见错误与症状
+### 十、为什么 KV block 从后往前遍历
+
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：6. Q / K / V pipeline 时间线
+知识点：KV block 为什么按 n_block_max-1 -> 0 倒序消费
+上次：prologue、steady state、tail 的边界拆分
+下次：Correction、最终归一化与 epilogue
+PTX：本节决定 QKᵀ / PV 的发射顺序；不改变 tcgen05.mma 的语义
+```
+
+#### 为什么现在讲这个
+
+前一小节已经说明了 prologue、steady state、tail 为什么必须分开，
+但源码里 `i_kv = load_trip_count - 2 - _i` 这样的反向索引仍然很容易
+被误解成“online softmax 必须倒着读 KV”，或者“倒序是 causal mask
+的正确性要求”。这两个判断都不对。倒序是 FA4 为了 causal 快路径和
+流水线形状做出的调度选择；把它和数学语义分开，才能判断替换顺序时
+哪些部分必须改、哪些部分可以保留。
+
+#### 1. 结论：数学上不要求倒序
+
+Online softmax 维护逐行状态：
+
+```text
+m: running maximum
+l: running sum of exp(score - m)
+O: running weighted value sum
+```
+
+处理一个新的 KV block 时，只用当前 block 的 score 更新 `(m, l, O)`。
+只要每次更新使用一致的 `m_old`、`m_new`，并正确乘上
+`exp(m_old - m_new)`，最终结果就与 block 的到达顺序无关。因此：
+
+- 正序 `0 -> n_block_max-1` 可以；
+- 倒序 `n_block_max-1 -> 0` 可以；
+- 交错或其他顺序也可以。
+
+倒序不是正确性要求，只是 FA4 的实现选择。
+
+#### 2. FA4 的实际消费顺序
+
+设当前 Q tile 的有效 KV block 数量为 `n=5`，有效 block 是
+`0, 1, 2, 3, 4`。FA4 的消费顺序是：
+
+```text
+4 -> 3 -> 2 -> 1 -> 0
+```
+
+具体到 K / V：
+
+```text
+K[4] -> V[4] -> K[3] -> V[3] -> K[2] -> V[2]
+-> K[1] -> V[1] -> K[0] -> V[0]
+```
+
+Pipeline 里 K 比 V 早半步：prologue 先加载 `K[4]`，用它生成 S4；
+softmax 产生 P4 之后，`V[4]` 才进入 PV；steady state 则用当前的 V
+做 PV，同时加载下一个 K。
+
+#### 3. Causal 下为什么倒序更有利
+
+以 causal attention 为例，某个 Q tile 的有效 KV 范围是
+`0..n_block_max-1`。其中：
+
+- `n_block_max-1` 是对角线附近的 block，可能包含被 causal mask
+  遮住的元素；
+- `0..n_block_max-2` 对这个 Q tile 来说是完全 unmasked 的 block。
+
+倒序先处理 `n_block_max-1`，带来三个具体好处。
+
+**第一，把 mask 特殊路径放进 prologue。**
+对角线 block 需要逐元素判断 `key_pos <= query_pos`。先把它处理掉，
+后面的 steady state 全部是完全有效 block，可以走统一的 fast path，
+不用在每轮里反复做边界判断。正序也能做，但会让 masked block 落到
+尾部，尾部的特殊处理更难和 steady state 重叠。
+
+**第二，更早建立有用的 running max。**
+先处理最新的对角线 block，通常能较早得到一个较紧的 `m`。后续处理
+更老的 block 时，新的 max 经常不会更大，于是 rescale 因子
+`exp(m_old - m_new)` 更常等于 1，O 的 rescale 可以走快路径。
+这是 workload heuristic，不是数学保证；它优化的是平均快路径命中率，
+不改变结果。
+
+**第三，形成自然的 prologue / steady / tail 结构。**
+反向顺序让 `K[n-1]`、`V[n-1]` 落在 prologue，`V[0]` 落在 tail，
+中间 steady state 始终是“PV 当前 V + QK 下一个 K”。如果改成正序，
+需要把 prologue 和 tail 对调，并重新安排 mask block 的位置；不是
+不能做，而是要换一套边界代码。
+
+#### 4. Non-causal 下为什么也倒序
+
+Non-causal 没有对角线特殊 block，所有 KV block 都是全有效的。此时
+倒序没有 causal 那样的 mask 和快路径收益，主要是复用同一套流水线
+骨架：prologue 处理最后一个 block，steady state 交错 PV 与下一个
+QK，tail 回收第一个 V。它是实现约定，不是 causal 语义的一部分。
+
+#### 5. 不要混淆两种“倒序”
+
+FA4 里有两个独立的顺序概念：
+
+| 顺序 | 对象 | FA4 方向 | 目的 |
+|---|---|---|---|
+| KV block 遍历 | 当前 Q tile 的 K/V blocks | `n_block_max-1 -> 0` | causal 快路径、prologue/steady/tail |
+| Q block 调度 | 不同 Q tile | 重的 tile 先调度 | 负载均衡，避免尾部长尾 |
+
+`FlashAttentionLPTScheduler` 反向调度 `m_block` 是为了让 causal 下
+KV 工作量更大的 Q tile 更早启动，和 KV block 的遍历方向是两件事。
+把两者混在一起，会误以为“KV 倒序”是为了负载均衡。
+
+#### 6. 常见误解与症状
+
+| 误解 | 实际含义 | 会导致什么 |
+|---|---|---|
+| “online softmax 必须倒序才正确” | 任意顺序都正确，只要 rescale 一致 | 不敢改遍历顺序，或错误地把顺序写进正确性条件 |
+| “倒序是 causal mask 的要求” | mask 只决定哪些 key 有效，不决定处理顺序 | 把 mask 逻辑和处理顺序绑死，替换顺序时漏掉边界 |
+| “KV 倒序和 Q tile 调度是同一件事” | 一个管 block 消费，一个管 tile 分派 | 调优时改错位置，性能问题定位错误 |
+| “non-causal 倒序也有同样收益” | non-causal 没有对角线 block | 夸大 non-causal 的快路径收益 |
+
+#### 7. 自测题
+
+1. 如果只考虑数学正确性，KV block 能否按 `0 -> n-1` 处理？为什么？
+2. Causal 下倒序处理时，哪个 block 带 mask？它被放在 prologue
+   还是 tail？
+3. 为什么先处理对角线 block 可能让 O 的 rescale 更常跳过？
+4. KV block 倒序与 Q tile 的 LPT 调度分别优化什么问题？
+
+答案：
+
+1. 可以。Online softmax 的结果与 block 顺序无关，条件是每次更新都
+   正确使用 running max、running sum 和 rescale 因子。
+2. `n_block_max-1` 的对角线 block 带 causal mask；倒序把它放在
+   prologue 处理，后续 steady state 可走全有效 block 的 fast path。
+3. 先处理对角线 block 通常能让 running max 更早接近较大值，后续老
+   block 更可能满足 `m_new <= m_old`，从而跳过 O 的 rescale。它是
+   经验性快路径，不是保证。
+4. KV 倒序主要服务 causal mask 路径和 prologue/steady/tail 结构；
+   Q tile 反向调度主要服务负载均衡，让更重的 causal Q tile 先开始。
+
+### 十一、常见错误与症状
 
 | 错误 | 原因 | 可观察症状 |
 |---|---|---|
@@ -5055,7 +5196,7 @@ PV MMA 次数:
 | 把 `commit o_ready` 放在 tail PV 前 | O 还没有最终值 | epilogue 提前读 O |
 | TMA store 在主循环中提前启动 | `corr_epi.full` 尚未由 WG2 完成 | store 读半成品 `O_smem` |
 
-### 十一、自测题与答案
+### 十二、自测题与答案
 
 #### 1. FA4 的三个 pipeline depth 分别是什么，为什么不能合并成一个 depth？
 
