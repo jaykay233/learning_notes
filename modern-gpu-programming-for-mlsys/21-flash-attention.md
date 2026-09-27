@@ -9,9 +9,10 @@ QK^T MMA -> softmax -> PV MMA
 ```
 
 目前已经讲完 attention tile 分解、FA4 conditional rescaling、`S/P/O`
-的 TMEM layout、QKᵀ MMA、softmax 和 PV MMA 数据路径。接下来需要把
-这些数据路径映射到具体执行者：CTAs 中的哪些 warpgroups 和 warps
-负责 softmax、correction、TMA 与 MMA issue。
+的 TMEM layout、QKᵀ MMA、softmax 和 PV MMA 数据路径，也已经把
+softmax、correction、TMA 与 MMA issue 映射到具体 warp 角色。现在补上
+角色之间的两项执行契约：每个 warpgroup 能拿到多少 registers，以及每个
+共享 buffer 通过哪个 barrier、由谁 arrive、由谁 wait。
 
 ## 本次讲解位置
 
@@ -36,10 +37,10 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
     [x] 4.1 QK^T MMA：SMEM 中的 Q/K -> TMEM 中的 S
     [x] 4.2 Softmax：S TMEM -> registers -> P TMEM
     [x] 4.3 PV MMA：P TMEM + V SMEM -> O TMEM
-[ ] 5. Warp 角色、register 分配与 barrier 分工
+[x] 5. Warp 角色、register 分配与 barrier 分工
     [x] 5.1 Warp 角色地图
-    [ ] 5.2 Register 分配与 setmaxnreg
-    [ ] 5.3 Barrier 分工与角色交接
+    [x] 5.2 Register 分配与 setmaxnreg
+    [x] 5.3 Barrier 分工与角色交接
 [ ] 6. Q / K / V pipeline 时间线
 [ ] 7. Correction、最终归一化与 epilogue
 [ ] 8. Causal mask、GQA、tile scheduling 与验证
@@ -3514,9 +3515,976 @@ stage 0，WG3 warp 0 负责 MMA issue；它们的 CTA 线程范围分别是
 两个 softmax stage 互相覆盖彼此的数据；错误通常从第二个 Q stage 开始
 出现。
 
-## 十六、下一知识点
+## 十六、Register 分配与 Barrier 交接契约
 
-下一步进入 `5.2 Register 分配与 setmaxnreg`：解释为什么 WG0/WG1
-需要更多 registers，WG2 和 WG3 为什么可以释放 registers，以及
-`setmaxnreg` 如何让四个 warpgroups 共享同一个 65,536-register CTA
-budget。
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：Registers 如何在角色之间分配 / Barrier 的分工与完成条件
+知识点：5.2 Register 分配与 setmaxnreg；5.3 Barrier 分工与角色交接
+上次：5.1 Warp 角色地图
+下次：6. Q / K / V pipeline 时间线
+PTX：setmaxnreg.inc/dec.sync.aligned.u32、mbarrier、
+     tcgen05.commit、cp.async.bulk.commit_group/wait_group
+```
+
+### 为什么现在讲这个
+
+`5.1` 只回答了“哪个 warp 负责哪一段代码”。这还不够，因为角色声明本身
+不会让 kernel 正确运行：
+
+1. Softmax 每个线程要保存一整行 `BLK_N=128` 个 fp32 score，register
+   需求远高于只负责发 TMA 的线程。如果所有线程平均分配 registers，
+   softmax 会出现 spill 或无法容纳一行 score。
+2. 如果每个 warpgroup 都按最大值申请 registers，四个 warpgroup 会超过
+   CTA 的 `65,536` 个 register 文件预算。
+3. 一个 buffer 被 TMA、MMA、softmax、correction 和 store 反复复用时，
+   必须同时回答“数据什么时候可读”和“什么时候可以覆盖”。只看到
+   `wait()` 或 `commit()` 而不知道它们对应哪个方向，会写出能编译但会
+   死锁、覆盖数据或提前读 TMEM 的 kernel。
+
+因此 `5.2` 解决寄存器容量契约，`5.3` 解决共享资源的时间契约。两者一起
+构成 FA4 的角色协作边界。
+
+### 5.2 Register 分配与 setmaxnreg
+
+### 一、心智模型：register file 是一个 CTA 共享预算
+
+在 SM110 上，一个 CTA 最多可使用的 register 文件预算是：
+
+```text
+65,536 registers
+```
+
+FA4 CTA 有：
+
+```text
+16 warps * 32 threads = 512 threads
+```
+
+如果平均分配，每个线程得到：
+
+```text
+65,536 / 512 = 128 registers per thread
+```
+
+但 FA4 的角色需求并不平均：
+
+```text
+WG0 softmax      : 128 threads
+WG1 softmax      : 128 threads
+WG2 correction   : 128 threads
+WG3 TMA/MMA/idle : 128 threads
+```
+
+所以要让 softmax 多拿 registers，WG2 和 WG3 就必须释放等量的 register
+额度。`setmaxnreg` 做的是同一个 CTA 内 warpgroups 之间的额度再分配，
+不是让硬件临时增加总 register 数。
+
+### 二、FA4 的角色目标
+
+FA4 源码中的角色声明如下：
+
+```python
+# Both role splits consume the complete 65536-register CTA file. The
+# pinned upstream FA4 schedule uses 192/72/56 for causal D128 on SM110.
+softmax_regs = 192 if thor_causal_d128 else 200
+correction_regs = 72 if thor_causal_d128 else 64
+other_regs = 56 if thor_causal_d128 else 48
+
+sp = txl.specialize(chain_dispatch=True)
+r_softmax = sp.role(
+    "softmax",
+    warps=[0, 1, 2, 3, 4, 5, 6, 7],
+    regs=softmax_regs,
+)
+r_correction = sp.role(
+    "correction",
+    warps=[8, 9, 10, 11],
+    regs=correction_regs,
+)
+wg3 = sp.warpgroup(
+    "wg3",
+    warps=range(12, 16),
+    regs=other_regs,
+)
+r_mma = sp.role(
+    "mma",
+    warps=[12],
+    group=wg3,
+    when=cta_rank == 0 if USE_2CTA else None,
+)
+r_load = sp.role("load", warps=[13], group=wg3)
+r_store = sp.role("store", warps=[14], group=wg3)
+r_idle = sp.role("idle", warps=[15], group=wg3)
+```
+
+这段代码表达三层关系：
+
+| 层级 | 含义 |
+|---|---|
+| `sp.role(...)` | 一个或多个 warp 的功能角色 |
+| `regs=...` | 该角色所在 warpgroup 的 per-thread register target |
+| `group=wg3` | WG3 内的 MMA、load、store、idle 共享同一个寄存器切换作用域 |
+
+WG3 的四个子角色不会分别把整个 warpgroup 设置成不同的 register 数。
+它们都在 `wg3` 这个 warpgroup scope 内运行，warpgroup 的 target 统一为
+`other_regs`。真正决定细分职责的是 `r_mma`、`r_load`、`r_store`、
+`r_idle` 的 dispatch guard。
+
+### 三、两个配置的完整预算
+
+默认 non-causal D128 配置：
+
+```text
+softmax     : 200 * 128 = 25,600
+softmax     : 200 * 128 = 25,600
+correction  :  64 * 128 =  8,192
+other/WG3   :  48 * 128 =  6,144
+                               ------
+total                      = 65,536
+```
+
+等价写法：
+
+```text
+128 * (200 + 200 + 64 + 48)
+= 128 * 512
+= 65,536
+```
+
+SM110 causal D128 配置：
+
+```text
+128 * (192 + 192 + 72 + 56)
+= 128 * 512
+= 65,536
+```
+
+两种配置唯一的共同点不是某一项固定，而是四项的和始终等于每个 CTA
+的 `512 * 128 = 65,536` register 预算。
+
+为什么 softmax 要这么多：
+
+```text
+s_chunk: 128 个 fp32 scores
+row_max: 运行中的行最大值
+row_sum: 运行中的行和
+p_chunk: 打包后的 f16 P fragment
+临时量: exp2、mask、地址、scale 等
+```
+
+`128` 个 fp32 scores 本身就至少需要约 `128` 个 32-bit registers。再把
+online softmax 与 P packing 的中间量算进去，`200` 或 `192` registers
+才足够避免频繁 spill。
+
+WG2 correction 只需要读取一个 `acc_scale`、少量 O fragment 和 epilogue
+临时量，生命周期短，因此是 `64` 或 `72`。WG3 主要执行 TMA descriptor
+构造、election 和 MMA issue，寄存器压力最小，因此是 `48` 或 `56`。
+
+### 四、`setmaxnreg` 的方向
+
+PTX 指令名称是：
+
+```text
+setmaxnreg.inc.sync.aligned.u32
+setmaxnreg.dec.sync.aligned.u32
+```
+
+方向不是由程序员随意选择，而是由目标值和 entry allocation 比较得出：
+
+```text
+target > entry_regs  -> .inc
+target < entry_regs  -> .dec
+target == entry_regs -> 不需要改变该值，但声明形式仍受上层实现约束
+```
+
+当前 CTA 是 16 warps，并且 FA4 使用 `min_blocks_per_sm=1` 固定入口
+分配，因此 entry share 是：
+
+```text
+65,536 / (1 * 16 * 32)
+= 65,536 / 512
+= 128 registers per thread
+```
+
+所以默认配置的方向是：
+
+```text
+WG0 softmax: 200 > 128 -> setmaxnreg.inc 200
+WG1 softmax: 200 > 128 -> setmaxnreg.inc 200
+WG2 corr   :  64 < 128 -> setmaxnreg.dec  64
+WG3        :  48 < 128 -> setmaxnreg.dec  48
+```
+
+如果 `min_blocks_per_sm` 没有固定，编译器无法可靠判断 entry allocation，
+TIRx 会拒绝这种角色声明。典型错误是：
+
+```text
+setmaxnreg requires txl.kernel(..., min_blocks_per_sm=...)
+to pin the entry allocation
+```
+
+如果方向错误，ptxas 可能报：
+
+```text
+(C7406) setmaxnreg.dec has register count (...) which is larger
+than the largest temporal register count in the program
+```
+
+### 五、硬约束
+
+`setmaxnreg` 的 target 必须满足：
+
+```text
+24 <= target <= 256
+target % 8 == 0
+```
+
+另外，它是 warpgroup-collective 指令。一个 warpgroup 的四个 warps 必须：
+
+1. 都到达同一条 `setmaxnreg`；
+2. predicate 条件一致；
+3. operand 一致；
+4. 不在中间被另一个分支拆散。
+
+错误写法：
+
+```python
+if warp_id == 0:
+    T.ptx.setmaxnreg(True, 200)
+if warp_id == 1:
+    T.ptx.setmaxnreg(True, 192)
+```
+
+这不是“warp 0 拿 200、warp 1 拿 192”，而是让同一 warpgroup 的成员
+走到不同 collective 路径，典型症状是编译失败，或者在运行时出现无法
+收敛的 warpgroup 同步。
+
+### 六、完整可运行预算验证脚本
+
+下面的脚本独立模拟 FA4 的 register 分配，不依赖 CUDA。它可以验证
+两种官方配置、错误的全 `200` 配置、`setmaxnreg` 方向，以及
+`p_o_rescale` 的 256 arrivals 契约。
+
+文件名：`flash_attention_register_barrier_check.py`
+
+```python
+from dataclasses import dataclass
+
+
+REGS_PER_CTA = 65_536
+WARPS_PER_CTA = 16
+THREADS_PER_WARP = 32
+THREADS_PER_WG = 128
+
+
+@dataclass(frozen=True)
+class Role:
+    name: str
+    warps: int
+    regs: int
+
+
+def validate_register_config(
+    label: str,
+    softmax_regs: int,
+    correction_regs: int,
+    other_regs: int,
+) -> None:
+    roles = [
+        Role("softmax-0", 4, softmax_regs),
+        Role("softmax-1", 4, softmax_regs),
+        Role("correction", 4, correction_regs),
+        Role("wg3", 4, other_regs),
+    ]
+
+    total_threads = WARPS_PER_CTA * THREADS_PER_WARP
+    entry_regs = REGS_PER_CTA // total_threads
+    total_regs = sum(role.warps * THREADS_PER_WARP * role.regs for role in roles)
+
+    assert total_threads == 512
+    assert entry_regs == 128
+    assert total_regs == REGS_PER_CTA
+
+    for role in roles:
+        assert 24 <= role.regs <= 256
+        assert role.regs % 8 == 0
+
+    directions = [
+        "inc" if role.regs > entry_regs else "dec"
+        for role in roles
+    ]
+
+    print(f"{label}:")
+    print(f"  entry_regs   = {entry_regs}")
+    print(f"  total_regs   = {total_regs}")
+    print(f"  directions   = {directions}")
+    for role in roles:
+        subtotal = role.warps * THREADS_PER_WARP * role.regs
+        print(f"  {role.name:10s} regs={role.regs:3d} subtotal={subtotal:5d}")
+
+
+def reject_all_200() -> None:
+    total = 4 * THREADS_PER_WG * 200
+    overflow = total - REGS_PER_CTA
+    assert total == 102_400
+    assert overflow == 36_864
+    print("bad all-200:")
+    print(f"  total_regs   = {total}")
+    print(f"  overflow     = {overflow}")
+    print("  result       = rejected: exceeds CTA pool")
+
+
+def check_barrier_counts() -> None:
+    counts = {
+        "q_load.full": 1,
+        "q_load.empty_tcgen05_commit": 1,
+        "kv_load.full": 1,
+        "kv_load.empty_tcgen05_commit": 1,
+        "s_ready_tcgen05_commit": 1,
+        "p_o_rescale": 128 + 128,
+        "p_ready_2": 128,
+        "o_ready_tcgen05_commit": 1,
+        "softmax_corr.empty": 128,
+        "corr_epi.full": 128,
+        "corr_epi.empty": 32,
+    }
+
+    assert counts["p_o_rescale"] == 256
+    assert counts["p_ready_2"] == 128
+    assert counts["corr_epi.empty"] == 32
+
+    print("barrier counts:")
+    for name, count in counts.items():
+        print(f"  {name:32s} {count}")
+
+
+if __name__ == "__main__":
+    validate_register_config("non-causal D128", 200, 64, 48)
+    validate_register_config("Thor causal D128", 192, 72, 56)
+    reject_all_200()
+    check_barrier_counts()
+```
+
+运行：
+
+```bash
+python3 flash_attention_register_barrier_check.py
+```
+
+预期输出：
+
+```text
+non-causal D128:
+  entry_regs   = 128
+  total_regs   = 65536
+  directions   = ['inc', 'inc', 'dec', 'dec']
+  softmax-0  regs=200 subtotal=25600
+  softmax-1  regs=200 subtotal=25600
+  correction regs= 64 subtotal= 8192
+  wg3        regs= 48 subtotal= 6144
+Thor causal D128:
+  entry_regs   = 128
+  total_regs   = 65536
+  directions   = ['inc', 'inc', 'dec', 'dec']
+  softmax-0  regs=192 subtotal=24576
+  softmax-1  regs=192 subtotal=24576
+  correction regs= 72 subtotal= 9216
+  wg3        regs= 56 subtotal= 7168
+bad all-200:
+  total_regs   = 102400
+  overflow     = 36864
+  result       = rejected: exceeds CTA pool
+barrier counts:
+  q_load.full                     1
+  q_load.empty_tcgen05_commit     1
+  kv_load.full                    1
+  kv_load.empty_tcgen05_commit    1
+  s_ready_tcgen05_commit          1
+  p_o_rescale                     256
+  p_ready_2                       128
+  o_ready_tcgen05_commit          1
+  softmax_corr.empty              128
+  corr_epi.full                   128
+  corr_epi.empty                  32
+```
+
+这个脚本只验证静态契约，不验证 SM110 上的实际 occupancy 或 SASS。
+真正的 GPU 验证仍需要目标构架、TIRx/TVM 编译链和对应硬件。
+
+### 七、register 常见错误
+
+| 错误 | 根本原因 | 可观察症状 |
+|---|---|---|
+| 让全部 512 threads 都保留 200 regs | `512 * 200 = 102400 > 65536` | 编译期预算超限或 occupancy 约束冲突 |
+| 只给 WG0 设 200，WG1 保持 128 | 两个 softmax warpgroup 都保存一整行 score | WG1 spill，或者性能与 WG0 严重不均衡 |
+| 在同一 warpgroup 内按 warp 设置不同 regs | `setmaxnreg` 是 warpgroup collective | 编译报 collective uniformity 错误或运行时挂死 |
+| 未设置 `min_blocks_per_sm` | entry allocation 不可判定 | TIRx 报 `setmaxnreg_without_min_blocks_per_sm` |
+| target 不是 8 的倍数 | PTX 操作数粒度约束 | ptxas 拒绝该 target |
+| target 小于 24 或大于 256 | 超出 PTX 合法范围 | ptxas 拒绝该指令 |
+
+一个有用的检查顺序：
+
+```text
+1. 角色是否覆盖完整 warpgroup？
+2. 每个 role 的 per-thread target 是否在 [24, 256] 且为 8 的倍数？
+3. 所有 warpgroup 的 threads * regs 总和是否等于 65536？
+4. entry allocation 是否由 min_blocks_per_sm 固定？
+5. 每个 warpgroup 是否在同一控制流点执行同一条 setmaxnreg？
+```
+
+### 5.3 Barrier 分工与角色交接
+
+### 一、心智模型：full/ready 与 empty
+
+循环复用的 buffer 一定有两个方向的问题：
+
+```text
+producer: 我写好数据了，consumer 可以读
+consumer: 我用完了，producer 可以覆盖
+```
+
+FA4 中统一采用下面的命名：
+
+| 名称 | 方向 | 谁通知 | 谁等待 |
+|---|---|---|---|
+| `full` / `ready` | 数据就绪 | producer | consumer |
+| `empty` | 资源可复用 | consumer | producer |
+
+例如 KV SMEM ring：
+
+```text
+TMA load:
+  wait kv_load.empty
+  issue TMA
+  register tx bytes on kv_load.full
+
+MMA:
+  wait kv_load.full
+  read K/V from SMEM
+  commit completion to kv_load.empty
+```
+
+这里 TMA 是 producer，MMA consumer 是 consumer。因此：
+
+```text
+full 上：TMA 报告 arrival + bytes，MMA wait
+empty 上：MMA 报告 Tensor Core 完成，TMA wait
+```
+
+一个不用背方向的判断法：
+
+```text
+先问“这个状态描述数据还是描述空间？”
+data ready -> producer arrive, consumer wait
+space free -> consumer arrive, producer wait
+```
+
+### 二、FA4 的 barrier 契约
+
+课程中的完整 barrier 表如下。表中 count 都针对某个 barrier 的一个
+slot、一个 phase，不是所有 pipeline stages 的总和。
+
+| Barrier | 参与通知的 threads | 每个 phase 的完成条件 | 完成后可以安全执行 |
+|---|---|---|---|
+| `q_load.full` | 1 个 elected TMA-load thread | 1 次 arrival；TMA 完成 `CTA_GROUP * BLK_M * HEAD_DIM * 2` bytes | QKᵀ MMA 读 Q SMEM |
+| `q_load.empty` | 1 个 elected MMA thread | `tcgen05.commit` 报告 Tensor Core 已完成读取 Q | TMA 覆盖该 Q stage |
+| `kv_load.full` | 1 个 elected TMA-load thread | 1 次 arrival；TMA 完成 `CTA_GROUP * BLK_N * HEAD_DIM * 2` bytes | QKᵀ/PV MMA 读 K/V |
+| `kv_load.empty` | 1 个 elected MMA thread | `tcgen05.commit` 报告 Tensor Core 已完成两次 MMA 读取 | TMA 覆盖该 K/V stage |
+| `s_ready` | 1 个 elected MMA thread | QKᵀ MMA 完成 | softmax 读 S TMEM |
+| `p_o_rescale` | 128 个 softmax threads + 128 个 WG2 threads | 共 256 次 arrivals | PV part 1 读 P 前半；WG2 完成 O rescale |
+| `p_ready_2` | softmax warpgroup 的 128 个 threads | 共 128 次 arrivals | PV part 2 读 P 后半 |
+| `o_ready` | 1 个 elected MMA thread | 最后一段 PV MMA 完成 | epilogue 读 O TMEM |
+| statistics named barrier | softmax warpgroup 与 WG2 配对 | softmax `bar.arrive`，WG2 `bar.sync` | WG2 读 `sScale` |
+| `softmax_corr.empty` | WG2 的 128 个 threads | 共 128 次 arrivals | softmax 重写对应 `sScale` slot |
+| `corr_epi.full` | WG2 的 128 个 threads | 共 128 次 arrivals | TMA store 读 `O_smem` |
+| `corr_epi.empty` | TMA-store warp 的 32 个 threads | TMA store 完成且共 32 次 arrivals | epilogue 复用 `O_smem` stage |
+
+注意 `TCGen05Bar` 的语义。`tcgen05.commit` 之后不要再手动为同一 barrier
+执行一次 thread `arrive`。barrier 跟踪的是 issuing thread 此前发出的相关
+异步 `tcgen05` 操作，完成时由 Tensor Core 路径更新 barrier。
+
+### 三、TMA load：empty -> TMA -> full
+
+FA4 的 Q load 路径可以简化成：
+
+```python
+def load_q(i_q, tensor_map):
+    q_load.empty.wait(i_q, q_epoch.phase)
+
+    with txl.If(elected()), txl.Then():
+        txl.ptx[tma_g2s_3d](
+            q_smem[i_q].ptr_to(0, 0),
+            txl.address_of(tensor_map),
+            txl.int32(0),
+            txl.Cast("int32", q_tile_start(i_q)),
+            txl.Cast("int32", (batch_idx * NUM_QO_HEADS + kv_head_idx) * 2),
+            txl.cuda.cvta_generic_to_shared(
+                q_load_full_remote.ptr_to([i_q])
+            ),
+        )
+
+        q_load_full_remote.arrive(
+            i_q,
+            tx_count=BLK_M * HEAD_DIM * 2,
+        )
+```
+
+执行顺序不能反：
+
+```text
+1. empty.wait:
+   TMA 必须确认上一轮 MMA 已经不再读取这个 Q stage。
+
+2. elected lane issue TMA:
+   只有一个 lane 提交 tensor-map load，fence 由 TMA 路径负责。
+
+3. full.arrive(tx_count):
+   登记本次 TMA 预计进入 shared memory 的 bytes。
+
+4. full 的 phase 完成:
+   条件同时包含 arrival 和 tx bytes 归零，之后 MMA 才能 wait 通过。
+```
+
+若省略 `tx_count`，barrier 只知道“有人到达”，不知道 TMA 是否真正完成。
+典型症状是 MMA 读到尚未到达的 shared memory，结果随调度变化。
+
+以 `BLK_M=128, HEAD_DIM=128, fp16` 为例：
+
+```text
+tx_count = 128 * 128 * 2
+         = 32,768 bytes
+```
+
+### 四、MMA：full -> tcgen05 -> commit
+
+QKᵀ 和 PV 的交接形态：
+
+```python
+def gemm_qk(q_stage, kv_stage, qd, kd):
+    for ki in range(HEAD_DIM // MMA_K):
+        with txl.If(elected()), txl.Then():
+            txl.ptx[mma_f16](
+                txl.Cast("uint32", q_stage * MMA_N),
+                desc_at(qd, q_stage * Q_STAGE16 + qoff(ki)),
+                desc_at(kd, kv_stage * KV_STAGE16 + koff(ki)),
+                txl.uint32(id_qk),
+                *mma_keep_lanes,
+                ki != 0,
+            )
+
+    with txl.If(elected()), txl.Then():
+        commit(s_ready, q_stage)
+```
+
+这段代码的职责链是：
+
+```text
+MMA wait q_load.full 和 kv_load.full
+-> 读取 SMEM operand
+-> 异步 tcgen05 写 S TMEM
+-> commit 把完成事件绑定到 s_ready
+-> softmax wait s_ready
+```
+
+`commit` 是交接点，不是“再等一下”。它把此前发出的相关异步 MMA 纳入
+completion tracking。测试时如果删掉 commit，softmax 的 wait 永远不能
+得到 Tensor Core 完成反馈。
+
+### 五、Softmax 与 WG2：两个方向同时交接
+
+Softmax 的关键片段如下。这里只省略不相关的 mask、exp2 实现细节，保留
+`S`、`P`、statistics 和 barrier 的真实顺序。
+
+```python
+def softmax_step(i_kv, apply_mask=False, is_first=False):
+    s_chunk = txl.alloc_local([BLK_N], "float32")
+    p_chunk = txl.alloc_local([BLK_N // 2], "uint32")
+
+    s_ready.wait(wg_id, score_epoch.phase)
+
+    for chunk_idx in range(BLK_N // SOFTMAX_LD_CHUNK):
+        tmem_load(
+            s_chunk,
+            chunk_idx * SOFTMAX_LD_CHUNK,
+            tmem(wg_id * MMA_N + chunk_idx * SOFTMAX_LD_CHUNK),
+            SOFTMAX_LD_CHUNK,
+        )
+
+    # 计算 row_max、acc_scale、exp2 和 P。
+    # 此处省略具体数学实现，只保留交接顺序。
+
+    if not is_first and tid_in_wg < BLK_M:
+        sScale_idx = ACC_SCALE_BASE + tid_in_wg + wg_id * BLK_M
+        txl.ptx.st.shared.f32(sScale.ptr_to([sScale_idx]), acc_scale)
+
+    # 通知 WG2 读取 acc_scale。
+    if STATS_BAR_PAIRWISE:
+        txl.ptx.bar.arrive(
+            txl.Cast("uint32", 1 + wg_id * 4 + warp_id),
+            64,
+        )
+        txl.ptx.bar.arrive(
+            txl.Cast("uint32", 1 + wg_id * 4 + warp_id),
+            64,
+        )
+    else:
+        txl.ptx.bar.arrive(txl.Cast("uint32", 1 + wg_id), 256)
+
+    for i in range(P_SPLIT_Q):
+        tmem_store(
+            p_chunk,
+            i * BLK_N // 4 // 2,
+            tmem((wg_id * 2 * MMA_N + MMA_N + i * BLK_N // 4) // 2),
+        )
+
+    txl.ptx.tcgen05.wait__st.sync.aligned()
+    p_o_rescale_remote.arrive(wg_id)
+
+    for i in range(4 - P_SPLIT_Q):
+        tmem_store(
+            p_chunk,
+            (P_SPLIT_Q + i) * BLK_N // 4 // 2,
+            tmem(
+                (
+                    wg_id * 2 * MMA_N
+                    + MMA_N
+                    + (P_SPLIT_Q + i) * BLK_N // 4
+                ) // 2
+            ),
+        )
+
+    txl.ptx.tcgen05.wait__st.sync.aligned()
+    p_ready_2_remote.arrive(wg_id)
+
+    softmax_corr.empty.wait(wg_id, softmax_epoch.phase)
+
+    if is_first:
+        reduce_sum_128(row_sum, s_chunk)
+    else:
+        row_sum[0] *= acc_scale
+        reduce_sum_128(row_sum, s_chunk, accum=True)
+
+    score_epoch.advance()
+    softmax_epoch.advance()
+```
+
+这里有三个不同生命周期：
+
+| 交接 | 何时发生 | 为什么这样切 |
+|---|---|---|
+| `p_o_rescale` | P 前半写完，且 `acc_scale` 已写入 `sScale` | PV part 1 可以开始；WG2 可以据此决定是否 rescale O |
+| `p_ready_2` | P 后半写完 | PV part 2 可以读取剩余 P |
+| `softmax_corr.empty` | 当前 `sScale` slot 已可覆盖 | 防止 softmax 下一轮写到 WG2 尚未读完的 statistics |
+
+两个 P 阶段拆分的目的不是数学变化，而是尽早释放部分 P 给 PV MMA。
+`p_o_rescale` 的 count 是：
+
+```text
+128 softmax threads + 128 WG2 threads = 256 arrivals
+```
+
+这不是两个 slot 各 128，也不是“只由 softmax 的 128 行各一次”。
+softmax 侧每个 thread 贡献一次，WG2 侧每个 thread 也贡献一次。
+
+WG2 的 correction 片段：
+
+```python
+def stats_sync(i_q):
+    if STATS_BAR_PAIRWISE:
+        txl.ptx.bar.sync(
+            txl.Cast("uint32", 1 + i_q * 4 + warp_id),
+            64,
+        )
+    else:
+        txl.ptx.bar.sync(txl.uint32(1 + i_q), 256)
+
+
+stats_sync(0)
+softmax_corr.empty.arrive(0)
+stats_sync(1)
+softmax_epoch.advance()
+
+for _i_kv in range(corr_trip_count - 1):
+    for i_q in range(2):
+        stats_sync(i_q)
+
+        if tid_in_wg < BLK_M:
+            txl.ptx.ld.shared.f32(
+                acc_scale,
+                sScale.ptr_to([ACC_SCALE_BASE + tid_in_wg + i_q * BLK_M]),
+            )
+            should_rescale = acc_scale < 1.0
+        else:
+            should_rescale = 0
+
+        any_needs_rescale = vote_sync_any(should_rescale)
+
+        if any_needs_rescale:
+            for d_tile in range(ceil(HEAD_DIM / RESCALE_TILE)):
+                addr = tmem(
+                    (SMEM_PIPE_DEPTH_Q + i_q) * MMA_N + d_tile * RESCALE_TILE
+                )
+                tmem_load(o_row, 0, addr, RESCALE_TILE)
+
+                for i in range(RESCALE_TILE // 2):
+                    mul_f32x2(o_row, 2 * i, acc_scale)
+
+                tmem_store(o_row, 0, addr, RESCALE_TILE)
+
+            txl.ptx.tcgen05.wait__st.sync.aligned()
+
+        p_o_rescale_remote.arrive(i_q)
+        softmax_corr.empty.arrive(1 - i_q)
+        softmax_epoch.advance()
+```
+
+WG2 必须接受 softmax 的统计量，即使本行不需要 rescale，也要执行
+`p_o_rescale_remote.arrive(i_q)`。原因是 PV MMA 不能仅凭“没有 rescale”
+就跳过整个 barrier 条件；barrier 的完成条件属于所有参与者共同建立的
+协议。按条件省掉 arrival 会让其他 consumer 一直等待。
+
+### 六、TMA store：full -> TMA -> commit/wait group -> empty
+
+store warp 和 load warp 不同。TMA store 不使用 `expect_tx` 的 mbarrier
+完成路径，而是典型 bulk async group：
+
+```python
+with r_store:
+    corr_epi.full.wait(0, tmem_epoch.phase)
+
+    for i_q in range(SMEM_PIPE_DEPTH_Q):
+        if i_q != 0:
+            corr_epi.full.wait(i_q, tmem_epoch.phase)
+
+        m_start_global = q_tile_start(i_q)
+
+        with txl.If(elected()), txl.Then():
+            txl.ptx[TMA_S2G_3D](
+                txl.address_of(O_tensor_map),
+                txl.int32(0),
+                txl.Cast("int32", m_start_global),
+                txl.Cast(
+                    "int32",
+                    (batch_idx * NUM_QO_HEADS + kv_head_idx) * 2,
+                ),
+                o_smem[i_q].ptr_to(0, 0),
+            )
+
+        txl.ptx.cp.async_.bulk.commit_group()
+
+    txl.ptx.cp.async_.bulk.wait_group(1)
+    corr_epi.empty.arrive(0)
+
+    txl.ptx.cp.async_.bulk.wait_group(0)
+    corr_epi.empty.arrive(1)
+```
+
+`wait_group(N)` 的含义是：
+
+```text
+最多允许 N 个 bulk async groups 尚未完成；
+返回时，更早的 groups 已经完成。
+```
+
+对上文两个 stage 具体解释：
+
+```text
+commit stage 0 -> group 0
+commit stage 1 -> group 1
+
+wait_group(1):
+  group 0 完成即可返回，可能仍有 1 个 group 未完成
+  因此 stage 0 的 O_smem 可以复用
+
+wait_group(0):
+  所有 TMA store 都已完成
+  因此 stage 1 的 O_smem 也可以复用
+```
+
+为什么 load 和 store 不同：
+
+| 路径 | 完成反馈 | 原因 |
+|---|---|---|
+| TMA load | `mbarrier.arrive.expect_tx` + tx bytes | load 把数据带入 shared memory，barrier 可直接跟踪传输完成 |
+| TMA store | `cp.async.bulk.commit_group` + `wait_group` | store 的完成反馈进入 bulk async group，不需要 tx-count consumer |
+| MMA | `tcgen05.commit` -> barrier | Tensor Core 完成事件由 commit 路径报告 |
+| 软件 arrive | 普通 `mbarrier.arrive` 或 named `bar.arrive` | 事件完全由线程代码决定 |
+
+因此，不能把 TMA store 硬套成：
+
+```text
+store -> arrive.expect_tx -> full.wait
+```
+
+这个方向没有 tx-count 语义，会产生错误的完成判断。
+
+### 七、named barrier 与 mbarrier 的区别
+
+FA4 中 statistics ready edge 使用硬件 named barrier：
+
+```text
+softmax: bar.arrive id, count
+WG2:     bar.sync   id, count
+```
+
+named barrier 的特点：
+
+| 项目 | named barrier | `mbarrier` |
+|---|---|---|
+| 状态保存位置 | hardware barrier slot | shared memory |
+| 初始化 | 使用 barrier id 与参与 count，不需要 shared memory init | 需要 init、phase 与 arrival count |
+| 非阻塞通知 | `bar.arrive` | `mbarrier.arrive` |
+| 阻塞等待并参与 | `bar.sync` | `mbarrier.try_wait` 等 |
+| FA4 用途 | softmax -> WG2 的 statistics handshake | TMA、TMEM、slot 完成的通用等待 |
+
+`bar.arrive` 不会等 WG2 读完 `sScale`，它只报告“softmax 已经写出本轮
+statistics”。真正阻止 softmax 下一轮覆盖 `sScale` 的是后续
+`softmax_corr.empty.wait`。
+
+### 八、一次完整的角色交接时间线
+
+把 `5.2` 的 register owner 和 `5.3` 的 barrier edge 合并，单轮 KV
+iteration 可以写成：
+
+```text
+WG3 load warp (48 regs):
+  wait kv_load.empty
+  TMA K/V -> SMEM
+  arrive kv_load.full(tx_count)
+
+WG3 MMA warp (48 regs):
+  wait kv_load.full
+  issue QK^T MMA and PV MMA
+  tcgen05.commit -> kv_load.empty
+  tcgen05.commit -> s_ready / o_ready
+
+WG0/WG1 softmax (200 regs):
+  wait s_ready
+  TMEM S -> RF
+  update row_max / row_sum
+  write acc_scale -> sScale
+  named bar.arrive
+  write P part 1 -> TMEM
+  arrive p_o_rescale
+  write P part 2 -> TMEM
+  arrive p_ready_2
+  wait softmax_corr.empty
+
+WG2 correction (64 regs):
+  named bar.sync
+  read acc_scale -> sScale
+  optional O TMEM -> RF -> rescale -> TMEM
+  arrive p_o_rescale
+  arrive softmax_corr.empty
+
+WG3 store warp (48 regs):
+  wait corr_epi.full
+  issue TMA store O_smem -> GMEM
+  commit_group
+  wait_group -> arrive corr_epi.empty
+```
+
+每一步的 owner 都不是由 buffer 名字猜测，而是由数据流决定：
+
+```text
+写入者 -> full/ready producer
+读取者 -> full/ready consumer 和 empty producer
+```
+
+### 九、phase 与 slot
+
+barrier 的 phase 只表示“这个 slot 的 barrier 完成了几次并翻转了多少次
+parity”，不是全局 iteration 计数。
+
+例如 KV pipeline 有 3 个 slots：
+
+```text
+iteration 0 -> stage 0, phase 0
+iteration 1 -> stage 1, phase 0
+iteration 2 -> stage 2, phase 0
+iteration 3 -> stage 0, phase 1
+iteration 4 -> stage 1, phase 1
+iteration 5 -> stage 2, phase 1
+```
+
+因此不能只维护一个 phase 变量给三个 stage 共用。每个 stage 都要有
+自己的 phase parity。FA4 通过 `kv_pipe.phase` 这类 pipe cursor 管理，
+Q pipeline 则用独立的 `q_epoch.phase`。
+
+同样，多个 slots 不会让 barrier 的 expected count 相乘。`p_o_rescale`
+的 256 是单个 slot、单个 phase 的完成条件；两个 slot 是两份独立状态，
+不会变成 512。
+
+### 十、常见错误与症状
+
+| 错误 | 会造成什么 | 症状 |
+|---|---|---|
+| `q_load.empty` 只 wait 不 commit | TMA 不知道 MMA 是否读完 Q | 覆盖正在读取的 Q SMEM |
+| `tcgen05.commit` 后再手动 `arrive` | barrier 多到一次 | phase 提前翻转，后续 wait 错位 |
+| 把 `p_o_rescale` 当成 128 arrivals | 少了一半完成条件 | PV part 1 或 O rescale 一直等待 |
+| `p_ready_2` 由 WG2 也 arrive | count 超出 128 | 提前放行或 barrier 状态混乱 |
+| 将 store 套用 `expect_tx` | store 没有对应 tx-count | store 完成无法报告，空等或覆盖 `O_smem` |
+| softmax 跳过 `softmax_corr.empty.wait` | 覆盖 WG2 还没读完的 `sScale` | rescale 使用错误统计量，结果间歇性错误 |
+| `cta_sync` 放进单个 WG 分支 | 其他 WG 到不了同一个同步点 | 整个 CTA 挂死 |
+| `setmaxnreg` 放进 warp-uniform 分支 | 同 WG 的四个 warp 不再 collective | 编译失败或运行时不同步 |
+
+### 十一、自测题与答案
+
+#### 1. 为什么 WG0/WG1 是 200 registers，WG2 是 64，WG3 是 48？请证明预算总和。
+
+答：WG0/WG1 各自要保存 128 个 fp32 scores，并保留 online softmax 和
+P packing 的临时量，因此各要 200。WG2 只做 correction/epilogue，WG3
+主要做 TMA/MMA issue，生命周期和 live values 都更短，所以分别降到
+64 和 48。预算为：
+
+```text
+128 * (200 + 200 + 64 + 48)
+= 128 * 512
+= 65,536
+```
+
+#### 2. 为什么 `setmaxnreg` 必须 warpgroup-uniform？
+
+答：它是 warpgroup-collective 的硬件操作，同一个 warpgroup 的四个 warps
+必须在同一控制流点以相同 predicate 和相同目标值执行。否则不同 warp
+对 register 文件形成不一致的视角，编译或运行时同步都会失败。
+
+#### 3. 为什么 `p_o_rescale` 的 count 是 256？
+
+答：每个 phase 由 128 个 softmax threads 和 128 个 WG2 threads 共同
+通知。前者表示 P 前半和 `acc_scale` 已就绪，后者表示 WG2 已决定是否
+rescale 并完成对应动作。两边都到齐后，PV part 1 和后续 O rescale
+才满足契约。
+
+#### 4. TMA load 和 TMA store 为什么使用不同的完成机制？
+
+答：TMA load 把字节带入 shared memory，barrier 可以用 `expect_tx`
+同时跟踪 arrival 和剩余传输字节；TMA store 从 shared memory 写回全局
+内存，完成反馈走 bulk async group，由 `commit_group` 与 `wait_group`
+管理。两者都等传输结束，但硬件提供给 load 和 store 的完成反馈通道不同。
+
+#### 5. 看到一个 barrier 名，如何判断谁 arrive、谁 wait？
+
+答：先判断它描述的是“数据已可读”还是“空间已可用”。名字为 `full` 或
+`ready` 时，producer arrive，consumer wait；名字为 `empty` 时，consumer
+arrive，producer wait。若事件来自 TMA 或 Tensor Core，则由对应的 tx
+或 commit 路径产生完成通知，而不是普通线程手动 arrive。
+
+#### 6. 如果 `wait_group(1)` 返回，能确定哪一组 TMA store 已完成？
+
+答：可以确定更早的那组已经完成，且最多还有 1 组未完成。对代码中按
+stage 顺序 commit 的情况，就是 stage 0 已完成，因此可以先归还
+stage 0 的 `O_smem`；之后再执行 `wait_group(0)`，等待全部 store 完成
+并归还 stage 1。
+
+## 十七、下一知识点
+
+下一步进入 `6. Q / K / V pipeline 时间线`。前面的数据路径、角色地图、
+register 契约和 barrier 契约已经分别成立，下一节把这些 edge 按时间
+排成完整流水：Q 双 buffer、K/V 三槽 ring、prologue、steady state、
+tail、barrier phase，以及每一轮中 TMA、QKᵀ、softmax、WG2、PV、
+store 的并行与依赖关系。
