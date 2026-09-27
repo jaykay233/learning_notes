@@ -34,6 +34,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、`work_id` / `init(bx)` / stride 148、M 优先与 N 优先的完整编号对照、`l2_group_size=8` 的 L2 locality、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
 | [19-gemm-warp-specialization.md](19-gemm-warp-specialization.md) | `chapter_gemm_advanced` Step 7 的 `hgemm_v7`、TMA producer / MMA consumer / writeback 三角色拆分、`tma2mma` / `mma2tma` 的 SMEM full-empty 协议、`mma2ld` / `ld2mma` 的 TMEM result-reuse 协议、named barrier、完整代码与 `PIPE_DEPTH=2` 交接 trace |
 | [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8-9 的 `hgemm_v8` / `hgemm_v9`、Two-CTA cooperative MMA、`cta_mask=3`、跨 CTA TMEM 复用、Multi-Consumer Warp Specialization、共享 staged B、`512 x 256` cluster tile、按 consumer 索引的 TMEM / barriers、`98304`-byte K-stage TMA transaction，以及完整 GPU 与静态验证代码 |
+| [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、`row_max` / `row_sum` / `O` online softmax 三状态、逐轮 rescale 公式、完整 CPU 数值验证代码，以及与 FA4 conditional rescaling 的衔接 |
 
 ## 当前进度
 
@@ -325,6 +326,19 @@ EPI_N=64 让每个 writeback warpgroup 用四轮写回 256 columns
 WG0 / WG1 分别使用 named barrier 10 / 11 隔离 Dsmem 生命周期
 chapter_gemm_advanced 第 9 步完成：Multi-Consumer Warp Specialization
 chapter_gemm_advanced 完成
+chapter_flash_attention 第 1 个知识点完成：Tile 分解与 online softmax 三状态
+标准 attention 的完整 S/P 为 [L, L]，fp32 下每个 head 占 4L^2 bytes
+FlashAttention 按 Q block 固定 query rows，流式读取 K/V blocks
+BLOCK_M 是 query rows，BLOCK_N 是 key/value positions
+当前 score tile S_block 的 shape 是 [BLOCK_M, BLOCK_N]
+row_max 是当前指数参考值，初始必须为 -inf
+row_sum 是已处理 positions 的指数和
+O 是已处理 positions 的指数加权 V
+新参考值 new_max = max(row_max, tile_max)
+参考值变化时 alpha = exp(row_max - new_max)
+row_sum 与 O 必须使用同一个 alpha 缩放到新尺度
+最终输出 O / row_sum
+完整 CPU 示例与标准 attention 的 max error 为 6.661338147750939e-16
 ```
 
 ## 下一知识点
@@ -344,7 +358,8 @@ chapter_tirx_layout_api 完成
 -> chapter_gemm_advanced 第 8 步第 4 个知识点完成：cooperative MMA 与 cta_mask=3 completion
 -> chapter_gemm_advanced 第 8 步第 5 个知识点完成：跨 CTA TMEM 复用
 -> chapter_gemm_advanced 第 9 步完成：Multi-Consumer Warp Specialization
--> chapter_flash_attention
+-> chapter_flash_attention 第 1 个知识点完成：Tile 分解与 online softmax 三状态
+-> chapter_flash_attention 第 2 个知识点：Conditional rescaling、delta 与 acc_scale
 ```
 
 ## 核心主线
@@ -381,5 +396,5 @@ TMEM lane / column 不匹配
 ```text
 WGMMA / tcgen05 matrix descriptor 字段与编码
 Two-CTA Cluster 的 cooperative MMA 与 remote barrier
-FlashAttention 的 tile 分解与 online softmax
+FlashAttention 的 conditional rescaling、S/P/O TMEM layout 与 warp pipeline
 ```
