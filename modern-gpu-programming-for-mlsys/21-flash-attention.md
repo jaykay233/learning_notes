@@ -8,12 +8,10 @@ persistent scheduling、warp specialization 和 two-CTA cooperative MMA
 QK^T MMA -> softmax -> PV MMA
 ```
 
-目前已经讲完五个知识点：不保存完整 score matrix，如何按 K/V block
-计算等价的 attention 输出；FA4 如何用 `delta`、阈值 8 和
-`acc_scale` 减少 TMEM 中 `O` 的重缩放次数；`S`、`P`、`O` 如何
-共享同一块 512-column TMEM allocation；以及 softmax 如何把 TMEM
-中的 `S` 读入 registers、按行计算，再把 fp16 `P` 写回 TMEM；最后
-是 `P` 与 `V` 如何分两段累加到 TMEM 中的 `O`。
+目前已经讲完 attention tile 分解、FA4 conditional rescaling、`S/P/O`
+的 TMEM layout、QKᵀ MMA、softmax 和 PV MMA 数据路径。接下来需要把
+这些数据路径映射到具体执行者：CTAs 中的哪些 warpgroups 和 warps
+负责 softmax、correction、TMA 与 MMA issue。
 
 ## 本次讲解位置
 
@@ -39,6 +37,9 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
     [x] 4.2 Softmax：S TMEM -> registers -> P TMEM
     [x] 4.3 PV MMA：P TMEM + V SMEM -> O TMEM
 [ ] 5. Warp 角色、register 分配与 barrier 分工
+    [x] 5.1 Warp 角色地图
+    [ ] 5.2 Register 分配与 setmaxnreg
+    [ ] 5.3 Barrier 分工与角色交接
 [ ] 6. Q / K / V pipeline 时间线
 [ ] 7. Correction、最终归一化与 epilogue
 [ ] 8. Causal mask、GQA、tile scheduling 与验证
@@ -3095,10 +3096,427 @@ PV MMA 之前。它不执行真实 `tcgen05.mma`；真实 kernel 需要 Blackwel
 完成后，通过 `tcgen05.commit` 报告，表示 O 已完成全部累积。
 `p_ready_2` 只表示当前 block 的剩余 P columns 已可用于第二段 MMA。
 
-## 十五、下一知识点
+## 十五、Warp 角色地图
 
-下一步进入 `5. Warp 角色、register 分配与 barrier 分工`：逐项说明
-WG0/WG1 的 softmax、WG2 的 correction/epilogue、WG3 的 TMA/MMA issue
-如何分工，为什么双 softmax stage 需要 `200` registers，以及
-`setmaxnreg`、named barrier 和 staged barriers 如何共同保证角色之间
-不互相覆盖数据。
+### 本次讲解位置
+
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：Warp 角色与 Scope
+知识点：5.1 CTA 内的 warpgroup/warp/thread 角色地图
+上次：PV MMA 数据路径
+下次：Register 分配与 setmaxnreg
+PTX：角色本身不是一条 PTX 指令；它决定 TMA、tcgen05.mma 与
+     mbarrier 操作分别由哪些 warp 发出
+```
+
+### 为什么现在讲这个
+
+前面的 QKᵀ MMA、softmax 和 PV MMA 已经回答了“数据从哪来、经过哪条
+路径、写回哪里”，但还没有回答“谁发出指令、谁执行计算、谁负责搬运”。
+如果只看到 `wg_id == 0`，很容易把 warpgroup 0 误认成 warp 0；如果
+不知道同一条 softmax 分支覆盖 128 个线程，就会给 barrier 设置错误的
+arrival count，或者把一个必须由整个 CTA 到达的 `cta_sync()` 放进单个
+warpgroup 分支，导致其他线程永远到不了同步点。
+
+本节先建立稳定的 thread 归属模型。它不深入 register 数量，也不展开每个
+barrier 的 wait/arrive 协议，只回答一个具体问题：
+
+```text
+对于 CTA 中任意一个 thread，
+怎样从它的 (wg_id, warp_id, lane_id)
+判断它属于哪个角色？
+```
+
+### 一、先建立层级：CTA -> warpgroup -> warp -> lane
+
+当前 non-causal FlashAttention kernel 的一个 CTA 有 512 个 threads：
+
+```text
+1 CTA
+  = 4 warpgroups
+  = 16 warps
+  = 512 threads
+```
+
+一个 warpgroup 包含 4 个 warps，每个 warp 有 32 个 lanes，所以：
+
+```text
+128 threads / warpgroup
+= 4 warps / warpgroup
+= 32 lanes / warp
+```
+
+`tid_in_wg` 是线程在所属 warpgroup 内的编号，范围为 `0..127`：
+
+```text
+tid_in_wg = warp_id * 32 + lane_id
+```
+
+CTA 内的全局 thread id 则是：
+
+```text
+tid = wg_id * 128 + warp_id * 32 + lane_id
+```
+
+反解公式为：
+
+```text
+wg_id   = tid // 128
+warp_id = (tid % 128) // 32
+lane_id = tid % 32
+```
+
+这里必须区分三个变量：
+
+| 名称 | 范围 | 含义 |
+|---|---:|---|
+| `wg_id` | `0..3` | 当前 thread 属于哪个 warpgroup |
+| `warp_id` | `0..3` | 当前 warp 在该 warpgroup 内的序号 |
+| `lane_id` | `0..31` | 当前 thread 在该 warp 内的 lane 序号 |
+
+因此“warp 0”并不唯一，必须同时说明 warpgroup。例如：
+
+```text
+(wg_id=0, warp_id=0) -> CTA 内第 0 个 warp
+(wg_id=3, warp_id=0) -> CTA 内第 12 个 warp
+```
+
+### 二、逻辑角色地图
+
+标准 non-causal 路径的角色分配如下：
+
+| 执行者 | 角色 | 负责的数据路径 |
+|---|---|---|
+| WG0 | softmax stage 0 | 读取 TMEM `S0`，写回 TMEM `P0` |
+| WG1 | softmax stage 1 | 读取 TMEM `S1`，写回 TMEM `P1` |
+| WG2 | correction / non-causal epilogue | 按需 rescale TMEM `O`，最终归一化并写 SMEM |
+| WG3, warp 0 | MMA issue | 发起 QKᵀ MMA 和 PV MMA |
+| WG3, warp 1 | TMA load | 将 Q、K、V 从 GMEM 搬到 SMEM |
+| WG3, warp 2 | TMA store | 将最终 O 从 SMEM 搬回 GMEM |
+| WG3, warp 3 | idle / 辅助 | 不承担当前路径的主要 issue 工作 |
+
+映射到 thread 范围：
+
+```text
+WG0: threads [0, 128)       -> softmax stage 0
+WG1: threads [128, 256)     -> softmax stage 1
+WG2: threads [256, 384)     -> correction / non-causal epilogue
+WG3: threads [384, 512)
+  warp 0: threads [384, 416) -> MMA issue
+  warp 1: threads [416, 448) -> TMA load
+  warp 2: threads [448, 480) -> TMA store
+  warp 3: threads [480, 512) -> idle / 辅助
+```
+
+这张图描述的是当前 non-causal 路径的执行分工，不等价于“这些线程亲自
+完成所有算术”。例如，WG3 warp 0 只负责提交 MMA；矩阵乘加由 Tensor
+Core 执行。TMA load/store warp 也只负责提交描述符和操作，搬运由 TMA
+engine 执行。
+
+### 三、TIRx 源码中的角色声明
+
+TIRx 用 `specialize(...).role(...)` 描述角色与 warp 的绑定：
+
+```python
+sp = txl.specialize(chain_dispatch=True)
+
+r_softmax = sp.role(
+    "softmax",
+    warps=[0, 1, 2, 3, 4, 5, 6, 7],
+    regs=softmax_regs,
+)
+r_correction = sp.role(
+    "correction",
+    warps=[8, 9, 10, 11],
+    regs=correction_regs,
+)
+wg3 = sp.warpgroup(
+    "wg3",
+    warps=range(12, 16),
+    regs=other_regs,
+)
+r_mma = sp.role(
+    "mma",
+    warps=[12],
+    group=wg3,
+)
+r_load = sp.role(
+    "load",
+    warps=[13],
+    group=wg3,
+)
+r_store = sp.role(
+    "store",
+    warps=[14],
+    group=wg3,
+)
+r_idle = sp.role(
+    "idle",
+    warps=[15],
+    group=wg3,
+)
+```
+
+源码里的 `softmax` role 覆盖 warps `0..7`，也就是 WG0 和 WG1 两个
+warpgroups。kernel 再用 `wg_id` 选择 Q stage：
+
+```python
+wg_id = T.warpgroup_id([4])
+warp_id = T.warp_id_in_wg([4])
+```
+
+因此：
+
+```text
+wg_id == 0, warp_id == 0..3 -> softmax stage 0
+wg_id == 1, warp_id == 0..3 -> softmax stage 1
+wg_id == 2, warp_id == 0..3 -> correction / epilogue
+wg_id == 3, warp_id == 0    -> MMA
+wg_id == 3, warp_id == 1    -> TMA load
+wg_id == 3, warp_id == 2    -> TMA store
+wg_id == 3, warp_id == 3    -> idle / 辅助
+```
+
+`warp_id` 是 warpgroup 内的 warp 序号，不是全局 warp 序号。源码写
+`warps=[12]`，对应的是全局第 12 个 warp，也就是 WG3 内
+`warp_id == 0`。
+
+### 四、完整可运行的角色映射脚本
+
+下面的脚本完整枚举 512 个 threads，并验证上面的 thread 范围。文件名：
+`flash_attention_warp_role_map.py`
+
+```python
+from __future__ import annotations
+
+from collections import defaultdict
+
+
+WG_THREADS = 128
+WARP_THREADS = 32
+WG_COUNT = 4
+
+
+def classify(wg_id: int, warp_id: int) -> str:
+    if wg_id == 0:
+        return "softmax stage 0 (WG0)"
+    if wg_id == 1:
+        return "softmax stage 1 (WG1)"
+    if wg_id == 2:
+        return "correction / non-causal epilogue (WG2)"
+
+    if wg_id == 3 and warp_id == 0:
+        return "MMA issue (WG3 warp 0)"
+    if wg_id == 3 and warp_id == 1:
+        return "TMA load (WG3 warp 1)"
+    if wg_id == 3 and warp_id == 2:
+        return "TMA store (WG3 warp 2)"
+    if wg_id == 3 and warp_id == 3:
+        return "idle / helper (WG3 warp 3)"
+
+    raise AssertionError((wg_id, warp_id))
+
+
+def main() -> None:
+    ranges: dict[str, list[int]] = defaultdict(list)
+
+    for tid in range(WG_COUNT * WG_THREADS):
+        wg_id = tid // WG_THREADS
+        tid_in_wg = tid % WG_THREADS
+        warp_id = tid_in_wg // WARP_THREADS
+        lane_id = tid_in_wg % WARP_THREADS
+
+        assert tid == wg_id * WG_THREADS + warp_id * WARP_THREADS + lane_id
+        ranges[classify(wg_id, warp_id)].append(tid)
+
+    expected = {
+        "softmax stage 0 (WG0)": (0, 128),
+        "softmax stage 1 (WG1)": (128, 256),
+        "correction / non-causal epilogue (WG2)": (256, 384),
+        "MMA issue (WG3 warp 0)": (384, 416),
+        "TMA load (WG3 warp 1)": (416, 448),
+        "TMA store (WG3 warp 2)": (448, 480),
+        "idle / helper (WG3 warp 3)": (480, 512),
+    }
+
+    print("CTA role map")
+    for role, threads in ranges.items():
+        actual = (threads[0], threads[-1] + 1)
+        assert actual == expected[role], (role, actual)
+        print(f"{role:42s}: threads [{actual[0]:3d}, {actual[1]:3d})")
+
+    examples = [129, 300, 430]
+    print()
+    print("example decoding")
+    for tid in examples:
+        wg_id = tid // WG_THREADS
+        tid_in_wg = tid % WG_THREADS
+        warp_id = tid_in_wg // WARP_THREADS
+        lane_id = tid_in_wg % WARP_THREADS
+        print(
+            f"tid={tid}: wg_id={wg_id}, warp_id={warp_id}, "
+            f"lane_id={lane_id}, role={classify(wg_id, warp_id)}"
+        )
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python3 flash_attention_warp_role_map.py
+```
+
+预期输出：
+
+```text
+CTA role map
+softmax stage 0 (WG0)                     : threads [  0, 128)
+softmax stage 1 (WG1)                     : threads [128, 256)
+correction / non-causal epilogue (WG2)    : threads [256, 384)
+MMA issue (WG3 warp 0)                    : threads [384, 416)
+TMA load (WG3 warp 1)                     : threads [416, 448)
+TMA store (WG3 warp 2)                    : threads [448, 480)
+idle / helper (WG3 warp 3)                : threads [480, 512)
+
+example decoding
+tid=129: wg_id=1, warp_id=0, lane_id=1, role=softmax stage 1 (WG1)
+tid=300: wg_id=2, warp_id=1, lane_id=12, role=correction / non-causal epilogue (WG2)
+tid=430: wg_id=3, warp_id=1, lane_id=14, role=TMA load (WG3 warp 1)
+```
+
+### 五、具体解码：`tid=430` 为什么属于 TMA load
+
+逐步计算：
+
+```text
+tid = 430
+
+wg_id
+  = 430 // 128
+  = 3
+
+tid_in_wg
+  = 430 % 128
+  = 46
+
+warp_id
+  = 46 // 32
+  = 1
+
+lane_id
+  = 46 % 32
+  = 14
+```
+
+所以：
+
+```text
+(wg_id, warp_id, lane_id) = (3, 1, 14)
+```
+
+该线程位于 WG3 的 warp 1，因此属于 TMA load warp。它不会执行 softmax
+的 128-thread collective；它所在的 warp 在满足 elected-lane 条件后提交
+TMA load。
+
+再比较 `tid=129`：
+
+```text
+wg_id   = 129 // 128 = 1
+tid_in_wg = 129 % 128 = 1
+warp_id = 1 // 32 = 0
+lane_id = 1 % 32 = 1
+```
+
+所以它属于：
+
+```text
+WG1 -> softmax stage 1
+```
+
+这两个例子说明：`wg_id` 决定大角色块，`warp_id` 在 WG3 内继续细分
+MMA、TMA load、TMA store 和 idle。
+
+### 六、角色范围与 per-thread 数据视图
+
+角色不仅决定控制流，也决定该线程看到的索引语义：
+
+| 角色 | 常用的本地索引 | 原因 |
+|---|---|---|
+| WG0/WG1 softmax | `tid_in_wg` | softmax 按 128-thread warpgroup 分行 |
+| WG2 correction | `tid_in_wg` 或行块索引 | correction 以 warpgroup 范围处理 O |
+| WG3 load | `elect_sync()` | 一个 warp 只需要一个 lane 提交 TMA |
+| WG3 MMA | `elect_sync()` | `tcgen05.mma` 是 single-thread issue |
+| WG3 store | `elect_sync()` | TMA store 也只由一个 elected lane 提交 |
+
+这一点会直接影响 buffer indexing。例如 softmax 中按行定位时，应该使用
+warpgroup 内的 `tid_in_wg`，而不是 CTA 全局 `tid`，否则 WG1 会把
+线程映射到错误的 128 行范围内。
+
+### 七、常见错误与可观察症状
+
+| 错误 | 为什么错 | 可观察症状 |
+|---|---|---|
+| 把 `wg_id == 0` 当成“warp 0” | warp 0 在每个 warpgroup 中都存在 | 角色分支覆盖 128 个线程，功能范围错误 |
+| 用全局 `tid` 直接代替 `tid_in_wg` | softmax 的本地行范围应为 `0..127` | WG1 访问越界或读写错误 row |
+| 认为 512 个线程都执行 softmax | 只有 WG0/WG1 负责 softmax | register 预算和 barrier arrival 全部估算错误 |
+| 把 WG0 和 WG1 当成同一个 stage | 它们分别服务 Q stage 0 和 stage 1 | S/P/O slot 混用，出现跨 stage 数据污染 |
+| 只用 `warp_id` 区分 WG3 角色 | WG0 的 warp 0 与 WG3 的 warp 0 不同 | MMA、TMA、softmax 分支互相串线 |
+| 把 TMA/MMA issue 写成整个 warp 都提交 | 多数硬件指令由 elected lane 提交 | 重复提交、barrier 多到达或结果不确定 |
+| 在单个 warpgroup 分支里调用 CTA-wide `cta_sync()` | 其他 warpgroup 到不了同一个同步点 | kernel 挂死，等待永远不结束 |
+
+### 八、自测题与答案
+
+#### 1. CTA 内有 512 个 threads，如何快速算出 `wg_id`、`warp_id`、`lane_id`？
+
+答：
+
+```text
+wg_id   = tid // 128
+warp_id = (tid % 128) // 32
+lane_id = tid % 32
+```
+
+例如 `tid=430` 得到 `(wg_id, warp_id, lane_id) = (3, 1, 14)`。
+
+#### 2. WG1 内的 `warp_id=2, lane_id=7`，它的 CTA 全局 `tid` 是多少？
+
+答：
+
+```text
+tid = 1 * 128 + 2 * 32 + 7
+    = 128 + 64 + 7
+    = 199
+```
+
+它属于 WG1 的 softmax stage 1。
+
+#### 3. 为什么 TIRx 角色声明中的 `warps=[12]` 对应 WG3 的 `warp_id=0`？
+
+答：全局 warp 12 是第 `12 // 4 = 3` 个 warpgroup，即 WG3；其
+warpgroup 内序号为 `12 % 4 = 0`。因此源码写 `warps=[12]`，执行时
+对应 `wg_id == 3 and warp_id == 0`。
+
+#### 4. WG3 warp 0 与 WG0 warp 0 都能写成“warp 0”，为什么不能只看 `warp_id`？
+
+答：`warp_id` 只在所属 warpgroup 内唯一。WG0 warp 0 负责 softmax
+stage 0，WG3 warp 0 负责 MMA issue；它们的 CTA 线程范围分别是
+`[0, 32)` 和 `[384, 416)`。必须同时检查 `wg_id`。
+
+#### 5. 如果 softmax 行索引错误地使用全局 `tid`，最先会出现什么现象？
+
+答：WG0 在 `tid=0..127` 时可能看起来正确，但 WG1 的 `tid=128..255`
+会超出预期的本地行范围。常见结果是越界、写错 SMEM/TMEM row，或者
+两个 softmax stage 互相覆盖彼此的数据；错误通常从第二个 Q stage 开始
+出现。
+
+## 十六、下一知识点
+
+下一步进入 `5.2 Register 分配与 setmaxnreg`：解释为什么 WG0/WG1
+需要更多 registers，WG2 和 WG3 为什么可以释放 registers，以及
+`setmaxnreg` 如何让四个 warpgroups 共享同一个 65,536-register CTA
+budget。
