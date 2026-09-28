@@ -6672,6 +6672,130 @@ O_h = softmax(S_h) @ V_g
 TMA 4D box 把自然布局中的 `(sequence, query head)` 子块装进一个
 128-row SMEM tile。这避免了重复搬运和一次额外的重排。
 
+### 四之补充：为什么 GQA 参数不会比 MHA 更多
+
+看到 packed Q tile 中有 `GQA_RATIO` 个 query heads，容易误以为 GQA
+新增了多份 query head，因此参数比 MHA 多。实际并不是这样：
+
+```text
+GQA packing 只是改变 kernel 如何组织已有的 query heads，
+并不会凭空增加模型中的 Q heads 或参数。
+```
+
+比较时必须固定相同的 `num_qo_heads`。例如：
+
+```text
+d_model = 4096
+head_dim = 128
+num_qo_heads = 32
+```
+
+MHA 配置：
+
+```text
+num_qo_heads = 32
+num_kv_heads = 32
+
+Q: 32 heads
+K: 32 heads
+V: 32 heads
+O: 32 heads
+```
+
+GQA 配置：
+
+```text
+num_qo_heads = 32
+num_kv_heads = 8
+GQA_RATIO = 32 / 8 = 4
+
+Q: 32 heads
+K:  8 heads
+V:  8 heads
+O: 32 heads
+```
+
+两者有相同的 Q 和 O，真正的区别只有 K/V：
+
+```text
+K/V heads: 32 -> 8
+减少比例: 1 - 8 / 32 = 75%
+```
+
+如果把每个 projection 的核心参数规模记作：
+
+```text
+Q 参数: Hq  * Dh * d_model
+K 参数: Hkv * Dh * d_model
+V 参数: Hkv * Dh * d_model
+O 参数: Hq  * Dh * d_model
+```
+
+则在 `Hq=32, Hkv=8` 时，GQA 相比 MHA：
+
+```text
+Q projection 参数: 不变
+O projection 参数: 不变
+K projection 参数: 减少 75%
+V projection 参数: 减少 75%
+```
+
+KV cache 的差别同样来自 K/V heads：
+
+```text
+MHA: 2 * Hq  * Dh * bytes_per_element
+GQA: 2 * Hkv * Dh * bytes_per_element
+```
+
+使用 fp16 和 `Dh=128` 时：
+
+```text
+MHA: 2 * 32 * 128 * 2 = 16,384 bytes/token
+GQA: 2 *  8 * 128 * 2 =  4,096 bytes/token
+```
+
+GQA 的 KV cache 只有 MHA 的 25%。
+
+为什么 pack 后看起来一次处理了更多 Q heads？因为这些 Q heads 本来
+就在模型中，只是原本由不同的 CTA 分别处理；GQA kernel 把它们放进
+同一个 CTA，使它们复用同一份 K/V tile：
+
+```text
+MHA:
+  一个 CTA 处理 1 个 query head
+  Q tile = [128 sequences, D]
+
+GQA ratio=4:
+  一个 CTA 处理 4 个 query heads
+  Q tile = [32 sequences, 4 query heads, D]
+  flatten = [128, D]
+```
+
+这不是额外加载四倍 Q。对于同一组 Q heads，总 Q 工作量没有增加；
+变化的是任务的打包方式和 K/V 的复用方式。三者可对比如下：
+
+| 模式 | Q heads | K/V heads | GQA ratio | KV cache |
+|---|---:|---:|---:|---:|
+| MHA | 32 | 32 | 1 | 100% |
+| GQA | 32 | 8 | 4 | 25% |
+| MQA | 32 | 1 | 32 | 3.125% |
+
+还需要区分误差容易混淆的三类指标：
+
+| 指标 | GQA 相对同 `Hq` 的 MHA |
+|---|---|
+| K/V projection 参数 | 更少 |
+| KV cache 容量与读取流量 | 更少 |
+| QKᵀ 与 PV 的主要矩阵计算量 | 通常相近，主要由 `Hq` 决定 |
+
+所以正确的结论是：
+
+```text
+GQA 减少的是 K/V heads，
+不是减少 Q heads，
+也不是增加 Q heads。
+```
+
 ### 五、Q load：4D view 与 TMA 坐标
 
 源码中的自然输入布局可以理解为：
