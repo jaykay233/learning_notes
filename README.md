@@ -8,7 +8,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
-| [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、WGMMA 与 Blackwell TMEM |
+| [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、Blackwell TMEM，以及 CUDA kernel launch 机制 |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
@@ -59,7 +59,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 20-gemm-two-cta-cluster.md
 ├── 21-flash-attention.md
 ├── 22-roofline-and-course-completion.md
-└── 23-benchmarking-timing-boundary.md
+├── 23-benchmarking-timing-boundary.md
+└── 24-kernel-launch-pdl-and-dynamic-parallelism.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -182,6 +183,7 @@ models/
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
 | GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
+| CUDA kernel launch / PDL / Dynamic Parallelism | [24-kernel-launch-pdl-and-dynamic-parallelism.md](modern-gpu-programming-for-mlsys/24-kernel-launch-pdl-and-dynamic-parallelism.md) |
 | LLM 量化 / W4A8KV4 / QoQ / KV4 / SmoothAttention | [quantization/01-qoq-w4a8kv4.md](quantization/01-qoq-w4a8kv4.md) |
 | torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
@@ -210,7 +212,7 @@ models/
 ## Modern GPU Programming for MLSys
 
 围绕 GPU 数据布局、Tensor Core 数据路径、推理 kernel 与性能模型展开。
-当前已落盘 01-22，教材正文 Parts I-IV 主线已收束：
+当前已落盘 01-24，教材正文 Parts I-IV 主线已收束：
 
 ```text
 layout / named axes / replication / offset
@@ -386,6 +388,10 @@ memory-bound 优先减少 HBM bytes，compute-bound 优先减少 Tensor Core 等
 教材正文 Parts I-IV 收束，appendix 转为按需查阅资料
 appendix/benchmarking_gpu_kernels 第 1 个知识点：定义计时边界
 完整边界对比脚本：modern-gpu-programming-for-mlsys/code/benchmark_timing_boundary.py
+CPU 算子分发、host launch、GPU dispatch 与 kernel execution 的边界
+PDL 的依赖启动、早启动与 programmatic completion 等待契约
+Dynamic Parallelism 的 device-side child launch 与同步边界
+PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 ```
 
 完整文档索引、当前进度和硬件环境说明见
