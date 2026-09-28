@@ -7965,18 +7965,148 @@ self.linear_idx = self._total_tasks
 launch/teardown 复用，但让前面算出的 LPT launch order 能够直接决定
 GPU 的 CTA 发射顺序，配合 causal workload 的阶梯形状。
 
-### 九、常见错误与可观察症状
+### 九、术语澄清：q、m_block_idx 与 linear_idx
+
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：Tile scheduling
+知识点：q、m_block_idx 与 linear_idx 的语义边界
+上次：Causal LPT tile scheduling 与 L2 swizzle
+下次：Reference 与容差验证
+PTX/SASS：无专用指令；只解释 scheduler 坐标
+```
+
+#### 为什么现在讲这个
+
+LPT 的反向映射容易和序列语义混在一起。若把 `m_block_idx` 当成单个
+token 的序号，或者把 `linear_idx` 当成序列位置，就会误以为代码改变了
+causal attention 的数学定义。实际上，调度器只改变“先处理哪个语义
+坐标”，没有改变 Q、K、V 的坐标、可见范围或 mask 规则。
+
+先区分四个编号：
+
+| 名称 | 所在层次 | 含义 |
+|---|---|---|
+| `q` | token / row | 一个 query 在序列中的位置 |
+| `m_block_idx` | Q tile | 一段连续 q rows 的编号 |
+| `m_block_raw` | LPT launch | group 内尚未反转的 m block 顺序 |
+| `linear_idx` | task launch | 调度器发出的第几个 task |
+
+例如按字符方式切 token，序列为：
+
+```text
+北京天安门广
+q=0 -> 北
+q=1 -> 京
+q=2 -> 天
+q=3 -> 安
+q=4 -> 门
+q=5 -> 广
+```
+
+这里 `q` 才是 token 位置。假设一个 `m_block` 包含两个 q rows：
+
+```text
+Q_PER_M_BLOCK = 2
+
+m_block_idx=0 -> q=0,1 -> 北, 京
+m_block_idx=1 -> q=2,3 -> 天, 安
+m_block_idx=2 -> q=4,5 -> 门, 广
+```
+
+因此 `m_block_idx=1` 不是“京”这个 token，而是包含 `q=2,3` 的第二个
+Q block。实际模型通常不会按单字切 token，而且一个 block 通常覆盖
+128 或 256 个 q positions；这里的两个字只是用来展示坐标层次。
+
+对于 causal attention，`m_block_idx=0` 中的 query rows 只能看到序列
+开头的少量 K/V，`m_block_idx=2` 中的 query rows 能看到更长前缀：
+
+```text
+m_block_idx=0:
+  q=0 能看到 北
+  q=1 能看到 北, 京
+  整个 block 的可见 K/V 上界是序列位置 1
+
+m_block_idx=1:
+  q=2 能看到 北, 京, 天
+  q=3 能看到 北, 京, 天, 安
+  整个 block 的可见 K/V 上界是序列位置 3
+
+m_block_idx=2:
+  q=4,5 能看到更长的前缀
+  整个 block 的可见 K/V 上界是序列位置 5
+```
+
+因此 `m_block_idx` 越大，block 中的 query rows 越靠后，需要覆盖的
+K/V blocks 越多，task 越重。
+
+实际 kernel 的坐标换算可以写成：
+
+```text
+q_start = m_block_idx * Q_PER_M_BLOCK
+q_end_exclusive = min(
+    (m_block_idx + 1) * Q_PER_M_BLOCK,
+    SEQ_LEN_Q,
+)
+```
+
+而 LPT 的反转只发生在 task launch 层：
+
+```python
+m_block_idx = (num_m_blocks - 1) - m_block_raw
+```
+
+它不是改变序列编号，而是让：
+
+```text
+m_block_raw=0 -> 实际执行序列最末尾的 m_block_idx=num_m_blocks-1
+m_block_raw=1 -> 实际执行倒数第二个 block
+...
+m_block_raw=num_m_blocks-1 -> 实际执行序列开头的 block 0
+```
+
+完整调度层次可以压缩成：
+
+```text
+先划分 L2 group
+-> group 内按 m_block_raw 从小到大发射
+-> 每个 raw 阶段覆盖该 group 的所有 batch/head
+-> 通过 M - 1 - raw 映射成实际 m_block_idx
+-> 最终表现为重 block 在前、轻 block 在后
+```
+
+#### 自测
+
+1. `q` 和 `m_block_idx` 有什么区别？
+
+答：`q` 是单个 query token 的序列位置；`m_block_idx` 是连续 Q rows
+组成的 block 编号。
+
+2. 若 `q=0` 是“北”，`m_block_idx=1` 是否一定对应“京”？
+
+答：不一定。只有在 `Q_PER_M_BLOCK=1` 时才可能一一对应。通常一个
+`m_block_idx` 包含很多个 `q`。
+
+3. 为什么最后要使用 `M - 1 - m_block_raw`？
+
+答：causal attention 中序列尾部 block 更重。用 `M - 1` 减去 raw
+编号，可以让 raw 最小的第一个任务对应最大的 `m_block_idx`，从而先发
+重任务。
+
+### 十、常见错误与可观察症状
 
 | 错误 | 原因 | 可观察症状 |
 |---|---|---|
 | 认为 causal 也使用 persistent CTA | 忽略 `num_ctas=None` 的默认行为 | 把 `next_tile` 的 stride 解释成跨 task，性能模型错误 |
 | 按 `BLK_M` 而不是 `SEQ_Q_PER_TILE` 计算 m_blocks | 忘记 GQA packing | block 数偏小，GQA 下任务覆盖残缺 |
 | 把 `m_block` 当做单块 Q tile | 忘记 `SMEM_PIPE_DEPTH_Q` | causal cost 少乘 2，调度顺序推导错误 |
+| 把 `m_block_idx` 当成单个 token 的序号 | 混淆 Q block 与 Q row | 把 `m_block_idx=1` 错认为只覆盖第二个 token |
 | 说 LPT 动态测量每个 task 的耗时 | 把静态反序当成运行期调度 | 误以为 scheduler 需要额外 profiling 或 atomic queue |
 | 把 L2 swizzle 和 SMEM swizzle 混为一谈 | 两者都含 swizzle | 错误地在 TMA descriptor 或 XOR 计算中找 L2 地址 |
 | 最后 partial group 使用错误的 divisor | `num_hb % l2_swizzle != 0` | 最后一个 group 的 head index 越界或重复 |
 
-### 十、自测题与答案
+### 十一、自测题与答案
 
 #### 1. 已知 `m_block=2`、`SEQ_Q_PER_TILE=128`、`SMEM_PIPE_DEPTH_Q=2`、`SEQ_LEN_Q=SEQ_LEN_KV=1024`、`BLK_N=128`，求最大 K/V block 数。
 
