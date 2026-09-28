@@ -36,6 +36,7 @@ pipeline、TMA 异步搬运和 Roofline 性能分析展开的内容，重点关�
 | [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8-9 的 `hgemm_v8` / `hgemm_v9`、Two-CTA cooperative MMA、`cta_mask=3`、跨 CTA TMEM 复用、Multi-Consumer Warp Specialization、共享 staged B、`512 x 256` cluster tile、按 consumer 索引的 TMEM / barriers、`98304`-byte K-stage TMA transaction，以及完整 GPU 与静态验证代码 |
 | [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、online softmax、conditional rescaling、`S` / `P` / `O` TMEM 复用、causal mask、GQA packed rows、causal LPT scheduling、L2 swizzle、FP64 reference、`rtol` / `atol` 容差验证、完整数值与调度验证脚本 |
 | [22-roofline-and-course-completion.md](22-roofline-and-course-completion.md) | `chapter_performance` 的 arithmetic intensity、B200 ridge point、GEMM / materialized attention / Flash prefill / decode 的瓶颈分类、完整 Roofline 脚本，以及教材正文 Parts I-IV 的课程收束 |
+| [23-benchmarking-timing-boundary.md](23-benchmarking-timing-boundary.md) | `appendix/benchmarking_gpu_kernels` 的计时边界、CUDA event 与 synchronized host timer 的差异、完整边界对比脚本和 dry-run 验证 |
 
 ## 当前进度
 
@@ -402,6 +403,12 @@ memory-bound 优先减少 byte，compute-bound 优先减少 Tensor Core 等待
 完整可运行脚本 modern-gpu-programming-for-mlsys/code/roofline_capstone.py
 chapter_performance 完成
 教材正文 Parts I-IV 主线收束完成
+appendix/benchmarking_gpu_kernels 第 1 个知识点完成：Define the Timing Boundary
+CUDA event 测 GPU-stream interval，synchronized host timer 测单次调用端到端延迟
+event 区间包含期间的所有 stream work 与 idle gap，不等于 kernel duration 之和
+GEMM-only、GEMM+ReLU event 和 GEMM+ReLU host call 是三种不同边界
+FLOP 分子必须和计时分母描述同一个 operation
+完整边界对比脚本 modern-gpu-programming-for-mlsys/code/benchmark_timing_boundary.py
 ```
 
 ## 下一知识点
@@ -435,7 +442,8 @@ chapter_tirx_layout_api 完成
 -> chapter_flash_attention 完成
 -> chapter_performance 完成：Roofline 与瓶颈分类
 -> 教材正文 Parts I-IV 收束
--> appendix 转为按需查阅资料
+-> appendix/benchmarking_gpu_kernels 第 1 个知识点完成：Define the Timing Boundary
+-> appendix/benchmarking_gpu_kernels 下一知识点：warm-up、repeat、rounds 与样本稳定性
 ```
 
 ## 核心主线

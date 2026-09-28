@@ -58,7 +58,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 19-gemm-warp-specialization.md
 ├── 20-gemm-two-cta-cluster.md
 ├── 21-flash-attention.md
-└── 22-roofline-and-course-completion.md
+├── 22-roofline-and-course-completion.md
+└── 23-benchmarking-timing-boundary.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -383,6 +384,8 @@ prefill 通常 compute-bound，单 token decode 通常 memory-bound
 memory-bound 优先减少 HBM bytes，compute-bound 优先减少 Tensor Core 等待
 完整可运行脚本：modern-gpu-programming-for-mlsys/code/roofline_capstone.py
 教材正文 Parts I-IV 收束，appendix 转为按需查阅资料
+appendix/benchmarking_gpu_kernels 第 1 个知识点：定义计时边界
+完整边界对比脚本：modern-gpu-programming-for-mlsys/code/benchmark_timing_boundary.py
 ```
 
 完整文档索引、当前进度和硬件环境说明见
