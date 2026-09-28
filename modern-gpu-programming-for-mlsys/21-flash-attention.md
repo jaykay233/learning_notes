@@ -54,7 +54,7 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
 [ ] 8. Causal mask、GQA、tile scheduling 与验证
     [x] 8.1 Causal mask：block 跳过与块内列屏蔽
     [x] 8.2 GQA packed Q rows 与 K/V 复用
-    [ ] 8.3 Causal LPT tile scheduling
+    [x] 8.3 Causal LPT tile scheduling 与 L2 swizzle
     [ ] 8.4 Reference 与容差验证
 ```
 
@@ -6672,6 +6672,23 @@ O_h = softmax(S_h) @ V_g
 TMA 4D box 把自然布局中的 `(sequence, query head)` 子块装进一个
 128-row SMEM tile。这避免了重复搬运和一次额外的重排。
 
+### 四之再补充：packed 计算为什么基本等同于 MHA
+
+GQA 的 packed Q rows 只是把共享同一个 K/V 的多个 query heads
+组织到同一个 MMA operand 中。逐 query head 看，公式仍然是：
+
+```text
+h = kv_head_idx * GQA_RATIO + head_offset
+g = kv_head_idx
+
+S_h = Q_h @ K_g^T
+O_h = softmax(S_h) @ V_g
+```
+
+因此数学形式基本等同于 MHA：每个 query head 仍独立产生 scores、
+softmax 和 output；区别只是多个 query heads 共享 `K_g/V_g`。
+packing 不改变逐 head 的 attention 公式，也不增加 Q heads 或参数。
+
 ### 四之补充：为什么 GQA 参数不会比 MHA 更多
 
 看到 packed Q tile 中有 `GQA_RATIO` 个 query heads，容易误以为 GQA
@@ -7285,9 +7302,713 @@ row 127 -> sequence 31, qo_head 15
 答：不需要。causal 边界只由 sequence position 决定，同一个 sequence
 的多个 query heads 对当前 K/V tile 拥有相同的可见 key 范围。
 
-## 二十一、下一知识点
+## 二十一、Causal LPT scheduling 与 L2 swizzle
 
-下一步进入 `8.3 Causal LPT tile scheduling`：解释 causal tasks 为什么
-会造成明显的 tail imbalance，LPT scheduler 如何先处理更靠后的 Q
-blocks，`l2_swizzle` 如何组织 `(batch, kv_head)` 使同一组 K/V 在
-L2 中更容易复用，以及非 persistent causal path 如何与 task loop 衔接。
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：Tile scheduling
+知识点：Causal LPT scheduling 与 L2 swizzle
+上次：GQA packed Q rows 与 K/V tile 复用
+下次：Reference 与容差验证
+PTX/SASS：无专用指令；对应 scheduler 的 task-index 到
+         `(batch, kv_head, m_block)` 映射
+```
+
+### 为什么现在讲这个
+
+上一节说明了 GQA 如何把一个 `(batch, kv_head)` 任务打包成多组 Q
+rows。它还没有回答一个会直接决定 GPU 利用率的问题：
+
+```text
+这 32 个 attention tasks 应该按什么顺序送进 GPU？
+```
+
+Non-causal attention 中，每个 Q block 都要遍历全部 K/V blocks，所以
+不同 task 的成本基本相同。Causal attention 不是这样：靠前的 Q block
+只能看到很少的 K/V，靠后的 Q block 能看到几乎全部 K/V。若仍按普通
+顺序启动 tasks，前期可能有很多短任务，尾部却只剩少量长任务，形成
+明显的 `tail imbalance`。
+
+这一节解释三件事：
+
+```text
+1. 为什么 causal task 的成本是递减的阶梯
+2. LPT scheduler 为什么把 m_block 从大到小输出
+3. l2_swizzle 为什么在这个顺序上再按 batch/KV-head 分组
+```
+
+重点是“任务发射顺序”，不是改变 attention 数学计算。K/V loop 中每个
+task 仍执行相同的 QKᵀ、softmax 和 PV MMA 数据路径；改变的是
+`linear task index -> (batch, kv_head, m_block)` 的静态映射。
+
+### 一、心智模型：先做大石头，再填小石子
+
+LPT 是 Longest Processing Time first 的缩写。它的直觉是：
+
+```text
+先把耗时最长的工作交给能够工作的 worker，
+再用耗时较短的工作填补空闲时间，
+这样最后一个大工作在尾部没有机会形成长空档。
+```
+
+这里的 worker 可以理解为 GPU 上能够执行 attention task 的
+SM/CTA residency。Scheduler 不会在 kernel 内动态测量每条 task 的
+执行时间，而是利用 causal attention 的结构先验：
+
+```text
+m_block 越大，可见 K/V blocks 越多，task 越重。
+```
+
+因此只反转 `m_block` 顺序，就得到一个近似按成本降序排列的 launch
+order。这个设计不需要 atomic work queue，也不需要运行期计数。
+
+### 二、任务、成本与边界
+
+一个 attention task 定义为：
+
+```text
+(batch_idx, kv_head_idx, m_block_idx)
+```
+
+`m_block` 不是一个 MMA tile，而是 scheduler 的一格工作单位。它包含
+`SMEM_PIPE_DEPTH_Q` 个 Q stages。对于 `GQA_RATIO=1`：
+
+```text
+SEQ_Q_PER_TILE = BLK_M = 128
+SMEM_PIPE_DEPTH_Q = 2
+一个 m_block 覆盖 128 * 2 = 256 个 Q positions
+```
+
+对于 causal attention，当前 task 最多可见的 K/V block 数量是：
+
+```python
+m_idx_max = (m_block_idx + 1) * SEQ_Q_PER_TILE * SMEM_PIPE_DEPTH_Q
+n_idx = m_idx_max + SEQ_LEN_KV - SEQ_LEN_Q
+n_block_max = min(num_kv_blocks, ceildiv(n_idx, BLK_N))
+```
+
+`SEQ_LEN_KV - SEQ_LEN_Q` 是 Q/KV 右对齐时的位置修正。若 Q 与 KV
+长度相同，这一项为 0。这里的 `n_block_max` 是 exclusive upper bound：
+
+```text
+task 实际访问的 K/V blocks 是
+[n_block_min_causal, n_block_max)
+```
+
+因此调度成本可以近似写成：
+
+```text
+cost(m_block) = n_block_max(m_block) - n_block_min_causal(m_block)
+```
+
+在常见 `SEQ_LEN_Q == SEQ_LEN_KV`、且最后一块没有额外裁剪的配置中，
+`n_block_min_causal == 0`，所以：
+
+```text
+cost(m_block) = n_block_max(m_block)
+```
+
+### 三、当前代码如何展开 task index
+
+关键源码可以概括为：
+
+```python
+num_hb = num_batches * num_heads
+l2_major = l2_swizzle * num_m_blocks
+num_hb_quotient = num_hb // l2_swizzle
+
+bidhb = linear_idx // l2_major
+l2_mod = linear_idx % l2_major
+
+num_hb_remainder = max(num_hb % l2_swizzle, 1)
+
+m_block_raw = (
+    l2_mod // l2_swizzle
+    if bidhb < num_hb_quotient
+    else l2_mod // num_hb_remainder
+)
+
+bidhb_residual = (
+    l2_mod % l2_swizzle
+    if bidhb < num_hb_quotient
+    else l2_mod % num_hb_remainder
+)
+
+bidhb_actual = bidhb * l2_swizzle + bidhb_residual
+batch_idx = bidhb_actual // num_heads
+head_idx = bidhb_actual % num_heads
+m_block_idx = (num_m_blocks - 1) - m_block_raw
+```
+
+各变量含义如下：
+
+| 名称 | 含义 | 影响 |
+|---|---|---|
+| `num_hb` | `batch * kv_head` 的总数 | 共有多少条 batch/head 工作流 |
+| `l2_swizzle` | 一次在 L2 中保持活跃的 `num_hb` 组大小 | 决定 K/V working set 的局部性 |
+| `l2_major` | 一条 swizzle group 覆盖多少个 linear tasks | 等于 `l2_swizzle * num_m_blocks` |
+| `bidhb` | 当前 linear index 位于第几条 swizzle group | 用于区分完整组和残余组 |
+| `l2_mod` | group 内偏移 | 继续分解成 `m_block_raw` 与 residual |
+| `m_block_raw` | 尚未反转的 block 顺序 | 从 0 递增到 `num_m_blocks - 1` |
+| `bidhb_residual` | group 内的 batch/KV-head 偏移 | 与原 `bidhb` 合成实际 head |
+| `m_block_idx` | 最终交给 kernel 的 Q block | 由 `num_m_blocks - 1 - raw` 反转 |
+
+`l2_swizzle` 不是 shared-memory swizzle。前者改变 task 发射顺序以
+利用 L2；后者改变 SMEM 地址的 XOR mapping 以避免 bank conflict。
+两者解决的问题完全不同。
+
+### 四、为什么这个映射同时实现 LPT 和 L2 locality
+
+假设：
+
+```text
+batches = 1
+kv_heads = 8
+m_blocks = 4
+l2_swizzle = 8
+```
+
+则：
+
+```text
+num_hb = 1 * 8 = 8
+l2_major = 8 * 4 = 32
+num_hb_quotient = 8 // 8 = 1
+total_tasks = 8 * 4 = 32
+```
+
+当前示例的 `linear_idx` 都在 `[0, 32)`：
+
+```text
+bidhb = linear_idx // 32 = 0
+l2_mod = linear_idx
+m_block_raw = l2_mod // 8
+bidhb_residual = l2_mod % 8
+bidhb_actual = 0 * 8 + bidhb_residual = bidhb_residual
+m_block_idx = 3 - m_block_raw
+```
+
+所以 launch order 是：
+
+| linear index | batch | kv_head | `m_block_raw` | `m_block_idx` | 成本 | 作用 |
+|---:|---:|---:|---:|---:|---:|---|
+| 0..7 | 0 | 0..7 | 0 | 3 | 8 | 最先发射最重的 blocks |
+| 8..15 | 0 | 0..7 | 1 | 2 | 6 | 继续填满同一组 heads |
+| 16..23 | 0 | 0..7 | 2 | 1 | 4 | 进入较短的工作 |
+| 24..31 | 0 | 0..7 | 3 | 0 | 2 | 最短工作放最后 |
+
+这里有两个方向同时发生：
+
+```text
+m_block_raw 增大 -> m_block_idx 减小 -> 成本由 8 降到 2
+group 内 residual 增大 -> kv_head 0..7 依次出现
+```
+
+因此同一时刻活跃的 tasks 使用同一批 K/V heads。对于这个例子，每个
+KV head 的 K/V 总量是：
+
+```text
+SIZE_ONE_KV_HEAD
+  = SEQ_LEN_KV * HEAD_DIM * 2 * F16_BYTES
+  = 1024 * 128 * 2 * 2
+  = 524,288 bytes
+  = 0.5 MiB
+```
+
+八个 heads 合起来约 `4 MiB`。这些 K/V 被连续使用，比在 32 个
+`batch/head` 之间来回跳更可能命中 L2。
+
+### 五、具体成本计算：为什么成本是 2、4、6、8
+
+使用：
+
+```text
+SEQ_LEN_Q = 1024
+SEQ_LEN_KV = 1024
+BLK_N = 128
+SEQ_Q_PER_TILE = 128
+SMEM_PIPE_DEPTH_Q = 2
+m_blocks = 4
+```
+
+先算 K/V block 总数：
+
+```text
+num_kv_blocks = ceildiv(1024, 128) = 8
+```
+
+再逐项计算 `n_block_max`：
+
+| `m_block_idx` | `m_idx_max` | `n_idx` | `ceildiv(n_idx, 128)` | `n_block_max` | 成本 |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 * 128 * 2 = 256 | 256 | 2 | 2 | 2 |
+| 1 | 2 * 128 * 2 = 512 | 512 | 4 | 4 | 4 |
+| 2 | 3 * 128 * 2 = 768 | 768 | 6 | 6 | 6 |
+| 3 | 4 * 128 * 2 = 1024 | 1024 | 8 | 8 | 8 |
+
+注意 `m_idx_max` 使用的是 block 的 exclusive end：
+
+```text
+m_idx_max = (0 + 1) * 128 * 2 = 256
+n_idx = 256 + 1024 - 1024 = 256
+n_block_max = ceildiv(256, 128) = 2
+```
+
+所以四项成本为：
+
+```text
+m_block 0 -> n_block_max 2
+m_block 1 -> n_block_max 4
+m_block 2 -> n_block_max 6
+m_block 3 -> n_block_max 8
+```
+
+总成本为：
+
+```text
+8 heads * (2 + 4 + 6 + 8)
+= 8 * 20
+= 160 block-iterations
+```
+
+若平均分到 4 个等速 worker，理想负载是：
+
+```text
+160 / 4 = 40
+```
+
+LPT 顺序在前 8 个 tasks 中让每个 worker 都拿到一个成本 8 的 task，
+之后每轮也都均衡分配，因此最终负载为：
+
+```text
+[40, 40, 40, 40]
+```
+
+如果按自然顺序“每个 head 从 m=0 到 m=3”，后出现的重 task 会落到
+已经积累过负载的 worker 上。一个简单的“空闲 worker 取下一个”模拟
+得到：
+
+```text
+[44, 38, 38, 40]
+```
+
+最大负载从 44 降到 40，也就是理想下限。实际 GPU 的调度粒度、SM
+resident CTA 数量和 memory stall 会让收益不等于严格比例，但 LPT
+解决的是这组结构性尾部不均衡。
+
+### 六、完整可运行模拟
+
+完整文件：
+`modern-gpu-programming-for-mlsys/code/flash_attention_lpt_scheduler_sim.py`
+
+```python
+#!/usr/bin/env python3
+"""Compare causal attention LPT ordering with a natural m-ascending order."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class SchedulerConfig:
+    batch_size: int
+    num_heads: int
+    num_m_blocks: int
+    l2_swizzle: int
+    num_kv_blocks: int
+    seq_q_per_tile: int
+    smem_pipe_depth_q: int
+    seq_len_q: int
+    seq_len_kv: int
+    blk_n: int
+
+    @property
+    def num_hb(self) -> int:
+        return self.batch_size * self.num_heads
+
+    @property
+    def l2_major(self) -> int:
+        return self.l2_swizzle * self.num_m_blocks
+
+    @property
+    def num_hb_quotient(self) -> int:
+        return self.num_hb // self.l2_swizzle
+
+    @property
+    def num_hb_remainder(self) -> int:
+        return max(self.num_hb % self.l2_swizzle, 1)
+
+    @property
+    def total_tasks(self) -> int:
+        return self.batch_size * self.num_heads * self.num_m_blocks
+
+
+def ceildiv(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def n_block_max_of(m_block_idx: int, cfg: SchedulerConfig) -> int:
+    m_idx_max = (
+        (m_block_idx + 1)
+        * cfg.seq_q_per_tile
+        * cfg.smem_pipe_depth_q
+    )
+    n_idx = m_idx_max + cfg.seq_len_kv - cfg.seq_len_q
+    return min(cfg.num_kv_blocks, ceildiv(n_idx, cfg.blk_n))
+
+
+def decode_lpt(
+    linear_idx: int,
+    cfg: SchedulerConfig,
+) -> tuple[int, int, int]:
+    """Mirror FlashAttentionLPTScheduler::update_current_m_n_idx."""
+    bidhb = linear_idx // cfg.l2_major
+    l2_mod = linear_idx % cfg.l2_major
+
+    complete_group = bidhb < cfg.num_hb_quotient
+    m_block_raw = (
+        l2_mod // cfg.l2_swizzle
+        if complete_group
+        else l2_mod // cfg.num_hb_remainder
+    )
+    bidhb_residual = (
+        l2_mod % cfg.l2_swizzle
+        if complete_group
+        else l2_mod % cfg.num_hb_remainder
+    )
+
+    bidhb_actual = bidhb * cfg.l2_swizzle + bidhb_residual
+    batch_idx = bidhb_actual // cfg.num_heads
+    head_idx = bidhb_actual % cfg.num_heads
+    m_block_idx = (cfg.num_m_blocks - 1) - m_block_raw
+    return batch_idx, head_idx, m_block_idx
+
+
+def decode_natural(
+    linear_idx: int,
+    cfg: SchedulerConfig,
+) -> tuple[int, int, int]:
+    """Natural head-major, m-ascending order used as the comparison."""
+    batch_idx = linear_idx // (cfg.num_heads * cfg.num_m_blocks)
+    head_idx = (linear_idx // cfg.num_m_blocks) % cfg.num_heads
+    m_block_idx = linear_idx % cfg.num_m_blocks
+    return batch_idx, head_idx, m_block_idx
+
+
+def task_cost(task: tuple[int, int, int], cfg: SchedulerConfig) -> int:
+    _, _, m_block_idx = task
+    return n_block_max_of(m_block_idx, cfg)
+
+
+def simulate_workers(
+    tasks: list[tuple[int, int, int]],
+    cfg: SchedulerConfig,
+    num_workers: int,
+) -> tuple[list[list[int]], list[int]]:
+    """Idle worker takes next task; equal loads prefer the smaller id."""
+    histories = [[] for _ in range(num_workers)]
+    loads = [0] * num_workers
+    for task in tasks:
+        worker = min(range(num_workers), key=lambda idx: (loads[idx], idx))
+        cost = task_cost(task, cfg)
+        histories[worker].append(cost)
+        loads[worker] += cost
+    return histories, loads
+
+
+def describe_tasks(
+    tasks: list[tuple[int, int, int]],
+    cfg: SchedulerConfig,
+    limit: int | None = None,
+) -> None:
+    for linear_idx, (batch_idx, head_idx, m_block_idx) in enumerate(tasks):
+        if limit is not None and linear_idx >= limit:
+            break
+        cost = task_cost((batch_idx, head_idx, m_block_idx), cfg)
+        print(
+            f"linear={linear_idx:2d} -> "
+            f"batch={batch_idx}, head={head_idx}, "
+            f"m_block={m_block_idx}, cost={cost}"
+        )
+
+
+def main() -> None:
+    cfg = SchedulerConfig(
+        batch_size=1,
+        num_heads=8,
+        num_m_blocks=4,
+        l2_swizzle=8,
+        num_kv_blocks=8,
+        seq_q_per_tile=128,
+        smem_pipe_depth_q=2,
+        seq_len_q=1024,
+        seq_len_kv=1024,
+        blk_n=128,
+    )
+
+    print("== scheduler geometry ==")
+    print(f"num_hb          = {cfg.batch_size} * {cfg.num_heads} = {cfg.num_hb}")
+    print(f"l2_major        = {cfg.l2_swizzle} * {cfg.num_m_blocks} = {cfg.l2_major}")
+    print(f"num_hb_quotient = {cfg.num_hb} // {cfg.l2_swizzle} = {cfg.num_hb_quotient}")
+    print(f"num_hb_remainder= max({cfg.num_hb} % {cfg.l2_swizzle}, 1) = {cfg.num_hb_remainder}")
+    print(f"total_tasks     = {cfg.total_tasks}")
+    print()
+
+    print("== causal task costs ==")
+    for m_block_idx in range(cfg.num_m_blocks):
+        m_idx_max = m_block_idx * cfg.seq_q_per_tile * cfg.smem_pipe_depth_q
+        n_idx = m_idx_max + cfg.seq_len_kv - cfg.seq_len_q
+        cost = n_block_max_of(m_block_idx, cfg)
+        print(
+            f"m_block={m_block_idx}: "
+            f"m_idx={m_idx_max}, n_idx={n_idx}, "
+            f"n_block_max={cost}, cost={cost}"
+        )
+    print()
+
+    lpt_tasks = [decode_lpt(i, cfg) for i in range(cfg.total_tasks)]
+    natural_tasks = [decode_natural(i, cfg) for i in range(cfg.total_tasks)]
+
+    print("== LPT launch order (first 16 tasks) ==")
+    describe_tasks(lpt_tasks, cfg, limit=16)
+    print()
+
+    print("== natural launch order (first 16 tasks) ==")
+    describe_tasks(natural_tasks, cfg, limit=16)
+    print()
+
+    lpt_histories, lpt_loads = simulate_workers(lpt_tasks, cfg, num_workers=4)
+    natural_histories, natural_loads = simulate_workers(
+        natural_tasks,
+        cfg,
+        num_workers=4,
+    )
+
+    print("== 4-worker simulation ==")
+    print("LPT histories     =", lpt_histories)
+    print("LPT loads         =", lpt_loads)
+    print("natural histories =", natural_histories)
+    print("natural loads     =", natural_loads)
+    print("max load          = LPT: 40, natural: 44")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python3 modern-gpu-programming-for-mlsys/code/flash_attention_lpt_scheduler_sim.py
+```
+
+预期输出：
+
+```text
+== scheduler geometry ==
+num_hb          = 1 * 8 = 8
+l2_major        = 8 * 4 = 32
+num_hb_quotient = 8 // 8 = 1
+num_hb_remainder= max(8 % 8, 1) = 1
+total_tasks     = 32
+
+== causal task costs ==
+m_block=0: m_idx_min=0, m_idx_max=256, n_idx=256, n_block_max=2, cost=2
+m_block=1: m_idx_min=256, m_idx_max=512, n_idx=512, n_block_max=4, cost=4
+m_block=2: m_idx_min=512, m_idx_max=768, n_idx=768, n_block_max=6, cost=6
+m_block=3: m_idx_min=768, m_idx_max=1024, n_idx=1024, n_block_max=8, cost=8
+
+== LPT launch order (first 16 tasks) ==
+linear= 0 -> batch=0, head=0, m_block=3, cost=8
+linear= 1 -> batch=0, head=1, m_block=3, cost=8
+linear= 2 -> batch=0, head=2, m_block=3, cost=8
+linear= 3 -> batch=0, head=3, m_block=3, cost=8
+linear= 4 -> batch=0, head=4, m_block=3, cost=8
+linear= 5 -> batch=0, head=5, m_block=3, cost=8
+linear= 6 -> batch=0, head=6, m_block=3, cost=8
+linear= 7 -> batch=0, head=7, m_block=3, cost=8
+linear= 8 -> batch=0, head=0, m_block=2, cost=6
+linear= 9 -> batch=0, head=1, m_block=2, cost=6
+linear=10 -> batch=0, head=2, m_block=2, cost=6
+linear=11 -> batch=0, head=3, m_block=2, cost=6
+linear=12 -> batch=0, head=4, m_block=2, cost=6
+linear=13 -> batch=0, head=5, m_block=2, cost=6
+linear=14 -> batch=0, head=6, m_block=2, cost=6
+linear=15 -> batch=0, head=7, m_block=2, cost=6
+
+== natural launch order (first 16 tasks) ==
+linear= 0 -> batch=0, head=0, m_block=0, cost=2
+linear= 1 -> batch=0, head=0, m_block=1, cost=4
+linear= 2 -> batch=0, head=0, m_block=2, cost=6
+linear= 3 -> batch=0, head=0, m_block=3, cost=8
+linear= 4 -> batch=0, head=1, m_block=0, cost=2
+linear= 5 -> batch=0, head=1, m_block=1, cost=4
+linear= 6 -> batch=0, head=1, m_block=2, cost=6
+linear= 7 -> batch=0, head=1, m_block=3, cost=8
+linear= 8 -> batch=0, head=2, m_block=0, cost=2
+linear= 9 -> batch=0, head=2, m_block=1, cost=4
+linear=10 -> batch=0, head=2, m_block=2, cost=6
+linear=11 -> batch=0, head=2, m_block=3, cost=8
+linear=12 -> batch=0, head=3, m_block=0, cost=2
+linear=13 -> batch=0, head=3, m_block=1, cost=4
+linear=14 -> batch=0, head=3, m_block=2, cost=6
+linear=15 -> batch=0, head=3, m_block=3, cost=8
+
+== 4-worker simulation ==
+LPT histories     = [[8, 8, 6, 6, 4, 4, 2, 2], [8, 8, 6, 6, 4, 4, 2, 2], [8, 8, 6, 6, 4, 4, 2, 2], [8, 8, 6, 6, 4, 4, 2, 2]]
+LPT loads         = [40, 40, 40, 40]
+natural histories = [[2, 2, 4, 2, 6, 8, 4, 2, 6, 8], [4, 6, 8, 2, 6, 8, 4], [6, 8, 4, 4, 2, 6, 8], [8, 4, 2, 6, 8, 4, 2, 6]]
+natural loads     = [44, 38, 38, 40]
+max load          = LPT: 40, natural: 44
+```
+
+### 七、逐项解释执行结果
+
+#### 1. 为什么 `linear=0` 就是 `m_block=3`
+
+`m_block_raw` 从 0 开始，而最终映射是：
+
+```text
+m_block_idx = num_m_blocks - 1 - m_block_raw
+            = 4 - 1 - 0
+            = 3
+```
+
+所以最大的 `m_block` 拥有最低的 linear index，最先被发出。
+
+#### 2. 为什么 `linear=8` 又回到 `head=0`
+
+当 `l2_mod` 从 0 到 7 时，`m_block_raw=0`，residual 依次是 0..7，
+因此遍历 8 个 heads。进入 `l2_mod=8` 后：
+
+```text
+m_block_raw = 8 // 8 = 1
+bidhb_residual = 8 % 8 = 0
+```
+
+所以它回到 `head=0`，但 `m_block_idx` 变为 `3 - 1 = 2`。这正是 L2
+swizzle 的 group 遍历：一个 group 内的 8 个 heads 做完同一个
+`m_block`，再一起进入下一个 `m_block`。
+
+#### 3. 为什么 LPT 的四个 worker 刚好都是 40
+
+每个 worker 在四个 8-task 轮次中依次收到：
+
+```text
+第 1 轮：cost 8
+第 2 轮：cost 8
+第 3 轮：cost 6
+第 4 轮：cost 6
+第 5 轮：cost 4
+第 6 轮：cost 4
+第 7 轮：cost 2
+第 8 轮：cost 2
+```
+
+合计：
+
+```text
+8 + 8 + 6 + 6 + 4 + 4 + 2 + 2 = 40
+```
+
+#### 4. 为什么 natural order 的最大负载是 44
+
+Natural order 先发射各 head 的短 tasks，之后才发射 cost=8 的
+`m_block=3`。当最后两个重 tasks 到达时，已有 worker 的负载较高，
+新任务只能落到当时最轻的 worker，形成额外的尾部排队感。这个模拟
+的 worker 负载为：
+
+```text
+[44, 38, 38, 40]
+```
+
+它不是对真实 GPU 的 cycle 精确建模，而是展示同一个任务集合在不同
+launch order 下的结构性差异。
+
+### 八、Causal 路径与非 persistent loop 的关系
+
+Causal FA4 被描述为“非 persistent causal path”，不是因为它没有
+task loop，而是因为：
+
+```text
+非 causal：
+  num_ctas 通常小于 total_tasks
+  一个 CTA 完成任务后，用 next_tile 跳到后面的 task
+
+causal：
+  num_ctas 等于 total_tasks
+  每个 CTA 只负责当前 task
+  next_tile 把 linear_idx 推到 total_tasks，loop 随即结束
+```
+
+源码中的接口形式完全相同：
+
+```python
+while scheduler.valid():
+    m_block_idx = scheduler.m_block_idx
+    batch_idx = scheduler.batch_idx
+    kv_head_idx = scheduler.head_idx
+    # TMA load / QK^T / softmax / PV / store
+    scheduler.next_tile()
+```
+
+区别仅在 `next_tile()` 的推进策略。Causal LPT scheduler 默认
+`num_ctas=None`，其 `next_tile()` 直接：
+
+```python
+self.linear_idx = self._total_tasks
+```
+
+因此它不会把一个 CTA 复用给下一条 task。这样做牺牲了 persistent 的
+launch/teardown 复用，但让前面算出的 LPT launch order 能够直接决定
+GPU 的 CTA 发射顺序，配合 causal workload 的阶梯形状。
+
+### 九、常见错误与可观察症状
+
+| 错误 | 原因 | 可观察症状 |
+|---|---|---|
+| 认为 causal 也使用 persistent CTA | 忽略 `num_ctas=None` 的默认行为 | 把 `next_tile` 的 stride 解释成跨 task，性能模型错误 |
+| 按 `BLK_M` 而不是 `SEQ_Q_PER_TILE` 计算 m_blocks | 忘记 GQA packing | block 数偏小，GQA 下任务覆盖残缺 |
+| 把 `m_block` 当做单块 Q tile | 忘记 `SMEM_PIPE_DEPTH_Q` | causal cost 少乘 2，调度顺序推导错误 |
+| 说 LPT 动态测量每个 task 的耗时 | 把静态反序当成运行期调度 | 误以为 scheduler 需要额外 profiling 或 atomic queue |
+| 把 L2 swizzle 和 SMEM swizzle 混为一谈 | 两者都含 swizzle | 错误地在 TMA descriptor 或 XOR 计算中找 L2 地址 |
+| 最后 partial group 使用错误的 divisor | `num_hb % l2_swizzle != 0` | 最后一个 group 的 head index 越界或重复 |
+
+### 十、自测题与答案
+
+#### 1. 已知 `m_block=2`、`SEQ_Q_PER_TILE=128`、`SMEM_PIPE_DEPTH_Q=2`、`SEQ_LEN_Q=SEQ_LEN_KV=1024`、`BLK_N=128`，求最大 K/V block 数。
+
+答：
+
+```text
+m_idx_max = (2 + 1) * 128 * 2 = 768
+n_idx = 768 + 1024 - 1024 = 768
+n_block_max = min(8, ceildiv(768, 128)) = 6
+```
+
+#### 2. 为什么 `m_block` 越大，causal attention task 越重？
+
+答：`m_block` 越大，Q positions 越靠后，causal mask 允许访问的
+key/value positions 越多。因此要遍历的 K/V blocks 越多。
+
+#### 3. LPT 调度器是运行期测量任务耗时后重新排序吗？
+
+答：不是。它使用 causal mask 的固定结构，直接反转 `m_block` 顺序，
+让默认 launch order 近似从重到轻。
+
+#### 4. `l2_swizzle=8`、`num_heads=8`、`num_m_blocks=4` 时，为什么 `linear=0..7` 都映射到 `m_block=3`？
+
+答：`l2_mod` 在 0..7 时 `m_block_raw=0`，最终 `m_block_idx=4-1-0=3`。
+residual 0..7 只负责把这 8 个 tasks 分给 8 个 KV heads。
+
+#### 5. 这个 example 中 LPT 和 natural order 的最大 worker load 分别是多少？
+
+答：LPT 为 `40`，natural order 为 `44`；总工作量均为 160。
+
+## 二十二、下一知识点
+
+下一步进入 `8.4 Reference and tolerance verification`：把 FA4 输出与
+PyTorch attention reference 对齐，解释 fp16 输入、fp32 累加、输出
+cast 和 `rtol` / `atol` 容差的关系，并给出可执行验证与失败定位方法。

@@ -34,7 +34,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、`work_id` / `init(bx)` / stride 148、M 优先与 N 优先的完整编号对照、`l2_group_size=8` 的 L2 locality、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
 | [19-gemm-warp-specialization.md](19-gemm-warp-specialization.md) | `chapter_gemm_advanced` Step 7 的 `hgemm_v7`、TMA producer / MMA consumer / writeback 三角色拆分、`tma2mma` / `mma2tma` 的 SMEM full-empty 协议、`mma2ld` / `ld2mma` 的 TMEM result-reuse 协议、named barrier、完整代码与 `PIPE_DEPTH=2` 交接 trace |
 | [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8-9 的 `hgemm_v8` / `hgemm_v9`、Two-CTA cooperative MMA、`cta_mask=3`、跨 CTA TMEM 复用、Multi-Consumer Warp Specialization、共享 staged B、`512 x 256` cluster tile、按 consumer 索引的 TMEM / barriers、`98304`-byte K-stage TMA transaction，以及完整 GPU 与静态验证代码 |
-| [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、`row_max` / `row_sum` / `O` online softmax 三状态、FA4 conditional rescaling 的 `delta` / 阈值 8 / `acc_scale`、WG2 两级重缩放筛选、`S` / `P` / `O` 的 512-column TMEM 划分与 fp16 分时复用、完整 CPU 数值验证与地址计算脚本 |
+| [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、online softmax、conditional rescaling、`S` / `P` / `O` TMEM 复用、causal mask、GQA packed rows、causal LPT scheduling、L2 swizzle、完整数值与调度验证脚本 |
 
 ## 当前进度
 
@@ -362,6 +362,25 @@ softmax 必须先把完整 S 读入 registers，P 才能覆盖 S 的后半部分
 PV MMA 消费完 P 之前，下一轮 QK^T MMA 不能重新覆盖同一区域
 s_ready、tcgen05.wait::st、p_o_rescale 与 p_ready_2 共同保护 S/P 的生命周期
 完整 Python 地址计算脚本验证 P0/P1 的 physical column、fp16 half 与 overlap 范围
+chapter_flash_attention 第 4 个知识点完成：QK^T、softmax、PV 数据路径
+QK^T MMA 从 SMEM 读取 Q/K，把 S 写入 TMEM
+softmax 将 S 读入 registers，再把 P 写回 TMEM
+PV MMA 使用 TMEM 中的 P 与 SMEM 中的 V 更新 O
+chapter_flash_attention 第 5 个知识点完成：Warp 角色、register 与 barrier 分工
+chapter_flash_attention 第 6 个知识点完成：Q/K/V pipeline 时间线
+chapter_flash_attention 第 7 个知识点完成：Correction、最终归一化与 epilogue
+chapter_flash_attention 第 8.1 个知识点完成：Causal mask
+block-level 跳过与对角线块内的逐行列屏蔽分开处理
+同一 sequence 下不同 GQA query heads 共享 causal 边界
+chapter_flash_attention 第 8.2 个知识点完成：GQA packed Q rows 与 K/V 复用
+packed row 还原公式为 sequence = row // GQA_RATIO、head_offset = row % GQA_RATIO
+逐 query head 仍满足 S_h = Q_h @ K_g^T、O_h = softmax(S_h) @ V_g
+GQA 不增加 Q heads 或参数，只减少 K/V heads、KV cache 与 K/V 流量
+chapter_flash_attention 第 8.3 个知识点完成：Causal LPT scheduling 与 L2 swizzle
+causal task 成本随 m_block 增大而阶梯上升
+task index 先按 l2_swizzle 分组，再反转 m_block 顺序
+示例配置下 LPT 最大 worker load 为 40，natural order 为 44
+causal path 每个 CTA 只处理一个 task，next_tile 直接结束 loop
 ```
 
 ## 下一知识点
@@ -384,7 +403,14 @@ chapter_tirx_layout_api 完成
 -> chapter_flash_attention 第 1 个知识点完成：Tile 分解与 online softmax 三状态
 -> chapter_flash_attention 第 2 个知识点完成：Conditional rescaling、delta 与 acc_scale
 -> chapter_flash_attention 第 3 个知识点完成：S / P / O 的 TMEM layout 与分时复用
--> chapter_flash_attention 第 4 个知识点：QK^T MMA、softmax、PV MMA 的数据路径
+-> chapter_flash_attention 第 4 个知识点完成：QK^T、softmax、PV 数据路径
+-> chapter_flash_attention 第 5 个知识点完成：Warp 角色、register 与 barrier 分工
+-> chapter_flash_attention 第 6 个知识点完成：Q/K/V pipeline 时间线
+-> chapter_flash_attention 第 7 个知识点完成：Correction、最终归一化与 epilogue
+-> chapter_flash_attention 第 8.1 个知识点完成：Causal mask
+-> chapter_flash_attention 第 8.2 个知识点完成：GQA packed Q rows 与 K/V 复用
+-> chapter_flash_attention 第 8.3 个知识点完成：Causal LPT scheduling 与 L2 swizzle
+-> chapter_flash_attention 第 8.4 个知识点：Reference 与容差验证
 ```
 
 ## 核心主线
