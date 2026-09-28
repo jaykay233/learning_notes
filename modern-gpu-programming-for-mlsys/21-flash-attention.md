@@ -18,7 +18,9 @@ TMEM 三条流水线排成完整时间线。
 现在继续补上 K/V loop 结束后的 epilogue：`row_sum` 如何归一化 TMEM
 中的 `O`，写入 `O_smem`，再交给 TMA store。
 接下来进入 causal 特化，先补上两层 causal mask：任务级 KV block
-裁剪，以及对角线 block 内的逐行列屏蔽。
+裁剪，以及对角线 block 内的逐行列屏蔽。然后解释 GQA 如何把多个
+query heads 打包进同一个 128-row Q tile，使这些 query heads 共享
+scheduler 为它们选定的同一份 K/V tile。
 
 ## 本次讲解位置
 
@@ -51,7 +53,7 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
 [x] 7. Correction、最终归一化与 epilogue
 [ ] 8. Causal mask、GQA、tile scheduling 与验证
     [x] 8.1 Causal mask：block 跳过与块内列屏蔽
-    [ ] 8.2 GQA packed Q rows 与 K/V 复用
+    [x] 8.2 GQA packed Q rows 与 K/V 复用
     [ ] 8.3 Causal LPT tile scheduling
     [ ] 8.4 Reference 与容差验证
 ```
@@ -6480,10 +6482,688 @@ blocks。这样可以把 mask 逻辑限制在少数 iterations 中，同时符�
 prologue、steady state、tail 的流水线结构。它不是 causal 语义本身，
 而是当前 FA4 的实现选择。
 
-## 二十、下一知识点
+## 二十、GQA packed Q rows 与 K/V 复用
 
-下一步进入 `8.2 GQA packed Q rows 与 K/V 复用`：解释
-`GQA_RATIO = num_qo_heads / num_kv_heads` 如何把多个 query heads
-打包进 128 条 Q rows，为什么这些 rows 可以共享同一份 K/V tile，
-以及 Q-load、causal mask 和 O-store 如何解释 `(sequence, query head)`
-坐标。
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：GQA 支持
+知识点：GQA packed Q rows，以及同一个 kv_head 对应的 K/V tile 复用
+上次：Causal mask 的任务级 block 裁剪与块内列屏蔽
+下次：Causal LPT tile scheduling
+PTX/SASS：TMA 4D box、packed row 到 `(sequence, query_head)` 的坐标还原
+```
+
+### 为什么现在讲这个
+
+上一节的 causal mask 已经要求根据 packed Q row 还原 sequence position：
+
+```python
+seq_pos_in_wg = tid_in_wg // GQA_RATIO
+```
+
+当时把 `GQA_RATIO` 暂时设为 1，所以 `tid_in_wg` 直接代表 sequence
+offset。这个简化掩盖了 GQA 路径最重要的变化：
+
+```text
+128 条 Q-tile rows 不再一定是 128 个连续 sequence positions。
+```
+
+如果仍然把 row 0、row 1、row 2 当作 sequence 0、1、2，会同时算错
+Q 的 TMA 坐标、causal mask、O 的写回位置，也会错误地假设需要加载
+多份 K/V。GQA 的核心不是改变 QKᵀ、softmax 或 PV MMA 的形状，而是
+改变 Q row 的编码方式，让多个 query heads 在一个 MMA operand 中
+共享同一份 K/V tile。
+
+### 一、心智模型：把 Q tile 从二维矩阵重新看成四维块
+
+没有 GQA 时，一个 Q stage 可以看作：
+
+```text
+[SEQ_Q_PER_TILE, HEAD_DIM]
+```
+
+`GQA_RATIO=1` 时：
+
+```text
+SEQ_Q_PER_TILE = BLK_M / 1 = 128
+```
+
+也就是 128 条 Q rows 对应 128 个 sequence positions。
+
+有 GQA 时，同一个 `kv_head_idx` 服务于多个 query heads。一个 Q stage
+重新解释为：
+
+```text
+[SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM]
+```
+
+然后按 row-major 顺序 flatten：
+
+```text
+row = sequence_offset * GQA_RATIO + query_head_offset
+```
+
+其中：
+
+```text
+0 <= sequence_offset < SEQ_Q_PER_TILE
+0 <= query_head_offset < GQA_RATIO
+```
+
+Flatten 后仍然是 QKᵀ MMA 需要的二维 operand：
+
+```text
+[BLK_M, HEAD_DIM]
+```
+
+所以 MMA 不需要知道 GQA 的内部结构；GQA 只影响 Q-load、causal mask
+和 O-store 如何解释 row 坐标。
+
+### 二、参数关系
+
+给定：
+
+```text
+num_qo_heads = 32
+num_kv_heads = 8
+BLK_M = 128
+```
+
+先计算：
+
+```text
+GQA_RATIO = num_qo_heads / num_kv_heads
+          = 32 / 8
+          = 4
+```
+
+再计算一个 Q stage 能容纳多少 sequence positions：
+
+```text
+SEQ_Q_PER_TILE = BLK_M / GQA_RATIO
+               = 128 / 4
+               = 32
+```
+
+因此一个 Q stage 的逻辑 shape 是：
+
+```text
+[32 sequences, 4 query heads, 128 dimensions]
+```
+
+它 flatten 后的物理 MMA shape 仍然是：
+
+```text
+[128 rows, 128 dimensions]
+```
+
+### 三、packed row 到 `(sequence, query_head)` 的映射
+
+对于 `kv_head_idx=3`：
+
+```text
+query heads covered by this K/V head:
+3 * 4 + 0 = 12
+3 * 4 + 1 = 13
+3 * 4 + 2 = 14
+3 * 4 + 3 = 15
+```
+
+逐个展开：
+
+```text
+row 0:
+  sequence_offset = 0 // 4 = 0
+  head_offset     = 0 % 4  = 0
+  qo_head         = 3 * 4 + 0 = 12
+
+row 5:
+  sequence_offset = 5 // 4 = 1
+  head_offset     = 5 % 4  = 1
+  qo_head         = 3 * 4 + 1 = 13
+
+row 127:
+  sequence_offset = 127 // 4 = 31
+  head_offset     = 127 % 4  = 3
+  qo_head         = 3 * 4 + 3 = 15
+```
+
+可以用表格检查：
+
+| Packed row | Sequence offset | Query-head offset | Global Q head | Owner K/V head |
+|---:|---:|---:|---:|---:|
+| 0 | 0 | 0 | 12 | 3 |
+| 1 | 0 | 1 | 13 | 3 |
+| 2 | 0 | 2 | 14 | 3 |
+| 3 | 0 | 3 | 15 | 3 |
+| 4 | 1 | 0 | 12 | 3 |
+| 5 | 1 | 1 | 13 | 3 |
+| 127 | 31 | 3 | 15 | 3 |
+
+所有 rows 的 `owner_kv_head` 都是 3，所以它们不需要四份 K/V。它们
+只需要 scheduler 已经选定的那一个 `kv_head_idx=3` 对应的 K/V tile。
+
+### 四、为什么 K/V tile 可以共享
+
+标准 GQA 公式是：
+
+```text
+Q_h: [S, D]，h = kv_head_idx * GQA_RATIO + head_offset
+K_g: [S, D]，g = kv_head_idx
+V_g: [S, D]，g = kv_head_idx
+
+S_h = Q_h @ K_g^T
+O_h = softmax(S_h) @ V_g
+```
+
+在同一份 K/V tile 上，不同 `head_offset` 只是使用不同的 Q rows。
+因此 kernel 可以：
+
+```text
+一次 TMA load K[kv_head_idx]
+一次 TMA load V[kv_head_idx]
+一次 QK^T MMA，同时算多个 query heads 的 scores
+一次 softmax，逐 row 处理
+一次 PV MMA，同时算多个 query heads 的 outputs
+```
+
+当前代码不是先分别加载四个 head 再做 K/V concatenate，而是直接用
+TMA 4D box 把自然布局中的 `(sequence, query head)` 子块装进一个
+128-row SMEM tile。这避免了重复搬运和一次额外的重排。
+
+### 五、Q load：4D view 与 TMA 坐标
+
+源码中的自然输入布局可以理解为：
+
+```text
+Q[batch, sequence, query_head, dim]
+```
+
+当前 CTA 处理 `kv_head_idx=3`，覆盖的 query heads 是 12..15。
+一个 Q stage 的 4D logical view 是：
+
+```python
+Q_smem_4d = Q_smem.view(
+    SMEM_PIPE_DEPTH_Q,
+    SEQ_Q_PER_TILE,
+    GQA_RATIO,
+    HEAD_DIM,
+)
+```
+
+当 `SEQ_Q_PER_TILE=32`、`GQA_RATIO=4` 时：
+
+```text
+stage 0: [sequence 0..31, query heads 12..15, dim 0..127]
+stage 1: [sequence 32..63, query heads 12..15, dim 0..127]
+```
+
+对于 `m_block=0`：
+
+```text
+q_tile_start(0) = 0
+q_tile_start(1) = 32
+```
+
+这里的 32 是 sequence start，不是 row start。每个 stage flatten 后
+仍然是 128 条 Q rows。
+
+### 六、Q stage 数量与 scheduler 的 `m_block`
+
+当前 FA4 同时维护两个 Q stages：
+
+```text
+SMEM_PIPE_DEPTH_Q = 2
+```
+
+下面的模拟先按 `cta_group=1, cta_rank=0` 展开；two-CTA 路径会在
+`q_tile_start` 中加入 `cta_group` 和 `cta_rank` 的步长，但 packed-row
+到 `(sequence, query_head)` 的映射不变。
+
+当 `GQA_RATIO=4` 时：
+
+```text
+一个 stage 覆盖 32 个 sequence positions。
+两个 stages 覆盖 64 个 sequence positions。
+```
+
+因此：
+
+```text
+num_q_blocks_total = ceil(SEQ_LEN_Q / SEQ_Q_PER_TILE)
+                   = ceil(1024 / 32)
+                   = 32
+
+num_m_blocks = ceil(num_q_blocks_total / 2)
+             = ceil(32 / 2)
+             = 16
+```
+
+这不同于 `GQA_RATIO=1` 的 `SEQ_LEN_Q=1024`：
+
+```text
+SEQ_Q_PER_TILE = 128
+num_q_blocks_total = 8
+num_m_blocks = 4
+```
+
+所以调度器不能复用“一个 m_block 覆盖 256 个 sequence positions”的
+结论。应该始终从 `SEQ_Q_PER_TILE` 推导。
+
+### 七、Causal mask 只看 sequence offset
+
+上一节的对角线列限制公式是：
+
+```text
+col_limit_right
+  = sequence_position + 1 + SEQ_LEN_KV - n_start - SEQ_LEN_Q
+```
+
+在 packed row 中：
+
+```text
+sequence_position
+  = m_block * SEQ_Q_PER_TILE * SMEM_PIPE_DEPTH_Q
+  + wg_id * SEQ_Q_PER_TILE
+  + tid_in_wg // GQA_RATIO
+```
+
+`tid_in_wg % GQA_RATIO` 只表示这是该 sequence 的第几个 query head，
+不参与 causal 边界。同一个 sequence 下的四个 query heads 共享完全
+相同的可见 key 范围，因为它们都读取同一份 K/V tile。
+
+### 八、O store：从 packed rows 写回自然布局
+
+输出 tile 同样按：
+
+```text
+[SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM]
+```
+
+解释。当前处理的 `kv_head_idx` 给出 query-head start：
+
+```text
+query_head_start = kv_head_idx * GQA_RATIO
+                 = 3 * 4
+                 = 12
+```
+
+因此 `row=5` 的输出会写回：
+
+```text
+sequence = 5 // 4 = 1
+qo_head  = 12 + (5 % 4) = 13
+```
+
+即：
+
+```text
+O[batch, 1, 13, :]
+```
+
+如果把 `row=5` 直接写成 sequence 5，就会把一个 head 的结果写到另一个
+sequence 的错误位置。
+
+### 九、完整可运行模拟
+
+完整文件：
+`modern-gpu-programming-for-mlsys/code/flash_attention_gqa_packed_rows_sim.py`
+
+模拟器默认使用 `cta_group=1, cta_rank=0`。
+
+```python
+#!/usr/bin/env python3
+"""Trace how FA4 packs GQA query heads into the 128 Q-tile rows."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+BLK_M = 128
+SMEM_PIPE_DEPTH_Q = 2
+
+
+def ceildiv(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+@dataclass(frozen=True)
+class GQAConfig:
+    num_qo_heads: int
+    num_kv_heads: int
+    seq_len_q: int
+
+    @property
+    def ratio(self) -> int:
+        if self.num_qo_heads % self.num_kv_heads != 0:
+            raise ValueError("num_qo_heads must be divisible by num_kv_heads")
+        return self.num_qo_heads // self.num_kv_heads
+
+    @property
+    def seq_q_per_tile(self) -> int:
+        if BLK_M % self.ratio != 0:
+            raise ValueError("GQA ratio must divide BLK_M")
+        return BLK_M // self.ratio
+
+    @property
+    def num_q_blocks_total(self) -> int:
+        return ceildiv(self.seq_len_q, self.seq_q_per_tile)
+
+    @property
+    def num_m_blocks(self) -> int:
+        return ceildiv(self.num_q_blocks_total, SMEM_PIPE_DEPTH_Q)
+
+
+def decode_packed_row(
+    row: int,
+    kv_head_idx: int,
+    cfg: GQAConfig,
+) -> tuple[int, int, int]:
+    """Return (sequence_offset, query_head_offset, global_query_head)."""
+    if not 0 <= row < BLK_M:
+        raise ValueError("row must be in [0, BLK_M)")
+    seq_offset = row // cfg.ratio
+    query_head_offset = row % cfg.ratio
+    query_head = kv_head_idx * cfg.ratio + query_head_offset
+    return seq_offset, query_head_offset, query_head
+
+
+def q_tile_start(
+    m_block: int,
+    q_stage: int,
+    cfg: GQAConfig,
+    cta_group: int = 1,
+    cta_rank: int = 0,
+) -> int:
+    """Return the global sequence start of one packed Q stage."""
+    if cta_group not in (1, 2) or not 0 <= cta_rank < cta_group:
+        raise ValueError("expected cta_group=1 or 2 and 0 <= cta_rank < cta_group")
+    return (
+        m_block * SMEM_PIPE_DEPTH_Q * cta_group
+        + q_stage * cta_group
+        + cta_rank
+    ) * cfg.seq_q_per_tile
+
+
+def describe_row(row: int, kv_head_idx: int, cfg: GQAConfig) -> str:
+    seq_offset, head_offset, query_head = decode_packed_row(
+        row, kv_head_idx, cfg
+    )
+    owner_kv_head = query_head // cfg.ratio
+    return (
+        f"row={row:3d} -> sequence={seq_offset:2d}, "
+        f"head_offset={head_offset}, qo_head={query_head:2d}, "
+        f"owner_kv_head={owner_kv_head}"
+    )
+
+
+def main() -> None:
+    cfg = GQAConfig(
+        num_qo_heads=32,
+        num_kv_heads=8,
+        seq_len_q=1024,
+    )
+    kv_head_idx = 3
+
+    print("== GQA geometry ==")
+    print(f"GQA_RATIO       = {cfg.num_qo_heads} / {cfg.num_kv_heads} = {cfg.ratio}")
+    print(f"SEQ_Q_PER_TILE  = {BLK_M} / {cfg.ratio} = {cfg.seq_q_per_tile}")
+    print(f"num_q_blocks    = ceildiv({cfg.seq_len_q}, {cfg.seq_q_per_tile}) = {cfg.num_q_blocks_total}")
+    print(f"num_m_blocks    = ceildiv({cfg.num_q_blocks_total}, 2) = {cfg.num_m_blocks}")
+    print()
+
+    print("== packed row decoding for kv_head_idx=3 ==")
+    for row in (0, 5, 127):
+        print(describe_row(row, kv_head_idx, cfg))
+    print()
+
+    print("== one Q stage ==")
+    print("SMEM Q tile is viewed as [SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM]")
+    print(
+        "logical tile: "
+        f"[{cfg.seq_q_per_tile} sequences, {cfg.ratio} query heads, 128 dims]"
+    )
+    print("flattened MMA operand: [BLK_M=128 rows, HEAD_DIM=128]")
+    print()
+
+    print("== Q stage global starts for m_block=0 ==")
+    for q_stage in range(SMEM_PIPE_DEPTH_Q):
+        start = q_tile_start(0, q_stage, cfg)
+        end = start + cfg.seq_q_per_tile - 1
+        print(
+            f"stage {q_stage}: sequence {start}..{end}, "
+            f"query heads "
+            f"{kv_head_idx * cfg.ratio}.."
+            f"{(kv_head_idx + 1) * cfg.ratio - 1}"
+        )
+    print()
+
+    print("== TMA box and coordinates for Q load ==")
+    print(
+        "box       = (head_dim//2, GQA_RATIO, SEQ_Q_PER_TILE, 1) "
+        f"= (64, {cfg.ratio}, {cfg.seq_q_per_tile}, 1)"
+    )
+    print(
+        "coordinates = "
+        f"(0, {kv_head_idx * cfg.ratio}, stage_sequence_start, batch*2)"
+    )
+    print()
+
+    print("== K/V reuse check ==")
+    owners = {
+        decode_packed_row(row, kv_head_idx, cfg)[2] // cfg.ratio
+        for row in range(BLK_M)
+    }
+    print(f"owner_kv_heads across all packed rows = {sorted(owners)}")
+    print("all 128 rows share one K/V tile because every row maps to kv_head_idx=3")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python3 modern-gpu-programming-for-mlsys/code/flash_attention_gqa_packed_rows_sim.py
+```
+
+预期输出：
+
+```text
+== GQA geometry ==
+GQA_RATIO       = 32 / 8 = 4
+SEQ_Q_PER_TILE  = 128 / 4 = 32
+num_q_blocks    = ceildiv(1024, 32) = 32
+num_m_blocks    = ceildiv(32, 2) = 16
+
+== packed row decoding for kv_head_idx=3 ==
+row=  0 -> sequence= 0, head_offset=0, qo_head=12, owner_kv_head=3
+row=  5 -> sequence= 1, head_offset=1, qo_head=13, owner_kv_head=3
+row=127 -> sequence=31, head_offset=3, qo_head=15, owner_kv_head=3
+
+== one Q stage ==
+SMEM Q tile is viewed as [SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM]
+logical tile: [32 sequences, 4 query heads, 128 dims]
+flattened MMA operand: [BLK_M=128 rows, HEAD_DIM=128]
+
+== Q stage global starts for m_block=0 ==
+stage 0: sequence 0..31, query heads 12..15
+stage 1: sequence 32..63, query heads 12..15
+
+== TMA box and coordinates for Q load ==
+box       = (head_dim//2, GQA_RATIO, SEQ_Q_PER_TILE, 1) = (64, 4, 32, 1)
+coordinates = (0, 12, stage_sequence_start, batch*2)
+
+== K/V reuse check ==
+owner_kv_heads across all packed rows = [3]
+all 128 rows share one K/V tile because every row maps to kv_head_idx=3
+```
+
+### 十、逐项解释执行结果
+
+#### 1. 为什么 `SEQ_Q_PER_TILE` 从 128 变成 32
+
+因为一个 stage 的 128 条 Q rows 要同时容纳：
+
+```text
+4 个 query heads
+```
+
+每四个 rows 属于同一个 sequence：
+
+```text
+row 0..3   -> sequence 0
+row 4..7   -> sequence 1
+...
+row 124..127 -> sequence 31
+```
+
+所以只有 32 个 sequence offsets。`BLK_M=128` 表示 MMA 的 M 维大小，
+不表示 sequence tile 宽度。
+
+#### 2. 为什么 row 5 不是 sequence 5
+
+映射公式是：
+
+```text
+sequence_offset = row // GQA_RATIO
+head_offset     = row % GQA_RATIO
+```
+
+代入 `row=5, GQA_RATIO=4`：
+
+```text
+sequence_offset = 5 // 4 = 1
+head_offset     = 5 % 4  = 1
+```
+
+因此 row 5 表示“sequence 1 的第 2 个 query head”，而不是 sequence 5。
+
+#### 3. 为什么 128 条 rows 可以共享一份 K/V
+
+这些 rows 的 global query heads 是 12、13、14、15：
+
+```text
+12 // 4 = 3
+13 // 4 = 3
+14 // 4 = 3
+15 // 4 = 3
+```
+
+它们全部属于 `kv_head_idx=3`。K/V tile 只由 `kv_head_idx` 选择，
+不会随 `GQA_RATIO` 内的 head offset 改变。
+
+#### 4. `m_block=0` 的两个 stages 覆盖什么
+
+```text
+stage 0: sequences 0..31，query heads 12..15
+stage 1: sequences 32..63，query heads 12..15
+```
+
+两个 stages 共覆盖 64 个 sequence positions。`GQA_RATIO=1` 时它们
+会覆盖 256 个 sequence positions，所以后面的 LPT scheduler 必须使用
+当前配置计算出的 `SEQ_Q_PER_TILE`，不能写死 128 或 256。
+
+### 十一、源码对应关系
+
+源码入口：
+
+```python
+GQA_RATIO = NUM_QO_HEADS // NUM_KV_HEADS
+SEQ_Q_PER_TILE = BLK_M // GQA_RATIO
+```
+
+Q-load 的 4D TMA 坐标：
+
+```python
+q_smem[i_q].ptr_to(k_part * BLK_M, 0)
+txl.ptx[tma_g2s_4d](
+    ...,
+    txl.int32(0),
+    txl.Cast("int32", kv_head_idx * GQA_RATIO),
+    txl.Cast("int32", q_tile_start(i_q)),
+    txl.Cast("int32", batch_idx * 2 + (k_part if USE_2CTA else 0)),
+    ...,
+)
+```
+
+这段代码做的事情是：
+
+```text
+从 Q[batch, sequence, query_head, dim] 取出
+  query_head range = [kv_head_idx*GQA_RATIO, (kv_head_idx+1)*GQA_RATIO)
+  sequence range   = [q_tile_start, q_tile_start + SEQ_Q_PER_TILE)
+形成一个 [SEQ_Q_PER_TILE, GQA_RATIO, HEAD_DIM] 的 packed Q tile。
+```
+
+O-store 使用相同的 4D 解释，把结果写回：
+
+```text
+O[batch, sequence, query_head, dim]
+```
+
+Causal mask 只使用：
+
+```python
+seq_pos_in_wg = tid_in_wg // GQA_RATIO
+```
+
+所以同一 sequence 下的多个 query heads 获得相同的 causal column limit。
+
+### 十二、常见错误与症状
+
+| 错误 | 原因 | 可观察症状 |
+|---|---|---|
+| 把 `row` 直接当 sequence | 忘记 `GQA_RATIO` packing | Q/O 坐标错位，单个 head 结果看似正常 |
+| 用 `BLK_M` 当 sequence tile 宽度 | 混淆 MMA M 维度与 sequence 维度 | scheduler 任务数偏小，远距离结果错误 |
+| 给每个 query head 各加载一份 K/V | 把 GQA 当成 MHA | 正确但多出 `GQA_RATIO` 倍 K/V 流量 |
+| mask 使用 `head_offset` | 误以为不同 head 的 causal 边界不同 | 同一 sequence 的不同 head 被错误屏蔽 |
+| 只改 Q load，不改 O store | 只完成正向 packing | QKᵀ 看似正确，但输出写回错 head/sequence |
+| `GQA_RATIO` 不能整除 `BLK_M` | tile 无法分成整数个 sequence groups | 编译期或 runtime tile 维度错误 |
+
+### 十三、自测题与答案
+
+#### 1. `num_qo_heads=32`、`num_kv_heads=8`、`BLK_M=128` 时，`GQA_RATIO` 和 `SEQ_Q_PER_TILE` 是多少？
+
+答：
+
+```text
+GQA_RATIO = 32 / 8 = 4
+SEQ_Q_PER_TILE = 128 / 4 = 32
+```
+
+#### 2. `kv_head_idx=3` 时，packed row 0、5、127 分别对应哪个 sequence 和哪个 query head？
+
+答：
+
+```text
+row 0   -> sequence 0,  qo_head 12
+row 5   -> sequence 1,  qo_head 13
+row 127 -> sequence 31, qo_head 15
+```
+
+#### 3. 为什么这 128 条 Q rows 可以共享同一份 K/V tile？
+
+答：它们的 global query heads 都在 `[12, 16)`，除以 `GQA_RATIO=4`
+后都属于 `kv_head_idx=3`。GQA 明确规定这个 query-head group 共享
+同一份 K/V。
+
+#### 4. `GQA_RATIO=4` 时，两个 Q stages 覆盖多少 sequence positions？
+
+答：每个 stage 覆盖 32 个 sequence positions，两个 stages 覆盖 64 个。
+不能再沿用 `GQA_RATIO=1` 时的 256。
+
+#### 5. causal mask 需要区分同一 sequence 下的不同 query heads 吗？
+
+答：不需要。causal 边界只由 sequence position 决定，同一个 sequence
+的多个 query heads 对当前 K/V tile 拥有相同的可见 key 范围。
+
+## 二十一、下一知识点
+
+下一步进入 `8.3 Causal LPT tile scheduling`：解释 causal tasks 为什么
+会造成明显的 tail imbalance，LPT scheduler 如何先处理更靠后的 Q
+blocks，`l2_swizzle` 如何组织 `(batch, kv_head)` 使同一组 K/V 在
+L2 中更容易复用，以及非 persistent causal path 如何与 task loop 衔接。
