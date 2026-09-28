@@ -6,8 +6,8 @@
 
 本目录整理对话中围绕 GPU 数据布局、命名轴、Replication、Offset、
 shared memory swizzle、Tensor Core fragment、`ldmatrix`、K 循环
-pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影响推理
-系统中的 GEMM、Attention 以及 KV Cache 数据路径。
+pipeline、TMA 异步搬运和 Roofline 性能分析展开的内容，重点关注这些
+概念如何影响推理系统中的 GEMM、Attention 以及 KV Cache 数据路径。
 
 ## 文档索引
 
@@ -35,6 +35,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [19-gemm-warp-specialization.md](19-gemm-warp-specialization.md) | `chapter_gemm_advanced` Step 7 的 `hgemm_v7`、TMA producer / MMA consumer / writeback 三角色拆分、`tma2mma` / `mma2tma` 的 SMEM full-empty 协议、`mma2ld` / `ld2mma` 的 TMEM result-reuse 协议、named barrier、完整代码与 `PIPE_DEPTH=2` 交接 trace |
 | [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8-9 的 `hgemm_v8` / `hgemm_v9`、Two-CTA cooperative MMA、`cta_mask=3`、跨 CTA TMEM 复用、Multi-Consumer Warp Specialization、共享 staged B、`512 x 256` cluster tile、按 consumer 索引的 TMEM / barriers、`98304`-byte K-stage TMA transaction，以及完整 GPU 与静态验证代码 |
 | [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、online softmax、conditional rescaling、`S` / `P` / `O` TMEM 复用、causal mask、GQA packed rows、causal LPT scheduling、L2 swizzle、FP64 reference、`rtol` / `atol` 容差验证、完整数值与调度验证脚本 |
+| [22-roofline-and-course-completion.md](22-roofline-and-course-completion.md) | `chapter_performance` 的 arithmetic intensity、B200 ridge point、GEMM / materialized attention / Flash prefill / decode 的瓶颈分类、完整 Roofline 脚本，以及教材正文 Parts I-IV 的课程收束 |
 
 ## 当前进度
 
@@ -388,6 +389,19 @@ GQA reference 通过 repeat_interleave 将 K/V heads 展开到 Q heads
 assert_close 的逐元素条件是 abs_error <= atol + rtol * abs(expected)
 fp16 输入、fp32 累加、fp16 P、fp16 输出的实测 max_abs_error 为 1.7804e-4
 mask、scale、head layout 三类注入错误分别产生不同量级的 tolerance failure
+chapter_performance：arithmetic intensity 与 B200 ridge point
+FLOP / byte 必须对应明确的 HBM、L2 或 SMEM memory level
+B200 近似 ridge point 为 2000 / 8 = 250 FLOP/byte
+方阵 GEMM N=4096 的理想 HBM AI 为 1365.33 FLOP/byte
+单个 128x128x64 fp16 CTA stage 的局部 HBM AI 为 64 FLOP/byte
+materialized attention 在 S=4096、D=128 时 AI 为 62.06 FLOP/byte
+Flash Attention prefill 在同一配置下 AI 为 2048 FLOP/byte
+decode 一个 token、KV length 4096 时 AI 约为 1 FLOP/byte
+prefill 通常 compute-bound，单 token decode 通常 memory-bound
+memory-bound 优先减少 byte，compute-bound 优先减少 Tensor Core 等待
+完整可运行脚本 modern-gpu-programming-for-mlsys/code/roofline_capstone.py
+chapter_performance 完成
+教材正文 Parts I-IV 主线收束完成
 ```
 
 ## 下一知识点
@@ -419,6 +433,9 @@ chapter_tirx_layout_api 完成
 -> chapter_flash_attention 第 8.3 个知识点完成：Causal LPT scheduling 与 L2 swizzle
 -> chapter_flash_attention 第 8.4 个知识点完成：Reference 与容差验证
 -> chapter_flash_attention 完成
+-> chapter_performance 完成：Roofline 与瓶颈分类
+-> 教材正文 Parts I-IV 收束
+-> appendix 转为按需查阅资料
 ```
 
 ## 核心主线
@@ -450,10 +467,12 @@ TMEM lane / column 不匹配
 - Blackwell 的 TMEM、`tcgen05`、WGMMA 和 TMA 示例主要用于理解 layout 和代码路径
 - 概念学习与静态代码分析可以在 macOS 上完成，实际性能测量需要 NVIDIA GPU
 
-## 后续可继续整理
+## 后续学习方式
 
 ```text
-WGMMA / tcgen05 matrix descriptor 字段与编码
-Two-CTA Cluster 的 cooperative MMA 与 remote barrier
-FlashAttention 的 QK^T / softmax / PV 数据路径与 warp pipeline
+在真实 GPU 上做 microbenchmark
+记录 DRAM bytes、Tensor Core busy、SM busy 与主要 stall reason
+对 prefill 和 decode 分别建立性能模型
+按 appendix 的 benchmarking / debugging 指南做 profiling
+把 kernel 接入实际推理框架并测量端到端延迟与吞吐
 ```

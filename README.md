@@ -57,7 +57,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 18-gemm-persistent-kernel.md
 ├── 19-gemm-warp-specialization.md
 ├── 20-gemm-two-cta-cluster.md
-└── 21-flash-attention.md
+├── 21-flash-attention.md
+└── 22-roofline-and-course-completion.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -207,7 +208,8 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-21：
+围绕 GPU 数据布局、Tensor Core 数据路径、推理 kernel 与性能模型展开。
+当前已落盘 01-22，教材正文 Parts I-IV 主线已收束：
 
 ```text
 layout / named axes / replication / offset
@@ -374,6 +376,13 @@ FP64 oracle、生产 reference 与 PyTorch SDPA 交叉验证
 fp16 输入、fp32 累加、fp16 P、fp16 输出精度链
 assert_close 的 atol / rtol 逐元素容差、注入错误与失败定位
 完整可运行脚本：modern-gpu-programming-for-mlsys/code/flash_attention_reference_validation.py
+arithmetic intensity、HBM / compute 双屋顶与 B200 ridge point
+GEMM 理想全局模型与单个 CTA stage 的 AI 差异
+materialized attention、Flash prefill 与 decode 的瓶颈分类
+prefill 通常 compute-bound，单 token decode 通常 memory-bound
+memory-bound 优先减少 HBM bytes，compute-bound 优先减少 Tensor Core 等待
+完整可运行脚本：modern-gpu-programming-for-mlsys/code/roofline_capstone.py
+教材正文 Parts I-IV 收束，appendix 转为按需查阅资料
 ```
 
 完整文档索引、当前进度和硬件环境说明见
