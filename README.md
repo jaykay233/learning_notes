@@ -4,7 +4,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 
 | 目录 | 侧重 |
 |---|---|
-| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen …） |
+| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo …） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
@@ -67,7 +67,7 @@ cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
 speculative-decoding/        # 投机解码
 torch_compile/               # Dynamo、AOTAutograd、Dispatcher
-models/                      # DeepSeek / GLM / Kimi / Qwen 架构笔记
+models/                      # DeepSeek / GLM / Kimi / Qwen / MiMo 架构笔记
 ```
 
 完整昇腾讲义目录与学习顺序见 [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)。
@@ -115,10 +115,12 @@ models/
 │   └── architecture.md   # Kimi-K3：MLA / KDA / MoE / AttnRes
 ├── qwen-3.8/
 │   └── architecture.md   # Qwen3.8-2.4T-A95B：GDN + Gated GQA + MoE（无 QSA）
-└── qwen3.8-flash-next/
-    ├── architecture.md   # Qwen3.8-Flash-Next 总览（Qwen4 预览）
-    ├── qsa.md            # Qwen Sparse Attention（c4 indexer → 稀疏 GQA）
-    └── ple.md            # N-gram / PLE（hash 查表、门控注入 HC）
+├── qwen3.8-flash-next/
+│   ├── architecture.md   # Qwen3.8-Flash-Next 总览（Qwen4 预览）
+│   ├── qsa.md            # Qwen Sparse Attention（c4 indexer → 稀疏 GQA）
+│   └── ple.md            # N-gram / PLE（hash 查表、门控注入 HC）
+└── mimo-v2.6-flash/
+    └── architecture.md   # MiMo-V2.6-Flash：多模态、SWA/GA、GQA、MoE、MTP
 ```
 
 ## 昇腾 AI 编译器讲义
@@ -162,12 +164,14 @@ models/
 | `kimi-k3/` | Kimi-K3 | **KDA + MLA** | **AttnRes** | 对称 KDA 等 |
 | `qwen-3.8/` | Qwen3.8-2.4T-A95B | **GDN + Gated GQA** | 单流 | **无 QSA / 无 PLE** |
 | `qwen3.8-flash-next/` | Qwen3.8-Flash-Next | **GDN + QSA** | **HC 4 路 + PLE ~51B** | `qwen4_exp`；≠ 旧 Qwen3-Next-80B |
+| `mimo-v2.6-flash/` | MiMo-V2.6-Flash | **SWA + GA** | Sparse MoE，309B / 15B active | 原生文本、图像、视频、音频；带 MTP |
 
 易混：
 
 - **Qwen3.8** ≠ Qwen3-**8B** dense；本仓是 **2.4T-A95B** MoE。
 - **Qwen3.8-Flash-Next** ≠ 旧 `Qwen3-Next-80B-A3B`；是 Qwen4 架构预览。
 - **GLM-5.3**（MLA+DSA text）≠ **GLM-5.3-Flash**（KDA hybrid + mHC）。
+- **MiMo 的 GA/SWA 与 GQA 是不同概念**：前两者描述注意力范围，GQA 描述 Q/KV 头分组；两种注意力都使用 GQA。
 
 ## 专题索引
 
@@ -194,6 +198,7 @@ models/
 | AttnRes | [kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | PLE / N-gram embedding | [qwen3.8-flash-next/ple.md](models/qwen3.8-flash-next/ple.md) |
 | MQA / CSA / HCA | [deepseek_v4/mqa.md](models/deepseek_v4/mqa.md)、[deepseek_v4/architecture.md](models/deepseek_v4/architecture.md) |
+| MiMo-V2.6-Flash / SWA / GA / MTP | [mimo-v2.6-flash/architecture.md](models/mimo-v2.6-flash/architecture.md) |
 
 ---
 
@@ -469,6 +474,12 @@ Qwen4 架构预览（`qwen4_exp`）：GDN + **QSA**，**Gated Residual（HC×4�
 | [architecture.md](models/qwen3.8-flash-next/architecture.md) | 配置总览、GDN/QSA 混排、HC Mix/Combine、PLE 入口 |
 | [qsa.md](models/qwen3.8-flash-next/qsa.md) | c4 压缩 indexer、`update_compressed_index_cache`、expand_blocks / unfinished 尾巴、稀疏 GQA、MTP IndexShare |
 | [ple.md](models/qwen3.8-flash-next/ple.md) | PLE 动机、可学习 N-gram 表、int64 hash、`gate(norm(Q),norm(K))`、注入 HC、host offload |
+
+## MiMo-V2.6-Flash
+
+| 文档 | 内容 |
+|---|---|
+| [architecture.md](models/mimo-v2.6-flash/architecture.md) | 多模态编码器、SWA/GA + GQA 公式、稀疏 MoE 与 MTP |
 
 要点备忘：
 
