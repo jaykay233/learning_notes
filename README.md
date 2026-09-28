@@ -4,7 +4,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 
 | 目录 | 侧重 |
 |---|---|
-| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo …） |
+| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo / Hunyuan Hy4 …） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
@@ -119,8 +119,10 @@ models/
 │   ├── architecture.md   # Qwen3.8-Flash-Next 总览（Qwen4 预览）
 │   ├── qsa.md            # Qwen Sparse Attention（c4 indexer → 稀疏 GQA）
 │   └── ple.md            # N-gram / PLE（hash 查表、门控注入 HC）
-└── mimo-v2.6-flash/
-    └── architecture.md   # MiMo-V2.6-Flash：多模态、SWA/GA、GQA、MoE、MTP
+├── mimo-v2.6-flash/
+│   └── architecture.md   # MiMo-V2.6-Flash：多模态、SWA/GA、GQA、MoE、MTP
+└── hy4-preview/
+    └── architecture.md   # Hunyuan Hy4 Preview：Gated DSA + IndexCache、MoE、iHC
 ```
 
 ## 昇腾 AI 编译器讲义
@@ -165,6 +167,7 @@ models/
 | `qwen-3.8/` | Qwen3.8-2.4T-A95B | **GDN + Gated GQA** | 单流 | **无 QSA / 无 PLE** |
 | `qwen3.8-flash-next/` | Qwen3.8-Flash-Next | **GDN + QSA** | **HC 4 路 + PLE ~51B** | `qwen4_exp`；≠ 旧 Qwen3-Next-80B |
 | `mimo-v2.6-flash/` | MiMo-V2.6-Flash | **SWA + GA** | Sparse MoE，309B / 15B active | 原生文本、图像、视频、音频；带 MTP |
+| `hy4-preview/` | Hunyuan Hy4 Preview | **Gated DSA + IndexCache** | **iHC 4 路** | 770B / 49B active；256 routed + 1 shared；带 MTP |
 
 易混：
 
@@ -172,6 +175,8 @@ models/
 - **Qwen3.8-Flash-Next** ≠ 旧 `Qwen3-Next-80B-A3B`；是 Qwen4 架构预览。
 - **GLM-5.3**（MLA+DSA text）≠ **GLM-5.3-Flash**（KDA hybrid + mHC）。
 - **MiMo 的 GA/SWA 与 GQA 是不同概念**：前两者描述注意力范围，GQA 描述 Q/KV 头分组；两种注意力都使用 GQA。
+- **Hy4 的 `num_key_value_heads=8` 不表示普通 GQA**：MLA 会把 KV latent 展开到 64 个 attention heads；实际复用方式以 `HYV4Config.__post_init__` 和模型实现为准。
+- **Hy4 的 iHC 不等于 mHC**：iHC 固定 \(H_{\text{res}}=I_4\)，删除 mHC 的动态 `comb` 与 Sinkhorn。
 
 ## 专题索引
 
@@ -192,6 +197,7 @@ models/
 | torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |
+| Gated DSA / IndexCache / iHC | [hy4-preview/architecture.md](models/hy4-preview/architecture.md) |
 | QSA（block 粗选 → token 展开） | [qwen3.8-flash-next/qsa.md](models/qwen3.8-flash-next/qsa.md) |
 | Linear / gated delta（KDA / GDN / Radix） | [glm-5.3-flash/radix_linear_attention.md](models/glm-5.3-flash/radix_linear_attention.md)、[qwen-3.8/architecture.md](models/qwen-3.8/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | mHC / HC / Gated Residual | [deepseek_v4/mhc.md](models/deepseek_v4/mhc.md)、[qwen3.8-flash-next/architecture.md](models/qwen3.8-flash-next/architecture.md)（HC；无 Sinkhorn） |
