@@ -56,7 +56,8 @@ modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── 17-gemm-software-pipeline.md
 ├── 18-gemm-persistent-kernel.md
 ├── 19-gemm-warp-specialization.md
-└── 20-gemm-two-cta-cluster.md
+├── 20-gemm-two-cta-cluster.md
+└── 21-flash-attention.md
 quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
@@ -206,7 +207,7 @@ models/
 
 ## Modern GPU Programming for MLSys
 
-围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-20：
+围绕 GPU 数据布局、Tensor Core 数据路径与推理 kernel 展开。当前已落盘 01-21：
 
 ```text
 layout / named axes / replication / offset
@@ -355,6 +356,24 @@ ClusterPersistentScheduler2D 统一生成 tile 坐标并按 l2_group_size 调整
 TMEM、SMEM allocation 和 barriers 在 CTA 生命周期内只初始化一次
 K_TILES=64、PIPE_DEPTH=2 时 barrier completion 次数为偶数，块边界可安全重置 phase
 chapter_gemm_async 第 6 步完成：Persistent Kernel + Tile Scheduler
+```
+
+第 21 章 `chapter_flash_attention` 已完成，新增内容包括：
+
+```text
+Q/K/V tile 分解与 online softmax 三状态
+FA4 conditional rescaling、delta 与 acc_scale
+S / P / O 的 TMEM layout 与分时复用
+QK^T MMA、softmax、PV MMA 的完整数据路径
+Warp 角色、register 分配与 barrier 分工
+Q / K / V software pipeline 时间线
+Correction、最终归一化与 epilogue
+Causal mask、GQA packed Q rows 与 K/V 复用
+Causal LPT tile scheduling 与 L2 swizzle
+FP64 oracle、生产 reference 与 PyTorch SDPA 交叉验证
+fp16 输入、fp32 累加、fp16 P、fp16 输出精度链
+assert_close 的 atol / rtol 逐元素容差、注入错误与失败定位
+完整可运行脚本：modern-gpu-programming-for-mlsys/code/flash_attention_reference_validation.py
 ```
 
 完整文档索引、当前进度和硬件环境说明见

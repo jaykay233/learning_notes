@@ -34,7 +34,7 @@ pipeline 和 TMA 异步搬运展开的内容，重点关注这些概念如何影
 | [18-gemm-persistent-kernel.md](18-gemm-persistent-kernel.md) | `hgemm_v6` 的 1D persistent CTA grid、`ClusterPersistentScheduler2D`、`work_id` / `init(bx)` / stride 148、M 优先与 N 优先的完整编号对照、`l2_group_size=8` 的 L2 locality、CTA 生命周期内复用 TMEM / SMEM / barriers，以及 barrier phase parity 证明 |
 | [19-gemm-warp-specialization.md](19-gemm-warp-specialization.md) | `chapter_gemm_advanced` Step 7 的 `hgemm_v7`、TMA producer / MMA consumer / writeback 三角色拆分、`tma2mma` / `mma2tma` 的 SMEM full-empty 协议、`mma2ld` / `ld2mma` 的 TMEM result-reuse 协议、named barrier、完整代码与 `PIPE_DEPTH=2` 交接 trace |
 | [20-gemm-two-cta-cluster.md](20-gemm-two-cta-cluster.md) | `chapter_gemm_advanced` Step 8-9 的 `hgemm_v8` / `hgemm_v9`、Two-CTA cooperative MMA、`cta_mask=3`、跨 CTA TMEM 复用、Multi-Consumer Warp Specialization、共享 staged B、`512 x 256` cluster tile、按 consumer 索引的 TMEM / barriers、`98304`-byte K-stage TMA transaction，以及完整 GPU 与静态验证代码 |
-| [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、online softmax、conditional rescaling、`S` / `P` / `O` TMEM 复用、causal mask、GQA packed rows、causal LPT scheduling、L2 swizzle、完整数值与调度验证脚本 |
+| [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、online softmax、conditional rescaling、`S` / `P` / `O` TMEM 复用、causal mask、GQA packed rows、causal LPT scheduling、L2 swizzle、FP64 reference、`rtol` / `atol` 容差验证、完整数值与调度验证脚本 |
 
 ## 当前进度
 
@@ -381,6 +381,13 @@ causal task 成本随 m_block 增大而阶梯上升
 task index 先按 l2_swizzle 分组，再反转 m_block 顺序
 示例配置下 LPT 最大 worker load 为 40，natural order 为 44
 causal path 每个 CTA 只处理一个 task，next_tile 直接结束 loop
+chapter_flash_attention 第 8.4 个知识点完成：Reference 与容差验证
+FP64 reference 是数学 oracle，生产 reference 是序列和 API 语义 oracle
+GQA reference 通过 repeat_interleave 将 K/V heads 展开到 Q heads
+非方阵 causal mask 使用 k <= q + (SEQ_LEN_KV - SEQ_LEN_Q)
+assert_close 的逐元素条件是 abs_error <= atol + rtol * abs(expected)
+fp16 输入、fp32 累加、fp16 P、fp16 输出的实测 max_abs_error 为 1.7804e-4
+mask、scale、head layout 三类注入错误分别产生不同量级的 tolerance failure
 ```
 
 ## 下一知识点
@@ -410,7 +417,8 @@ chapter_tirx_layout_api 完成
 -> chapter_flash_attention 第 8.1 个知识点完成：Causal mask
 -> chapter_flash_attention 第 8.2 个知识点完成：GQA packed Q rows 与 K/V 复用
 -> chapter_flash_attention 第 8.3 个知识点完成：Causal LPT scheduling 与 L2 swizzle
--> chapter_flash_attention 第 8.4 个知识点：Reference 与容差验证
+-> chapter_flash_attention 第 8.4 个知识点完成：Reference 与容差验证
+-> chapter_flash_attention 完成
 ```
 
 ## 核心主线

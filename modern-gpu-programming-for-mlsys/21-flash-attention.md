@@ -55,7 +55,7 @@ PTX：本节先建立算法和数值状态；后续映射到 tcgen05.mma、
     [x] 8.1 Causal mask：block 跳过与块内列屏蔽
     [x] 8.2 GQA packed Q rows 与 K/V 复用
     [x] 8.3 Causal LPT tile scheduling 与 L2 swizzle
-    [ ] 8.4 Reference 与容差验证
+    [x] 8.4 Reference 与容差验证
 ```
 
 ## 一、问题：完整 attention 为什么会产生平方级中间量
@@ -8137,8 +8137,889 @@ residual 0..7 只负责把这 8 个 tasks 分给 8 个 KV heads。
 
 答：LPT 为 `40`，natural order 为 `44`；总工作量均为 160。
 
-## 二十二、下一知识点
+## 二十二、8.4 Reference 与容差验证
 
-下一步进入 `8.4 Reference and tolerance verification`：把 FA4 输出与
-PyTorch attention reference 对齐，解释 fp16 输入、fp32 累加、输出
-cast 和 `rtol` / `atol` 容差的关系，并给出可执行验证与失败定位方法。
+```text
+本次讲解位置
+章节：chapter_flash_attention
+小节：8.4 Reference and tolerance verification
+知识点：FP64 oracle、生产 reference、精度链与 rtol / atol 容差
+上次：Causal LPT tile scheduling 与 L2 swizzle
+下次：chapter_flash_attention 完成；下一章待课程主线继续展开
+PTX：无新指令；验证对象是 tcgen05 QK^T、softmax、PV MMA、
+      tcgen05.ld 与最终 fp16 store 共同产生的数值结果
+```
+
+### 为什么现在讲这个
+
+前三个知识点已经说明了 causal mask 应该屏蔽哪些位置、GQA 应该复用
+哪些 K/V heads、LPT 应该先发射哪些 tile。但这些都是“代码应该怎样
+计算”的规约。一个 kernel 仍然可能在数据布局、mask 边界、scale、
+softmax 或写回阶段出错，而且 fp16 Tensor Core 路径也不可能与 CPU
+浮点实现逐 bit 相等。
+
+所以这里要解决两个问题：
+
+1. 如何判断输出错位、mask 错误或数值误差过大的具体类别。
+2. 如何区分“允许的浮点舍入差异”和“真实的语义 bug”。
+
+如果直接使用 `torch.equal`，正常 fp16 kernel 会因为累加顺序、P 的
+舍入和输出 cast 失败；如果只打印一个 `max_abs_error`，又无法判断
+小误差是来自参考实现的 dtype，还是来自真实的数据错误。容差验证的
+作用是把数学正确性、语义正确性和硬件数值误差分层检查。
+
+### 三个验证对象不是同一件事
+
+生产代码中的 reference 与 fp64 oracle 用途不同：
+
+| 验证对象 | 主要用途 | 能回答的问题 | 不能替代什么 |
+|---|---|---|---|
+| FP64 oracle | 数学真值 | 公式、GQA、mask、scale 是否正确 | 不能证明生产 API 的边界行为完全一致 |
+| Production reference | 序列语义与生产实现对照 | causal、非方阵、GQA、特殊 layout 是否符合生态约定 | 它自己也可能存在边界差异 |
+| SDPA / PyTorch | 独立实现交叉检查 | 基础 attention 公式是否与常见框架一致 | 不覆盖 FA4 的 TMEM 或 barrier 细节 |
+| Kernel output | 实际交付结果 | fp16 Tensor Core 路径是否落在容差内 | 单独看它无法证明公式正确 |
+
+官方 FA4 测试中使用 production reference：
+
+```python
+from flash_attn.cute.interface import _flash_attn_fwd
+
+ref = _flash_attn_fwd(
+    q=q_dev,
+    k=k_dev,
+    v=v_dev,
+    softmax_scale=1.0 / math.sqrt(head_dim),
+    causal=is_causal,
+)[0]
+
+torch.testing.assert_close(out, ref, rtol=0.01, atol=0.01)
+```
+
+专用 FP4/量化版本则保留了一个 fp64 oracle，位置在
+`flash_attention4_fp4.py::reference_attention_fp64`：
+
+```python
+b, sq, h, d = q.shape
+hk = k.shape[2]
+
+q64 = q.double().permute(0, 2, 1, 3)
+k64 = k.double().permute(0, 2, 1, 3).repeat_interleave(h // hk, dim=1)
+v64 = v.double().permute(0, 2, 1, 3).repeat_interleave(h // hk, dim=1)
+
+s = torch.matmul(q64, k64.transpose(-1, -2)) * softmax_scale
+if is_causal:
+    sk = k.shape[1]
+    row = torch.arange(sq, device=q.device)[:, None]
+    col = torch.arange(sk, device=q.device)[None, :]
+    s = s.masked_fill(col > row + (sk - sq), float("-inf"))
+
+p = torch.softmax(s, dim=-1)
+return torch.matmul(p, v64).permute(0, 2, 1, 3)
+```
+
+### GQA 在 reference 中怎样展开
+
+测试输入通常保持 Q 和 K/V 的 head 数分开：
+
+```text
+Q:  [B, Sq,  Hq,  D]
+K:  [B, Skv, Hkv, D]
+V:  [B, Skv, Hkv, D]
+```
+
+若：
+
+```text
+Hq = 4
+Hkv = 2
+GQA_RATIO = Hq // Hkv = 2
+```
+
+则每个 K/V head 对应两个相邻 Q heads：
+
+```text
+q head 0 -> kv head 0
+q head 1 -> kv head 0
+q head 2 -> kv head 1
+q head 3 -> kv head 1
+```
+
+reference 使用：
+
+```python
+k64 = k64.repeat_interleave(h // hk, dim=1)
+v64 = v64.repeat_interleave(h // hk, dim=1)
+```
+
+这里的 `repeat_interleave` 不是复制 KV cache 到生产路径，而是让
+reference 临时拥有与 Q 相同的 head 数，以便执行普通 attention。
+kernel 侧仍然只加载一份 K/V，并通过 packed Q rows 复用它们。
+
+### 非方阵 causal mask 的边界
+
+生产 attention 经常出现：
+
+```text
+SEQ_LEN_Q != SEQ_LEN_KV
+```
+
+例如 decoder 的最后一次验证、chunked prefill 或 KV cache 场景。
+fp64 reference 使用右下角对齐：
+
+```text
+k <= q + (SEQ_LEN_KV - SEQ_LEN_Q)
+```
+
+设：
+
+```text
+SEQ_LEN_Q  = 4
+SEQ_LEN_KV = 6
+offset = 6 - 4 = 2
+```
+
+则：
+
+| query row `q` | 可见 key columns |
+|---|---|
+| 0 | 0, 1, 2 |
+| 1 | 0, 1, 2, 3 |
+| 2 | 0, 1, 2, 3, 4 |
+| 3 | 0, 1, 2, 3, 4, 5 |
+
+这不是把所有 `q < k` 都屏蔽掉的左上角三角，而是把最后一个 query
+与最后一个 key 对齐。若这里使用错误的 causal 约定，错误会在
+sequence 长度不同的测试中集中出现，而等长测试可能完全正常。
+
+### Kernel 数值链
+
+下面的验证脚本模拟 FA4 最关键的数值边界：
+
+| 阶段 | 数据形式 | 说明 |
+|---|---|---|
+| Q、K、V 输入 | fp16 | 进入 Tensor Core 前的元素精度 |
+| QK^T accumulation | fp32 | 乘积进入 fp32 accumulator |
+| S / softmax | fp32 | 指数、最大值和求和使用 fp32 |
+| P | fp16 | P 写回 TMEM 供 PV MMA 使用 |
+| PV accumulation | fp32 | 使用 fp16 P 与 fp16 V，累加仍按 fp32 |
+| O 输出 | fp16 | 最终写回 GMEM 的元素精度 |
+| 验证输入 | fp32 view | 先把 kernel 输出 cast 到 fp32，再与 oracle 比较 |
+
+关键点不是“fp16 kernel 等于 fp16 参考”，而是：
+
+```text
+数学真值：fp64
+实际输出：fp16
+比较空间：fp32
+允许误差：atol + rtol * abs(expected)
+```
+
+如果把 fp16 输出和 fp64 oracle 直接做 bitwise 比较，必然失败；
+如果把两者差值先转成 fp16，再拿这个差异去推断 fp32 内部的 layout
+错误，量化误差又会掩盖真正的错位。
+
+### 容差不是“误差小于某个数字”
+
+`torch.testing.assert_close` 的核心逐元素条件是：
+
+```text
+abs(actual - expected) <= atol + rtol * abs(expected)
+```
+
+含义分别是：
+
+| 参数 | 主导场景 | 作用 |
+|---|---|---|
+| `atol` | expected 接近 0 | 给绝对值误差一个下限 |
+| `rtol` | expected 较大 | 按参考值相对缩放容差 |
+
+例如某个元素：
+
+```text
+actual   = 0.2512207031
+expected = 0.2513987466
+rtol     = 0.01
+atol     = 0.01
+```
+
+计算：
+
+```text
+abs_error = |0.2512207031 - 0.2513987466|
+          = 0.0001780434936
+
+allowed = 0.01 + 0.01 * |0.2513987466|
+        = 0.012513987466
+
+ratio = 0.0001780434936 / 0.012513987466
+      = 0.014228
+```
+
+因为：
+
+```text
+0.014228 <= 1
+```
+
+这个元素通过。真正的判定量应写成：
+
+```text
+max(abs_error / allowed) <= 1
+```
+
+只看 `max_abs_error` 会遗漏 expected 很小或很大的元素，因为允许
+误差随 expected 改变。
+
+### 完整可运行验证脚本
+
+文件名：
+`modern-gpu-programming-for-mlsys/code/flash_attention_reference_validation.py`
+
+```python
+"""Reference and tolerance validation for FlashAttention-style outputs.
+
+Run with a Python environment that contains PyTorch:
+
+    python3 flash_attention_reference_validation.py
+
+The script does not require CUDA. It compares three things:
+
+1. A fp64 attention oracle, used as the mathematical truth.
+2. A simulated kernel path with fp16 inputs, fp32 accumulation, fp16 P, and
+   fp16 output, used to model the actual numeric contract.
+3. PyTorch SDPA on a small equal-length case, used as a second implementation.
+
+It also injects mask, scale, and head-layout errors and confirms that the same
+validator rejects each one.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+
+
+@dataclass
+class Comparison:
+    name: str
+    max_abs: float
+    max_allowed: float
+    max_ratio: float
+    cosine: float
+    passed: bool
+
+
+def _repeat_kv_heads(x: torch.Tensor, num_q_heads: int) -> torch.Tensor:
+    """Expand [B, S, Hkv, D] to [B, S, Hq, D]."""
+    num_kv_heads = x.shape[2]
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError("num_q_heads must be divisible by num_kv_heads")
+    if num_q_heads == num_kv_heads:
+        return x
+    return x.repeat_interleave(num_q_heads // num_kv_heads, dim=2)
+
+
+def causal_mask(
+    seq_len_q: int,
+    seq_len_kv: int,
+    *,
+    device: torch.device,
+) -> torch.Tensor:
+    """Bottom-right aligned causal mask for possibly unequal sequence lengths.
+
+    A query row q may attend to key column k iff:
+
+        k <= q + (seq_len_kv - seq_len_q)
+
+    The offset keeps the last query aligned with the last key. This is the
+    convention used by the FP64 reference in flash_attention4_fp4.py.
+    """
+    row = torch.arange(seq_len_q, device=device)[:, None]
+    col = torch.arange(seq_len_kv, device=device)[None, :]
+    return col <= row + (seq_len_kv - seq_len_q)
+
+
+def reference_attention_fp64(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    *,
+    causal: bool,
+) -> torch.Tensor:
+    """Plain attention in fp64, with GQA expansion by repeating K/V heads."""
+    b, sq, hq, _ = q.shape
+    k_expanded = _repeat_kv_heads(k, hq)
+    v_expanded = _repeat_kv_heads(v, hq)
+
+    q64 = q.double().permute(0, 2, 1, 3)
+    k64 = k_expanded.double().permute(0, 2, 1, 3)
+    v64 = v_expanded.double().permute(0, 2, 1, 3)
+
+    scores = torch.matmul(q64, k64.transpose(-1, -2)) * softmax_scale
+    if causal:
+        keep = causal_mask(sq, k.shape[1], device=q.device)
+        scores = scores.masked_fill(~keep, float("-inf"))
+
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.matmul(probs, v64)
+    return out.permute(0, 2, 1, 3).contiguous()
+
+
+def simulate_kernel_precision(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    *,
+    causal: bool,
+) -> torch.Tensor:
+    """Approximate the FA4 numeric path without running a GPU kernel.
+
+    The input tensors are fp16. Scores and accumulation are fp32. P is rounded
+    to fp16 before the PV matmul, and the final result is stored as fp16.
+    """
+    b, sq, hq, _ = q.shape
+    k_expanded = _repeat_kv_heads(k, hq).float()
+    v_expanded = _repeat_kv_heads(v, hq).float()
+
+    q_fp32 = q.float().permute(0, 2, 1, 3)
+    k_fp32 = k_expanded.permute(0, 2, 1, 3)
+    v_fp32 = v_expanded.permute(0, 2, 1, 3)
+
+    scores = torch.matmul(q_fp32, k_fp32.transpose(-1, -2)) * softmax_scale
+    if causal:
+        keep = causal_mask(sq, k.shape[1], device=q.device)
+        scores = scores.masked_fill(~keep, float("-inf"))
+
+    probs_fp32 = torch.softmax(scores, dim=-1)
+    probs_fp16_for_pv = probs_fp32.half().float()
+    out_fp32 = torch.matmul(probs_fp16_for_pv, v_fp32)
+    out_fp16 = out_fp32.permute(0, 2, 1, 3).contiguous().half()
+    return out_fp16
+
+
+def compare(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> Comparison:
+    """Measure the same pointwise inequality used by assert_close."""
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"{name}: shape mismatch, actual={tuple(actual.shape)}, "
+            f"expected={tuple(expected.shape)}"
+        )
+
+    actual64 = actual.double()
+    expected64 = expected.double()
+    abs_error = (actual64 - expected64).abs()
+    allowed = atol + rtol * expected64.abs()
+    max_ratio = (abs_error / allowed).max().item()
+
+    cosine = F.cosine_similarity(
+        actual64.flatten(),
+        expected64.flatten(),
+        dim=0,
+        eps=1e-12,
+    ).item()
+
+    max_abs = abs_error.max().item()
+    max_allowed = allowed.max().item()
+    passed = max_ratio <= 1.0
+
+    if not passed:
+        raise AssertionError(
+            f"{name}: tolerance failed, max_ratio={max_ratio:.6g}, "
+            f"max_abs={max_abs:.6g}, max_allowed={max_allowed:.6g}"
+        )
+
+    return Comparison(
+        name=name,
+        max_abs=max_abs,
+        max_allowed=max_allowed,
+        max_ratio=max_ratio,
+        cosine=cosine,
+        passed=passed,
+    )
+
+
+def expect_failure(
+    name: str,
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> str:
+    try:
+        compare(name, actual, expected, rtol=rtol, atol=atol)
+    except AssertionError as exc:
+        return str(exc).splitlines()[0]
+    raise AssertionError(f"{name}: validator unexpectedly accepted a bad output")
+
+
+def swap_two_heads(x: torch.Tensor) -> torch.Tensor:
+    if x.shape[2] < 2:
+        raise ValueError("need at least two heads")
+    result = x.clone()
+    result[:, :, 0, :], result[:, :, 1, :] = (
+        x[:, :, 1, :].clone(),
+        x[:, :, 0, :].clone(),
+    )
+    return result
+
+
+def print_comparison(label: str, result: Comparison) -> None:
+    print(f"{label}:")
+    print(f"  max_abs_error   = {result.max_abs:.8e}")
+    print(f"  max_allowed     = {result.max_allowed:.8e}")
+    print(f"  max_error_ratio = {result.max_ratio:.6f}  (pass iff <= 1)")
+    print(f"  cosine_similarity = {result.cosine:.10f}")
+
+
+def print_tolerance_trace(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    """Print one concrete element and its pointwise tolerance calculation."""
+    actual64 = actual.double().flatten()
+    expected64 = expected.double().flatten()
+    abs_error = (actual64 - expected64).abs()
+    index = int(abs_error.argmax().item())
+    allowed = atol + rtol * expected64[index].abs()
+    print("worst element trace:")
+    print(f"  flat_index = {index}")
+    print(f"  actual     = {actual64[index].item():.10f}")
+    print(f"  expected   = {expected64[index].item():.10f}")
+    print(f"  abs_error  = {abs_error[index].item():.10e}")
+    print(f"  allowed    = atol + rtol * abs(expected)")
+    print(
+        f"             = {atol:.1e} + {rtol:.1e} * "
+        f"{expected64[index].abs().item():.10f}"
+        f" = {allowed.item():.10e}"
+    )
+    print(f"  ratio      = {abs_error[index].item() / allowed.item():.6f}")
+
+
+def run_small_trace() -> None:
+    """A 1x2 problem that can be followed by hand."""
+    q = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], dtype=torch.float64)
+    k = torch.tensor([[[[1.0, 0.0]], [[0.0, 1.0]]]], dtype=torch.float64)
+    v = torch.tensor([[[[10.0, 0.0]], [[0.0, 20.0]]]], dtype=torch.float64)
+    scale = 1.0 / math.sqrt(2.0)
+
+    full = reference_attention_fp64(q, k, v, scale, causal=False)
+    causal = reference_attention_fp64(q, k, v, scale, causal=True)
+    print("manual 2x2 trace:")
+    print("  scores = [[1, 0], [0, 1]] / sqrt(2)")
+    print(f"  full   = {full.flatten().tolist()}")
+    print(f"  causal = {causal.flatten().tolist()}")
+
+
+def main() -> None:
+    torch.manual_seed(0)
+
+    batch_size = 2
+    seq_len_q = 6
+    seq_len_kv = 8
+    num_q_heads = 4
+    num_kv_heads = 2
+    head_dim = 8
+    scale = 1.0 / math.sqrt(head_dim)
+
+    q = torch.randn(
+        batch_size,
+        seq_len_q,
+        num_q_heads,
+        head_dim,
+        dtype=torch.float16,
+    ) * 0.25
+    k = torch.randn(
+        batch_size,
+        seq_len_kv,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+    ) * 0.25
+    v = torch.randn(
+        batch_size,
+        seq_len_kv,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float16,
+    ) * 0.25
+
+    print("input shapes:")
+    print(f"  Q = {tuple(q.shape)}  [B, Sq, Hq, D]")
+    print(f"  K = {tuple(k.shape)}  [B, Skv, Hkv, D]")
+    print(f"  V = {tuple(v.shape)}  [B, Skv, Hkv, D]")
+    print(f"  softmax_scale = {scale:.10f}")
+
+    reference = reference_attention_fp64(q, k, v, scale, causal=True)
+    kernel_like = simulate_kernel_precision(q, k, v, scale, causal=True)
+    actual_fp32 = kernel_like.float()
+
+    direct_kernel_vs_fp64 = compare(
+        "cast(kernel_output, fp32) vs fp64 oracle",
+        actual_fp32,
+        reference,
+    )
+    print_comparison("kernel precision path vs fp64 oracle", direct_kernel_vs_fp64)
+    print_tolerance_trace(actual_fp32, reference, rtol=1e-2, atol=1e-2)
+
+    # Second implementation check on equal sequence lengths. In this case
+    # PyTorch's is_causal convention and the bottom-right mask coincide.
+    sdpa_k = _repeat_kv_heads(k[:, :seq_len_q], num_q_heads)
+    sdpa_v = _repeat_kv_heads(v[:, :seq_len_q], num_q_heads)
+    sdpa_out = F.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        sdpa_k.transpose(1, 2)[:, :, :seq_len_q, :],
+        sdpa_v.transpose(1, 2)[:, :, :seq_len_q, :],
+        is_causal=True,
+    ).transpose(1, 2).float()
+
+    sdpa_ref = reference_attention_fp64(
+        q,
+        k[:, :seq_len_q],
+        v[:, :seq_len_q],
+        scale,
+        causal=True,
+    )
+    sdpa_comparison = compare("PyTorch SDPA vs fp64 oracle", sdpa_out, sdpa_ref)
+    print_comparison("PyTorch SDPA vs fp64 oracle", sdpa_comparison)
+
+    bad_mask = simulate_kernel_precision(q, k, v, scale, causal=False)
+    bad_scale = simulate_kernel_precision(q, k, v, 1.0, causal=True)
+    bad_layout = swap_two_heads(kernel_like)
+
+    failures = [
+        expect_failure("mask error", bad_mask.float(), reference),
+        expect_failure("scale error", bad_scale.float(), reference),
+        expect_failure("head-layout error", bad_layout.float(), reference),
+    ]
+    print("expected rejected failures:")
+    for failure in failures:
+        print(f"  {failure}")
+
+    run_small_trace()
+
+    # assert_close checks dtype by default. The FP64 oracle remains the source
+    # of truth for error statistics; for this dtype-checked call, compare the
+    # rounded kernel output against the oracle rounded to fp32.
+    torch.testing.assert_close(
+        actual_fp32,
+        reference.float(),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="FA-style output must remain inside the reference tolerance",
+    )
+    print("torch.testing.assert_close: PASS")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+### 逐段解释
+
+#### 1. `_repeat_kv_heads`
+
+输入 shape 是 `[B, S, Hkv, D]`，输出是 `[B, S, Hq, D]`。
+它只用于 test reference，不是生产 kernel 的数据搬运方案。
+
+错误做法是直接把 K/V 当成已经展开的 `Hq`，这会让 GQA 测试出现
+shape 错误，或者把错误 head 的 K/V 拼进 attention。
+
+#### 2. `causal_mask`
+
+```python
+row = torch.arange(seq_len_q)[:, None]
+col = torch.arange(seq_len_kv)[None, :]
+keep = col <= row + (seq_len_kv - seq_len_q)
+```
+
+`row` shape 是 `[Sq, 1]`，`col` shape 是 `[1, Skv]`，广播后得到
+`[Sq, Skv]`。`keep` 可以直接用于 `masked_fill`，其中
+`masked_fill(~keep, -inf)` 与“mask 掉不可见位置”的语义一致。
+
+#### 3. `reference_attention_fp64`
+
+数据路径是：
+
+```text
+q[fp16] -> q64[fp64]
+k/v[fp16] -> repeat heads -> fp64
+QK^T -> scale -> causal mask
+softmax -> PV -> [B, H, S, D] -> [B, S, H, D]
+```
+
+这里不计算 online softmax，也不分 tile。它是 oracle，目标是最好地表示
+数学公式，而不是复现 kernel 的巨大 state 或内存布局。
+
+#### 4. `simulate_kernel_precision`
+
+这个函数模拟的是精度链，不是性能和调度：
+
+```text
+q/k/v fp16
+-> fp32 QK^T 累加
+-> fp32 softmax
+-> P 舍入到 fp16
+-> fp32 PV 累加
+-> O 舍入到 fp16
+```
+
+这一步把“数学实现”和“数值精度”分开。即使 oracle 公式完全正确，
+kernel 的输出仍会因为 P 舍入、乘加顺序和 fp16 store 产生小误差。
+
+#### 5. `compare`
+
+先检查 shape，再计算：
+
+```python
+abs_error = (actual - expected).abs()
+allowed = atol + rtol * expected.abs()
+max_ratio = (abs_error / allowed).max()
+```
+
+最后的 `max_ratio <= 1` 才是与 `assert_close` 一致的判定。输出中同时
+保留 `max_abs`、`max_allowed` 和 `cosine`，因为它们分别回答：
+
+```text
+max_abs:     最大绝对差是多少
+max_allowed: 对应的允许量级
+cosine:      向量方向是否仍然一致
+```
+
+#### 6. 三种注入错误
+
+`bad_mask` 把 causal 关闭，模拟 mask 或 causal offset 错误。
+`bad_scale` 使用 `1.0` 而不是 `1 / sqrt(D)`，模拟 scale 漏乘或位置错误。
+`bad_layout` 交换两个 heads，shape 不变，但语义已经错位。
+
+这三种错误都能通过 shape 检查，因此只用 shape 验证无法发现。它们的
+误差量级不同：
+
+| 注入错误 | max_ratio | max_abs | 说明 |
+|---|---:|---:|---|
+| mask 错误 | 21.9106 | 0.281779 | 多读了未来 positions，误差最大 |
+| scale 错误 | 7.33758 | 0.0742902 | softmax 分布改变 |
+| head layout 错误 | 2.35994 | 0.0286785 | 输出 head 与 Q/K/V 语义错位 |
+
+### 具体数值 trace
+
+脚本中的 oracle trace 使用：
+
+```text
+Q = [[1, 0], [0, 1]]
+K = [[1, 0], [0, 1]]
+V = [[10, 0], [0, 20]]
+scale = 1 / sqrt(2)
+```
+
+未 mask 时：
+
+```text
+S = [[1, 0],
+     [0, 1]] / sqrt(2)
+```
+
+第一行 softmax 后：
+
+```text
+[exp(1/sqrt(2)), exp(0)] / (exp(1/sqrt(2)) + exp(0))
+```
+
+乘 V 后得到，展开后输出为：
+
+```text
+full row 0 = [6.6976154933, 6.6047690135]
+full row 1 = [3.3023845067, 13.3952309865]
+```
+
+causal 时，第一行只能看到 key 0：
+
+```text
+P row 0 = [1, 0]
+
+causal row 0 = [10, 0]
+```
+
+第二行仍能看到 key 0 与 key 1，所以保留完整 attention 结果：
+
+```text
+causal row 1 = [3.3023845067, 13.3952309865]
+```
+
+把四个数按行展平，得到脚本输出：
+
+```text
+causal = [10.0, 0.0, 3.3023845067, 13.3952309865]
+```
+
+这是一个很小的 oracle trace，但它解释了为什么因果 mask 错误不能只
+看 shape：mask 关闭时，第一行会从 `[10, 0]` 变成 `[6.6976, 6.6048]`。
+
+### 运行命令与实测输出
+
+本机的 Python 3.11 `mlc` 环境路径是：
+
+```text
+/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python
+```
+
+运行：
+
+```bash
+'/Users/saboxu/Documents/ChatGPT/mlc学习/mlc/bin/python' \
+  modern-gpu-programming-for-mlsys/code/flash_attention_reference_validation.py
+```
+
+实测关键输出：
+
+```text
+input shapes:
+  Q = (2, 6, 4, 8)  [B, Sq, Hq, D]
+  K = (2, 8, 2, 8)  [B, Skv, Hkv, D]
+  V = (2, 8, 2, 8)  [B, Skv, Hkv, D]
+  softmax_scale = 0.3535533906
+
+kernel precision path vs fp64 oracle:
+  max_abs_error   = 1.78043494e-04
+  max_allowed     = 1.48145311e-02
+  max_error_ratio = 0.014228  (pass iff <= 1)
+  cosine_similarity = 0.9999999589
+
+worst element trace:
+  actual     = 0.2512207031
+  expected   = 0.2513987466
+  abs_error  = 1.7804349359e-04
+  allowed    = 1.0e-02 + 1.0e-02 * 0.2513987466
+             = 1.2513987466e-02
+  ratio      = 0.014228
+
+PyTorch SDPA vs fp64 oracle:
+  max_abs_error   = 1.47884913e-04
+  max_allowed     = 1.57421875e-02
+  max_error_ratio = 0.011535  (pass iff <= 1)
+  cosine_similarity = 0.9999999815
+
+expected rejected failures:
+  mask error: tolerance failed, max_ratio=21.9106, max_abs=0.281779
+  scale error: tolerance failed, max_ratio=7.33758, max_abs=0.0742902
+  head-layout error: tolerance failed, max_ratio=2.35994, max_abs=0.0286785
+
+manual 2x2 trace:
+  full   = [6.6976154933, 6.6047690135, 3.3023845067, 13.3952309865]
+  causal = [10.0, 0.0, 3.3023845067, 13.3952309865]
+
+torch.testing.assert_close: PASS
+```
+
+### 失败定位表
+
+| 现象 | 更可能的问题 | 下一步检查 |
+|---|---|---|
+| shape 不一致 | Q/K/V layout、GQA 展开、输出 permute 错误 | 打印 `[B, S, H, D]` 每一维来源 |
+| 非有限值 | mask 全 `-inf`、scale 过大、P 溢出 | 检查 oracle mask、softmax 输入范围、fp16 P |
+| max_abs 大且 cosine 低 | 语义错误，如 head 或 sequence 错位 | 交换 head、转置 Q/K、检查 stride |
+| mask 错误只在边界出现 | causal offset 或对角线 block 规则错误 | 测试非方阵 `Sq != Skv` |
+| scale 错误均匀放大误差 | `1 / sqrt(D)` 漏乘或乘错维度 | 比较 `scale` 参数和 QK^T 输出 |
+| 误差接近但未超过阈值 | 可能是合法 fp16 舍入 | 观察 `max_ratio`，再增加随机种子 |
+| max_ratio 随 K 增长 | fp32 累加顺序或 P 舍入差异 | 区分 expected tolerance 与分解误差 |
+| 只有 GQA 失败 | K/V head 映射或 packed row 还原错误 | 验证 `repeat_interleave` 顺序与 tile row 语义 |
+
+还要区分三类失败：
+
+```text
+编译失败：IR、layout、dispatch、target 或编译环境问题
+运行失败：非法地址、barrier 死锁、TMEM allocation 或硬件契约问题
+数值失败：shape 正确、finish 正常，但 tolerance 失败
+```
+
+`assert_close` 只覆盖第三类。遇到第二类时，不能把异常解释成
+`rtol` / `atol` 问题。
+
+### 常见误区
+
+| 误区 | 后果 | 正确做法 |
+|---|---|---|
+| 用 `torch.equal` 比较 kernel 与 reference | fp16 舍入必然造成假失败 | 使用逐元素 tolerance |
+| 把 kernel fp16 差值直接作为全部验证依据 | 量化误差掩盖 layout 错位 | 先 cast 到 fp32，再计算误差统计 |
+| 只测试 `Sq == Skv` | 掩盖 causal 右下角 offset 错误 | 同时测试 `Sq != Skv` |
+| GQA 测试不展开 K/V | shape 或 head 映射错误 | reference 中显式 `repeat_interleave` |
+| 只看 cosine similarity | 大向量方向相同但局部元素可能严重错位 | 同时检查 `max_ratio` 与逐元素 trace |
+| 把 `atol` 当成全局最大误差 | 忽略了 expected 较大时的相对误差 | 逐元素计算 `atol + rtol * abs(expected)` |
+| 只跑一个固定随机种子 | 特殊边界和最大值分布可能没覆盖 | 增加种子、长度、head ratio 和 causal 组合 |
+
+### 自测题与答案
+
+#### 1. 为什么不能直接用 fp16 kernel 输出与 fp64 oracle 做逐 bit 比较？
+
+答：fp16 输入、fp32 累加、P 的舍入和 fp16 输出都会改变结果。逐
+bit 比较会把正常的数值误差判成失败，不能反映真实语义 bug。
+
+#### 2. `assert_close` 的逐元素条件是什么？
+
+答：
+
+```text
+abs(actual - expected) <= atol + rtol * abs(expected)
+```
+
+`atol` 负责接近 0 的绝对误差，`rtol` 负责随参考值规模增长的相对误差。
+
+#### 3. `SEQ_LEN_Q=4`、`SEQ_LEN_KV=6` 时，query row 2 可见哪些 key columns？
+
+答：
+
+```text
+k <= q + (SEQ_LEN_KV - SEQ_LEN_Q)
+k <= 2 + (6 - 4)
+k <= 4
+```
+
+因此可见 columns 为 `0, 1, 2, 3, 4`。
+
+#### 4. 为什么 head 交换错误可以保持 shape 正确，却仍然让验证失败？
+
+答：shape 只描述维度大小，不描述哪个 head 对应哪份 K/V。交换两个
+heads 后输出仍是 `[B, S, H, D]`，但语义对应的 head 已经错位，所以
+误差会明显超过 tolerance。
+
+#### 5. 若 `max_abs_error` 很小，但 `max_ratio` 大于 1，应该优先检查什么？
+
+答：检查 expected 接近 0 的元素。小绝对误差可能相对于 `atol` 仍然
+过大；`max_ratio` 才能反映 `assert_close` 的真实判定。
+
+## 二十三、章节完成与下一步
+
+```text
+chapter_flash_attention
+[x] 1. Tile 分解与 online softmax 三状态
+[x] 2. FA4 conditional rescaling、delta 与 acc_scale
+[x] 3. S / P / O 的 TMEM layout 与分时复用
+[x] 4. QK^T MMA、softmax、PV MMA 的数据路径
+[x] 5. Warp 角色、register 分配与 barrier 分工
+[x] 6. Q / K / V pipeline 时间线
+[x] 7. Correction、最终归一化与 epilogue
+[x] 8. Causal mask、GQA、tile scheduling 与验证
+    [x] 8.1 Causal mask
+    [x] 8.2 GQA packed Q rows 与 K/V 复用
+    [x] 8.3 Causal LPT tile scheduling 与 L2 swizzle
+    [x] 8.4 Reference 与容差验证
+```
+
+至此 `chapter_flash_attention` 完成。下一章应回到课程主线的下一个
+独立主题，继续按“先说明为什么讲、再给心智模型和完整代码、最后用
+具体 trace 与自测验证”的方式展开。
