@@ -37,6 +37,7 @@ pipeline、TMA 异步搬运和 Roofline 性能分析展开的内容，重点关�
 | [21-flash-attention.md](21-flash-attention.md) | `chapter_flash_attention` 的 Q/K/V tile 分解、online softmax、conditional rescaling、`S` / `P` / `O` TMEM 复用、causal mask、GQA packed rows、causal LPT scheduling、L2 swizzle、FP64 reference、`rtol` / `atol` 容差验证、完整数值与调度验证脚本 |
 | [22-roofline-and-course-completion.md](22-roofline-and-course-completion.md) | `chapter_performance` 的 arithmetic intensity、B200 ridge point、GEMM / materialized attention / Flash prefill / decode 的瓶颈分类、完整 Roofline 脚本，以及教材正文 Parts I-IV 的课程收束 |
 | [23-benchmarking-timing-boundary.md](23-benchmarking-timing-boundary.md) | `appendix/benchmarking_gpu_kernels` 的计时边界、CUDA event 与 synchronized host timer 的差异、完整边界对比脚本和 dry-run 验证 |
+| [24-kernel-launch-pdl-and-dynamic-parallelism.md](24-kernel-launch-pdl-and-dynamic-parallelism.md) | CUDA host launch、GPU dispatch、PDL 与 Dynamic Parallelism 的边界、完整 CUDA 示例、同步契约与执行 trace |
 
 ## 当前进度
 
@@ -409,6 +410,13 @@ event 区间包含期间的所有 stream work 与 idle gap，不等于 kernel du
 GEMM-only、GEMM+ReLU event 和 GEMM+ReLU host call 是三种不同边界
 FLOP 分子必须和计时分母描述同一个 operation
 完整边界对比脚本 modern-gpu-programming-for-mlsys/code/benchmark_timing_boundary.py
+[x] CUDA 执行机制补充：PDL 与 Dynamic Parallelism 的 launch / synchronization 边界
+CUDA 执行机制补充：区分框架 operator dispatch、host launch、GPU dispatch 与 kernel execution
+PDL 在同一 stream 中通过 programmatic trigger 和 dependency wait 暴露启动重叠机会
+PDL 可重叠 GPU 侧 secondary launch latency，不会消除 host API 提交成本
+Dynamic Parallelism 由 GPU parent kernel 发起 child grid，任务配置可由 device 数据决定
+PDL 与 Dynamic Parallelism 的发起者、依赖语义、同步边界和适用场景
+完整 CUDA 示例 modern-gpu-programming-for-mlsys/24-kernel-launch-pdl-and-dynamic-parallelism.md
 ```
 
 ## 下一知识点
@@ -443,6 +451,7 @@ chapter_tirx_layout_api 完成
 -> chapter_performance 完成：Roofline 与瓶颈分类
 -> 教材正文 Parts I-IV 收束
 -> appendix/benchmarking_gpu_kernels 第 1 个知识点完成：Define the Timing Boundary
+-> CUDA 执行机制补充完成：PDL 与 Dynamic Parallelism 的 launch / synchronization 边界
 -> appendix/benchmarking_gpu_kernels 下一知识点：warm-up、repeat、rounds 与样本稳定性
 ```
 
