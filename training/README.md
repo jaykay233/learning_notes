@@ -11,6 +11,7 @@
 | [05 · Sequence Parallelism 布局转换](05-sequence-parallel-layout-transitions.md) | scatter / all-gather / reduce-scatter 的 forward/backward 配对与梯度语义 |
 | [06 · SP 下 Vocab Embedding 的 reduce-scatter](06-vocab-embedding-reduce-scatter-with-sp.md) | all-reduce 与 reduce-scatter 的输出布局区别、词表分片 partial 与序列分片 |
 | [07 · Reduce-Scatter 运算逻辑](07-reduce-scatter-collective.md) | 逐元素归约后按 rank 分片，与 all-reduce / all-gather 的区别 |
+| [08 · TP 与 SP 配合的前向数据流](08-tp-sp-forward-dataflow.md) | Attention / MLP 中 SP 序列分片、TP 矩阵乘、all-gather 与 reduce-scatter 如何衔接 |
 | [03 · 数据随机性、FIM 与 SLURM](03-data-randomness-fim-and-slurm.md) | sampler / dataset seed、Fill-in-the-Middle、可复现性边界与 SLURM 常用命令 |
 | [04 · `fan_in` / `fan_out`](04-initialization-fan-in-fan-out.md) | 全连接层与卷积层连接数、Kaiming 初始化尺度 |
 
