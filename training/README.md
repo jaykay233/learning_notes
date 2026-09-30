@@ -8,6 +8,7 @@
 |---|---|
 | [01 · 自动微分与 `derivatives.yaml`](01-autograd-and-derivatives-yaml.md) | `requires_grad`、`retain_grad()`、`create_graph` / `retain_graph`、VJP / JVP 与 YAML key/value |
 | [02 · 并行维度与 rank groups](02-parallelism-and-rank-groups.md) | TP / SP / DP / EP / ETP / expert-DP、rank 公式、`decompose`、`RankGenerator`、`ProcessGroupCollection` |
+| [05 · Sequence Parallelism 布局转换](05-sequence-parallel-layout-transitions.md) | scatter / all-gather / reduce-scatter 的 forward/backward 配对与梯度语义 |
 | [03 · 数据随机性、FIM 与 SLURM](03-data-randomness-fim-and-slurm.md) | sampler / dataset seed、Fill-in-the-Middle、可复现性边界与 SLURM 常用命令 |
 | [04 · `fan_in` / `fan_out`](04-initialization-fan-in-fan-out.md) | 全连接层与卷积层连接数、Kaiming 初始化尺度 |
 

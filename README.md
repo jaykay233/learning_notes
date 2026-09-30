@@ -13,7 +13,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`communication/`](communication/) | GPU 通信提交、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
-| [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、数据随机性与 SLURM |
+| [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行与 SP 布局转换、数据随机性与 SLURM |
 | [`quantization/`](quantization/) | LLM 低比特量化、W4A8KV4、QoQ、KV4 Attention 与 SmoothAttention |
 
 ## 目录总览
