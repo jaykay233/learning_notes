@@ -13,6 +13,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`communication/`](communication/) | GPU 通信提交、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
+| [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、数据随机性与 SLURM |
 | [`quantization/`](quantization/) | LLM 低比特量化、W4A8KV4、QoQ、KV4 Attention 与 SmoothAttention |
 
 ## 目录总览
@@ -67,6 +68,7 @@ cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
 speculative-decoding/        # 投机解码
 torch_compile/               # Dynamo、AOTAutograd、Dispatcher
+training/                     # autograd、初始化、训练并行、数据随机性与 SLURM
 models/                      # DeepSeek / GLM / Kimi / Qwen / MiMo 架构笔记
 ```
 
@@ -195,6 +197,7 @@ models/
 | CUDA kernel launch / PDL / Dynamic Parallelism | [24-kernel-launch-pdl-and-dynamic-parallelism.md](modern-gpu-programming-for-mlsys/24-kernel-launch-pdl-and-dynamic-parallelism.md) |
 | LLM 量化 / W4A8KV4 / QoQ / KV4 / SmoothAttention | [quantization/01-qoq-w4a8kv4.md](quantization/01-qoq-w4a8kv4.md) |
 | torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
+| PyTorch 训练：autograd / TP-SP-DP-EP / 数据随机性 / SLURM | [training/README.md](training/README.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |
 | Gated DSA / IndexCache / iHC | [hy4-preview/architecture.md](models/hy4-preview/architecture.md) |
