@@ -187,6 +187,26 @@ reduce-scatter 输出:       [S/P, B, H]
 
 反向通信与前向布局转换互为对应（省略计算本身）：不开 SP 时，Column 输入映射的反向需要 all-reduce 输入梯度、Row 输出 all-reduce 的反向是 identity；开 SP 后，前向 all-gather 的反向是 reduce-scatter，前向 reduce-scatter 的反向是 all-gather。
 
+## reduce-scatter 之后还需要 all-reduce 吗？
+
+通常不需要。`reduce-scatter` 的 reduce 阶段已经把所有 TP rank 对**同一 token、同一 hidden 坐标**的 partial 相加；scatter 阶段只是把已经完整的 token 输出按 sequence 分给各 rank。
+
+例如 `P=2`、完整输出逻辑上是 `Y=[y0,y1,y2,y3]`：
+
+```text
+不开 SP 的 all-reduce 结果：
+  rank 0: [y0,y1,y2,y3]   shape [S,B,H]
+  rank 1: [y0,y1,y2,y3]   shape [S,B,H]
+
+开 SP 的 reduce-scatter 结果：
+  rank 0: [y0,y1]         shape [S/P,B,H]
+  rank 1: [y2,y3]         shape [S/P,B,H]
+```
+
+这两个结果在**数学内容上相同**：把 SP 两卡的 shard 沿 sequence 拼起来，就是不开 SP 的完整 `Y`。不同的是每个 rank 持有的布局：不开 SP 是完整结果的副本；开 SP 是完整结果的不同序列片段。
+
+因此 reduce-scatter 后直接接本地 residual / LayerNorm 等操作，不要再对这些不同 token 片段做 all-reduce。那会把 rank 0 的 `y0,y1` 与 rank 1 的 `y2,y3` 按局部下标相加，混合不同 token 的值。若下游确实要求每 rank 都拿完整序列，应按下游接口要求做 all-gather；通常下一处 TP 列并行边界会负责恢复完整序列。只有当下游明确要求特定的跨 rank 聚合时，才添加相应 collective，不能因为“输出分片了”就机械地 all-reduce。
+
 ## 为什么是 all-gather + reduce-scatter
 
 不开 SP 时，典型 TP MLP 的前向边界可以抽象为：
