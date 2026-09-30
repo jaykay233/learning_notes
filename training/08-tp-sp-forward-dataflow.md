@@ -144,6 +144,38 @@ rank r: 本地 X shard [S/P,B,H]
 
 Attention 这里还有一个直觉：标准 SP 路径下，Q、K、V 都先覆盖完整序列，所以每个 rank 上的局部 heads 可以让每个 query 访问整段 K/V。若直接只拿本地序列片段做 QKV，每张卡就缺少其他 token 的 K/V，无法得到标准全序列 self-attention；当然也可以设计“本地 Q、全局 K/V”等其他通信算法，但那不是这里讨论的标准 TP+SP 布局。
 
+### 把每一步的尺寸算出来
+
+取一个小例子：TP 组 `P=2`，序列长 `S=4`，batch `B=2`，hidden size `H=8`，attention heads 数 `A=4`，每头维度 `D=H/A=2`。假设标准 MHA、`CP=1`，head 均匀分给两个 TP rank。下表的“元素数”是**每 rank 持有的逻辑元素数**，暂不考虑 dtype、临时 workspace 和是否与其他张量复用内存。
+
+| 前向位置 | 每 rank 张量形状 | 每 rank 元素数 | 说明 |
+|---|---:|---:|---|
+| SP 输入 `X_r` | `[S/P,B,H]=[2,2,8]` | `32` | rank 0/1 分别持有 2 个 token；两 rank 合起来覆盖完整 `[4,2,8]` 共 64 个元素 |
+| 本地 LayerNorm 输出 | `[2,2,8]` | `32` | 归一化不改变形状；在本地 token 上执行 |
+| all-gather 后的 `X` | `[S,B,H]=[4,2,8]` | `64` | 每个 rank 都有完整序列；两 rank 各自都存 64 个逻辑元素 |
+| QKV ColumnParallel 输出（融合） | `[S,B,3H/P]=[4,2,12]` | `96` | 每 rank 负责 `A/P=2` 个 heads 的 Q、K、V |
+| 单个 `Q`、`K` 或 `V` | `[S,B,A/P,D]=[4,2,2,2]` | `32` | 每个张量也可展平为 `[4,2,H/P]=[4,2,4]` |
+| Attention score / probability | `[B,A/P,S,S]=[2,2,4,4]` | `64` | 每个本地 head 对 4 个 query token 与 4 个 key token 计算分数；softmax 不改变形状 |
+| Attention context | `[S,B,A/P,D]=[4,2,2,2]` | `32` | 对完整 K/V 序列做加权求和；展平为 `[4,2,4]` |
+| 输出投影本地权重 `W_o,r` | `[H/P,H]=[4,8]` | `32` 个权重参数 | RowParallelLinear 沿输入 hidden 维切权重 |
+| 输出投影 partial | `[S,B,H]=[4,2,8]` | `64` | 每 rank 对同一 4 个 token 贡献一份 partial；rank 间要相加 |
+| reduce-scatter 后 `Y_r` | `[S/P,B,H]=[2,2,8]` | `32` | rank 0 得归约后前 2 个 token，rank 1 得后 2 个 token |
+| 本地 residual 相加后 | `[2,2,8]` | `32` | 与对应的输入 residual shard 形状相同，可逐元素相加 |
+
+一般公式（仍假设 head 均匀切分）：令每 rank 的 head 数 `A/P`，则 `D=H/A`：
+
+```text
+SP 输入 / LayerNorm:       [S/P, B, H]
+all-gather 后:             [S, B, H]
+本地 Q、K、V 各自:         [S, B, A/P, D]，元素数 S·B·H/P
+本地 attention score:     [B, A/P, S, S]，元素数 B·A·S²/P
+本地 context:              [S, B, A/P, D]
+RowParallel partial:       [S, B, H]
+reduce-scatter 输出:       [S/P, B, H]
+```
+
+这里能看到一个容易忽略的点：虽然 SP 输入和输出各 rank 只有 `S/P` 个 token，标准 TP attention 区域的 Q/K/V、context 仍覆盖完整 `S`；attention score 还随 `S²` 增长。因而 SP 会降低特定边界/非矩阵乘激活的存储量，但不代表每个 attention 中间张量都缩成 `1/P`。实际字节数再乘数据类型字节数，例如 BF16/FP16 通常每元素 2 字节；具体实现的布局顺序可能不同，但逻辑元素数一致。
+
 ### 一眼对照
 
 | 位置 | 不开 SP 的前向 | 开 SP 的前向 | rank 间激活布局变化 |
