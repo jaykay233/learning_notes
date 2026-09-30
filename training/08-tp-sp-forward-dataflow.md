@@ -44,6 +44,39 @@ SP 序列分片
 
 SP 不是新加一组 rank，也不是把 TP 替换掉；在这里它复用同一 TP group，只改变一些阶段中激活由“完整序列复制”变成“序列分片”的布局。
 
+## TP 切 hidden、SP 切 sequence，为什么不冲突？
+
+因为它们描述的是**不同张量、不同阶段的布局**，不是要求每个张量同时沿两轴分片。标准 Megatron TP + SP 会在同一 TP group 的 ranks 间切换激活布局：
+
+| 阶段 | 每个 rank 的激活布局 | 正在体现的切分 |
+|---|---|---|
+| LayerNorm / residual 等 SP 区域 | `[S/P,B,H]` | 按 sequence 分片；本地 token 的 hidden `H` 完整 |
+| ColumnParallelLinear 前 all-gather 后 | `[S,B,H]`，每 rank 都有完整序列 | sequence 暂时恢复完整；权重仍按 TP 切 |
+| ColumnParallelLinear / activation 后 | `[S,B,N/P]` | 序列完整；输出 hidden/feature 维按 TP 分片 |
+| RowParallelLinear 本地 partial | `[S,B,H]` | 每 rank 对同一 token 的完整输出贡献一份 partial |
+| RowParallelLinear 后 reduce-scatter | `[S/P,B,H]` | partial 先按 TP 归约，再按 sequence 分回各 rank |
+
+所以 rank 0 在 SP 区域可以负责前半段 token；进入 ColumnParallelLinear 后，它负责的是某部分输出 hidden/heads，并且要覆盖完整序列。rank 的工作含义会随布局转换而变，不是 rank 0 永远只负责“同一块序列”或“同一块 hidden”。
+
+用 `P=2, S=8, H=4` 看 FFN，假设中间维 `N=16`：
+
+```text
+SP 输入：
+  rank 0: token 0..3 的完整 hidden [4,B,4]
+  rank 1: token 4..7 的完整 hidden [4,B,4]
+
+all-gather 后：两卡都得到完整 [8,B,4]
+Up/ColumnLinear：
+  rank 0 得 [8,B,8]（中间 hidden 通道 0..7）
+  rank 1 得 [8,B,8]（中间 hidden 通道 8..15）
+Down/RowLinear：两卡分别算同一批 8 个 token 的 partial [8,B,4]
+reduce-scatter 后：
+  rank 0 得已归约 token 0..3 的 [4,B,4]
+  rank 1 得已归约 token 4..7 的 [4,B,4]
+```
+
+SP 没有再增加一组独立 ranks：还是这 2 张卡，因此不是要 `TP×SP=4` 张卡。这里是 TP group 内用同一批 ranks 交替管理 sequence-sharded 激活与 hidden-sharded 激活。不要把它误读为“每 rank 永远同时持有 `[S/P,B,H/P]`”。
+
 ## 一层 MLP 的前向逐步看
 
 以常见的两层 MLP 为例：第一层是 ColumnParallelLinear，第二层是 RowParallelLinear。忽略 bias、dropout 和具体 fused kernel，关注张量的形状与归属。
