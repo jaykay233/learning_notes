@@ -207,6 +207,14 @@ reduce-scatter 输出:       [S/P, B, H]
 
 因此 reduce-scatter 后直接接本地 residual / LayerNorm 等操作，不要再对这些不同 token 片段做 all-reduce。那会把 rank 0 的 `y0,y1` 与 rank 1 的 `y2,y3` 按局部下标相加，混合不同 token 的值。若下游确实要求每 rank 都拿完整序列，应按下游接口要求做 all-gather；通常下一处 TP 列并行边界会负责恢复完整序列。只有当下游明确要求特定的跨 rank 聚合时，才添加相应 collective，不能因为“输出分片了”就机械地 all-reduce。
 
+## 辨析资料中的一条 All-Gather 流程图
+
+若资料把“不开 SP 的 ColumnParallel 前向”写成 `AllGather(input) → X_full × W_local → 输出分片`，要先确认输入分片的轴。对这里讨论的**标准、不开 SP 的 Megatron TP**，ColumnParallelLinear 的输入通常已在各 TP rank 完整复制；前向是 `X × W_r`，不需要先 all-gather。输入是 `[S,H]`，本 rank 权重为 `[H,N/P]`，输出是 `[S,N/P]`：沿输出 feature/hidden 维分片。
+
+`AllGather(sequence shard) → X_full × W_r` 对应的是 SP 输入边界：每 rank 原本只有 `[S/P,H]`，先沿 sequence 维 gather 成 `[S,H]`，再做 column-parallel GEMM。故若图明确标“不开 SP”却又说输入是各 rank 的 `[S/P,H]` sequence shards，它与本资料前面“不开 SP 时 Column 输入前向为 identity、无 all-gather”的说明冲突；更可能是图注混淆了开/不开 SP，或省略了另一种输入分片前提。
+
+读这类图时要分别标明两个轴：输入被切的是 sequence 维，还是 hidden/feature 维？ColumnParallel 的输出分片是输出 feature 维，不是 sequence 维。
+
 ## 为什么是 all-gather + reduce-scatter
 
 不开 SP 时，典型 TP MLP 的前向边界可以抽象为：
