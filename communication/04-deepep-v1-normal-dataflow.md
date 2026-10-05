@@ -528,8 +528,8 @@ normal channels:
 
 - [x] DeepEP V1 normal：layout → rank dispatch → local expert metadata → handle → combine
 - [x] 区分 rank-major 通信布局、expert-major 计算布局与 gate 加权
-- [ ] DeepEP V1 low-latency：定容 dispatch、packed expert 输入、combine 与 hook
+- [x] DeepEP V1 low-latency：定容 dispatch、packed expert 输入、handle 回程元数据、weighted combine 与 hook
 
 ### 下一知识点
 
-DeepEP V1 low-latency 模式：为什么它要求最大 token 容量、如何按 expert 打包接收区，以及 `low_latency_dispatch` / `low_latency_combine` 的返回值和重叠语义。
+DeepEP V1 normal 与 low-latency 的性能边界：结合 workload 看容量、buffer 占用、通信延迟和双 micro-batch overlap 的取舍。
