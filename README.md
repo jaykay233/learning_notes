@@ -85,7 +85,8 @@ cuda-graph/
 communication/
 ├── 01-proxy-gdaki-gpi.md                    # CPU Proxy / GDAKI / GPI；QP、WQE、提交路径
 ├── 02-mok-scheduling-and-buffers.md          # MoK：device schedule、pull/push、ring token buffer
-└── 03-low-latency-collectives-and-synchronization.md  # Sentinel / credit / Multicast / LL128 / multimem
+├── 03-low-latency-collectives-and-synchronization.md  # Sentinel / credit / Multicast / LL128 / multimem
+└── 04-deepep-v1-normal-dataflow.md            # DeepEP V1 normal：layout / rank dispatch / handle / combine
 ```
 
 ```
@@ -190,6 +191,7 @@ models/
 | GPU 通信提交 / Proxy / GDAKI / GPI | [communication/01](communication/01-proxy-gdaki-gpi.md) |
 | MoE 训练 / MoK / pull-push / buffer | [communication/02](communication/02-mok-scheduling-and-buffers.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
+| DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
@@ -430,6 +432,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [01-proxy-gdaki-gpi.md](communication/01-proxy-gdaki-gpi.md) | 传统 CPU Proxy、QP 爆炸、GDAKI 提交模式；BlueFlame 与 GPI 的队列所有权差异 |
 | [02-mok-scheduling-and-buffers.md](communication/02-mok-scheduling-and-buffers.md) | MoK 的设备端 schedule、dispatch pull / combine push、minibatch overlap、macrobatch ring buffer，以及与 DeepEP Buffer 的对照 |
 | [03-low-latency-collectives-and-synchronization.md](communication/03-low-latency-collectives-and-synchronization.md) | 小消息 collective 的 memory ordering、Sentinel、双缓冲 credit、fabric / SHARP、LL128 atomic，以及 `multimem.ld_reduce` 与 AllReduce 的关系 |
+| [04-deepep-v1-normal-dataflow.md](communication/04-deepep-v1-normal-dataflow.md) | DeepEP V1 normal：layout、rank/channel dispatch、local expert 路由元数据、handle、combine 与 gate 权重边界 |
 
 ## DeepSeek-V4
 
