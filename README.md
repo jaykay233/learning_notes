@@ -89,7 +89,8 @@ communication/
 ├── 04-deepep-v1-normal-dataflow.md            # DeepEP V1 normal：layout / rank dispatch / handle / combine
 ├── 05-deepep-v1-low-latency-dataflow.md       # DeepEP V1 low-latency：expert-major buffer / handle / weighted combine / hooks
 ├── 06-deepep-v1-normal-and-low-latency-dataflow.md # 两种模式完整端到端数据流与差异对照
-└── 07-deepep-v1-get-dispatch-layout-kernel.md # 机内 get_dispatch_layout kernel：block 分工 / per-thread 计数 / token-rank 去重
+├── 07-deepep-v1-get-dispatch-layout-kernel.md # 机内 get_dispatch_layout kernel：block 分工 / per-thread 计数 / token-rank 去重
+└── 08-deepep-v1-barrier-block.md              # 机内跨 GPU barrier：分布式信号矩阵 / +T−T 原子操作 / warp 投票
 ```
 
 ```
@@ -198,6 +199,7 @@ models/
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
 | DeepEP V1 normal vs low-latency / 完整端到端数据流 | [communication/06](communication/06-deepep-v1-normal-and-low-latency-dataflow.md) |
 | DeepEP V1 get_dispatch_layout kernel / block 分工 / token-rank 去重 | [communication/07](communication/07-deepep-v1-get-dispatch-layout-kernel.md) |
+| DeepEP V1 barrier_block / 跨 GPU barrier / system scope 原子操作 | [communication/08](communication/08-deepep-v1-barrier-block.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
@@ -442,6 +444,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [05-deepep-v1-low-latency-dataflow.md](communication/05-deepep-v1-low-latency-dataflow.md) | DeepEP V1 low-latency：expert-major 固定容量接收区、`recv_count`、handle 回程元数据、weighted combine、RDMA/NVLink 路径与 receive hook |
 | [06-deepep-v1-normal-and-low-latency-dataflow.md](communication/06-deepep-v1-normal-and-low-latency-dataflow.md) | Normal 与 low-latency 端到端数据流统一对照：请求内容、rank/expert 布局、计数/handle、gate、同步与数值示例 |
 | [07-deepep-v1-get-dispatch-layout-kernel.md](communication/07-deepep-v1-get-dispatch-layout-kernel.md) | 机内 `get_dispatch_layout` kernel：expert/rank 两类 block 分工、shared memory 私有计数 + 按列归约、token-rank 去重、单机 RDMA 分支、CPU 重放验证脚本 |
+| [08-deepep-v1-barrier-block.md](communication/08-deepep-v1-barrier-block.md) | 机内 `barrier_block`：信号区分配与 8×8 分布式布局、`+T/−T` 成对 system 原子操作、`__all_sync` 投票、`kSyncOnly`、`<= 0` 防死锁、多线程模拟验证 |
 
 ## DeepSeek-V4
 
