@@ -92,7 +92,8 @@ communication/
 ├── 07-deepep-v1-get-dispatch-layout-kernel.md # 机内 get_dispatch_layout kernel：block 分工 / per-thread 计数 / token-rank 去重
 ├── 08-deepep-v1-barrier-block.md              # 机内跨 GPU barrier：分布式信号矩阵 / +T−T 原子操作 / warp 投票
 ├── 09-deepep-v1-notify-dispatch.md            # 机内 notify_dispatch：计数交换 / rank·channel 前缀和 / pinned mapped 计数器握手
-└── 10-deepep-v1-intranode-dispatch-kernel.md  # 机内 dispatch kernel：环形队列 / head-tail 流控 / send_head / release-acquire
+├── 10-deepep-v1-intranode-dispatch-kernel.md  # 机内 dispatch kernel：环形队列 / head-tail 流控 / send_head / release-acquire
+└── 11-deepep-v1-intranode-combine-and-warp-roles.md # 机内 combine / warp 分工 / handle·cached notify / send_head 空洞编码
 ```
 
 ```
@@ -204,6 +205,7 @@ models/
 | DeepEP V1 barrier_block / 跨 GPU barrier / system scope 原子操作 | [communication/08](communication/08-deepep-v1-barrier-block.md) |
 | DeepEP V1 notify_dispatch / rank_prefix_matrix / channel_prefix_matrix / pinned mapped 内存 | [communication/09](communication/09-deepep-v1-notify-dispatch.md) |
 | DeepEP V1 intranode dispatch kernel / 环形队列 / head-tail 流控 / named barrier | [communication/10](communication/10-deepep-v1-intranode-dispatch-kernel.md) |
+| DeepEP V1 combine / warp 分工 / handle·cached notify / send_head 空洞 | [communication/11](communication/11-deepep-v1-intranode-combine-and-warp-roles.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
@@ -451,6 +453,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [08-deepep-v1-barrier-block.md](communication/08-deepep-v1-barrier-block.md) | 机内 `barrier_block`：信号区分配与 8×8 分布式布局、`+T/−T` 成对 system 原子操作、`__all_sync` 投票、`kSyncOnly`、`<= 0` 防死锁、多线程模拟验证 |
 | [09-deepep-v1-notify-dispatch.md](communication/09-deepep-v1-notify-dispatch.md) | 机内 `notify_dispatch`：两次 barrier 交换计数、`rank_prefix_matrix`（只有本列有效）、expert 对齐、`warp_reduce_sum` 算 `channel_prefix_matrix`、pinned mapped 计数器与 −1 哨兵轮询、`num_worst_tokens`、CPU 重放验证 |
 | [10-deepep-v1-intranode-dispatch-kernel.md](communication/10-deepep-v1-intranode-dispatch-kernel.md) | 机内 `dispatch` kernel：发收 block 与 3-warp 分工、`Buffer<T>` 布局、环形队列 head/tail 流控与分批、`send_head`、topk 本地化、TMA 两半搬运、release/acquire、named barrier、`__launch_bounds__`/SM 资源/HBM vs L1、多线程模拟验证 |
+| [11-deepep-v1-intranode-combine-and-warp-roles.md](communication/11-deepep-v1-intranode-combine-and-warp-roles.md) | 机内 `combine`：dispatch/combine warp 对照、handle 与 `cached_notify_*`、`__any_sync` / `tma_store_wait`、`send_head` 空洞编码、rank-major 与 `recv_topk_idx`、Python 验证 |
 
 ## DeepSeek-V4
 

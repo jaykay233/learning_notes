@@ -10,7 +10,7 @@
 小节：intranode dispatch 的数据搬运阶段
 知识点：偶数 block 发、奇数 block 收；每个（channel, 对端 rank）一个接收端环形队列；Buffer<T> 切分布局；发送端分批 + release tail；接收端 acquire tail + 释放 head；send_head 记录 channel 内序号；recv_x 行号 = rank 偏移 + channel 起点 + channel 内序号
 上次：intranode notify_dispatch（rank_prefix_matrix、channel_prefix_matrix、pinned mapped 计数器）
-下次：intranode combine kernel（如何用 send_head / recv_channel_offset 把 expert 输出按原顺序送回并求和）
+下次：intranode combine、warp 分工对照、handle / cached notify（见 11）
 PTX：st.release.sys.global、ld.acquire.sys.global、st.global.L1::no_allocate、bar.sync a, b（named barrier）、cp.async.bulk（TMA 1D）
 ```
 
@@ -1518,7 +1518,8 @@ block 内：responsible_rank = thread_id / 96，每个对端 rank 3 个 warp
 - [x] 机内 `barrier_block`：分布式 8×8 信号矩阵、+T/−T 成对原子操作、warp 投票、`kSyncOnly`、`<= 0` 的原因
 - [x] 机内 `notify_dispatch`：两次 barrier 交换计数、`rank_prefix_matrix` 只有本列有效、expert 对齐、`channel_prefix_matrix`、pinned mapped 计数器与 −1 哨兵、`num_worst_tokens`
 - [x] 机内 `dispatch` kernel：发收 block 分工、`Buffer<T>` 布局、环形队列与 head/tail 流控、分批发布、`send_head`、TMA 两半搬运、release/acquire、named barrier、`__launch_bounds__` 与 SM 资源
+- [x] 机内 `combine` / warp 分工 / handle·cached notify（见 [11](./11-deepep-v1-intranode-combine-and-warp-roles.md)）
 
 ### 下一知识点
 
-intranode `combine` kernel：`cached_notify_combine` 如何修补 `send_head` 中的 −1，combine 的发送端（原接收端）如何按 `recv_channel_offset` 把 expert 输出写回，接收端（原发送端）如何用 `send_head` 等待每个来源 rank 的结果并按 topk 权重求和。
+internode（跨节点）RDMA + NVLink 转发，或 elastic V2 布局。详细 combine / warp / handle 收束见 [11-deepep-v1-intranode-combine-and-warp-roles.md](./11-deepep-v1-intranode-combine-and-warp-roles.md)。
