@@ -93,7 +93,8 @@ communication/
 ├── 08-deepep-v1-barrier-block.md              # 机内跨 GPU barrier：分布式信号矩阵 / +T−T 原子操作 / warp 投票
 ├── 09-deepep-v1-notify-dispatch.md            # 机内 notify_dispatch：计数交换 / rank·channel 前缀和 / pinned mapped 计数器握手
 ├── 10-deepep-v1-intranode-dispatch-kernel.md  # 机内 dispatch kernel：环形队列 / head-tail 流控 / send_head / release-acquire
-└── 11-deepep-v1-intranode-combine-and-warp-roles.md # 机内 combine / warp 分工 / handle·cached notify / send_head 空洞编码
+├── 11-deepep-v1-intranode-combine-and-warp-roles.md # 机内 combine / warp 分工 / handle·cached notify / send_head 空洞编码
+└── 12-deepep-v1-low-latency-dispatch-kernel.md # LL dispatch：定容槽 / finish 2×TAG / −n−1 / expert-major 打包
 ```
 
 ```
@@ -206,6 +207,7 @@ models/
 | DeepEP V1 notify_dispatch / rank_prefix_matrix / channel_prefix_matrix / pinned mapped 内存 | [communication/09](communication/09-deepep-v1-notify-dispatch.md) |
 | DeepEP V1 intranode dispatch kernel / 环形队列 / head-tail 流控 / named barrier | [communication/10](communication/10-deepep-v1-intranode-dispatch-kernel.md) |
 | DeepEP V1 combine / warp 分工 / handle·cached notify / send_head 空洞 | [communication/11](communication/11-deepep-v1-intranode-combine-and-warp-roles.md) |
+| DeepEP V1 LL dispatch / 定容槽 / finish 协议 / expert-major 打包 | [communication/12](communication/12-deepep-v1-low-latency-dispatch-kernel.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
@@ -454,6 +456,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [09-deepep-v1-notify-dispatch.md](communication/09-deepep-v1-notify-dispatch.md) | 机内 `notify_dispatch`：两次 barrier 交换计数、`rank_prefix_matrix`（只有本列有效）、expert 对齐、`warp_reduce_sum` 算 `channel_prefix_matrix`、pinned mapped 计数器与 −1 哨兵轮询、`num_worst_tokens`、CPU 重放验证 |
 | [10-deepep-v1-intranode-dispatch-kernel.md](communication/10-deepep-v1-intranode-dispatch-kernel.md) | 机内 `dispatch` kernel：发收 block 与 3-warp 分工、`Buffer<T>` 布局、环形队列 head/tail 流控与分批、`send_head`、topk 本地化、TMA 两半搬运、release/acquire、named barrier、`__launch_bounds__`/SM 资源/HBM vs L1、多线程模拟验证 |
 | [11-deepep-v1-intranode-combine-and-warp-roles.md](communication/11-deepep-v1-intranode-combine-and-warp-roles.md) | 机内 `combine`：dispatch/combine warp 对照、handle 与 `cached_notify_*`、`__any_sync` / `tma_store_wait`、`send_head` 空洞编码、rank-major 与 `recv_topk_idx`、Python 验证 |
+| [12-deepep-v1-low-latency-dispatch-kernel.md](communication/12-deepep-v1-low-latency-dispatch-kernel.md) | Low-latency `dispatch` kernel：SEND/RECV phase、原子抢槽、finish=`2×TAG`、count `−n−1`、staging→expert-major 打包、与 normal 对照、Python 验证 |
 
 ## DeepSeek-V4
 

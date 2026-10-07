@@ -508,4 +508,4 @@ Expert：recv_topk_idx 本地 id，不是行号
 
 ### 下一知识点
 
-internode（跨节点）路径：RDMA 段与 NVLink 段如何接力转发，`internode::cached_notify` 与机内版本的差异；或回到 elastic V2 的 GEMM 友好布局。
+low-latency `dispatch` kernel 读码（定容槽、finish/`−n−1`、expert-major 打包）见 [12-deepep-v1-low-latency-dispatch-kernel.md](./12-deepep-v1-low-latency-dispatch-kernel.md)。之后可接 LL combine，或 normal internode / elastic V2。
