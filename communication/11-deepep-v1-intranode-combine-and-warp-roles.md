@@ -358,6 +358,8 @@ DeepEP **不**在通信里排成 expert-major；框架读 `recv_topk_idx` 再 pe
 若某处先 `if (elect_one_sync()) x = ...;` 再 `__shfl_sync(mask, x, 0)`，而选中的不是 lane 0，会广播未初始化值。
 非 SM90 路径显式 lane0 安全；SM90 上实测常选 0，但 **PTX 不保证**。读到「elect + shfl 0」配对时要警惕。
 
+专门展开（危险/合法对照、CPU 模拟、算不算活 bug）：见 [19](./19-deepep-elect-one-shfl-lane0-hazard.md)。
+
 ## 6. 完整可运行验证：`send_head` 编码与 head 更新
 
 把 `cached_notify_combine` 的从后往前编码，以及 combine 的 head 更新，缩成纯 Python，不依赖 GPU。

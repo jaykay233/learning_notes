@@ -474,6 +474,8 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [15-deepep-v1-warp-block-queue-matrix.md](communication/15-deepep-v1-warp-block-queue-matrix.md) | Normal/LL × dispatch/combine × intra/inter：warp/block 分工、环形 vs staging、中转数据模型（head/tail 所有权、双环、meta、门铃） |
 | [16-deepep-v1-internode-dispatch-combine.md](communication/16-deepep-v1-internode-dispatch-combine.md) | Normal 跨机：RDMA+NVL 双环、dispatch/combine WarpRole 走读、Sender 装箱 vs Coordinator put、极性对调 |
 | [17-deepep-v1-internode-deep-dive-qa.md](communication/17-deepep-v1-internode-deep-dive-qa.md) | 跨机深挖问答：layout+notify、18 个 meta、`kRDMASender`、shfl vs syncwarp、combine 两级 reduce、LL combine、tail 只读 / head 取 min |
+| [18-deepep-v1-ll-recv-hook-zero-sm.md](communication/18-deepep-v1-ll-recv-hook-zero-sm.md) | LL `return_recv_hook`：phases 拆 SEND/RECV、IBGDA `put_nbi` 后台 DMA、「0 SM」= 等网窗口、与 `async_finish` 互斥 |
+| [19-deepep-elect-one-shfl-lane0-hazard.md](communication/19-deepep-elect-one-shfl-lane0-hazard.md) | `elect_one_sync` + `__shfl_sync(..., 0)`：elect 不保证 lane 0、危险/合法对照、CPU 模拟验证 |
 
 ## DeepSeek-V4
 
