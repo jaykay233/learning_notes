@@ -662,8 +662,8 @@ if __name__ == "__main__":
 
 - [x] 机内 / LL 各路径精读（10–14）
 - [x] Warp·block·队列矩阵（图文版）
-- [ ] Normal internode 按 WarpRole 逐段精读
+- [x] Normal internode 按 WarpRole 逐段精读（16）
 
 ### 下一知识点
 
-`internode.cu` dispatch：按 `kRDMASender` → `kRDMAAndNVLForwarder` → `kNVLReceivers` 走读一跳 token。
+[16](./16-deepep-v1-internode-dispatch-combine.md)：跨机 dispatch/combine 双环与 WarpRole 走读。
