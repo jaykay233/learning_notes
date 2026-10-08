@@ -95,7 +95,8 @@ communication/
 ├── 10-deepep-v1-intranode-dispatch-kernel.md  # 机内 dispatch kernel：环形队列 / head-tail 流控 / send_head / release-acquire
 ├── 11-deepep-v1-intranode-combine-and-warp-roles.md # 机内 combine / warp 分工 / handle·cached notify / send_head 空洞编码
 ├── 12-deepep-v1-low-latency-dispatch-kernel.md # LL dispatch：定容槽 / finish 2×TAG / −n−1 / expert-major 打包
-└── 13-deepep-v1-low-latency-dispatch-qa.md # LL dispatch 精读：条带 / staging / finish·count / 双重 idx
+├── 13-deepep-v1-low-latency-dispatch-qa.md # LL dispatch 精读：条带 / staging / finish·count / 双重 idx
+└── 14-deepep-v1-low-latency-combine-and-pack.md # LL 打包顺序 + combine 回程：row/slot/src_idx / layout / 加权
 ```
 
 ```
@@ -210,6 +211,7 @@ models/
 | DeepEP V1 combine / warp 分工 / handle·cached notify / send_head 空洞 | [communication/11](communication/11-deepep-v1-intranode-combine-and-warp-roles.md) |
 | DeepEP V1 LL dispatch / 定容槽 / finish 协议 / expert-major 打包 | [communication/12](communication/12-deepep-v1-low-latency-dispatch-kernel.md) |
 | DeepEP V1 LL dispatch 精读问答 / staging·finish·count | [communication/13](communication/13-deepep-v1-low-latency-dispatch-qa.md) |
+| DeepEP V1 LL combine / expert-major 打包回程 / src_idx | [communication/14](communication/14-deepep-v1-low-latency-combine-and-pack.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
@@ -460,6 +462,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [11-deepep-v1-intranode-combine-and-warp-roles.md](communication/11-deepep-v1-intranode-combine-and-warp-roles.md) | 机内 `combine`：dispatch/combine warp 对照、handle 与 `cached_notify_*`、`__any_sync` / `tma_store_wait`、`send_head` 空洞编码、rank-major 与 `recv_topk_idx`、Python 验证 |
 | [12-deepep-v1-low-latency-dispatch-kernel.md](communication/12-deepep-v1-low-latency-dispatch-kernel.md) | Low-latency `dispatch` kernel：SEND/RECV phase、原子抢槽、finish=`2×TAG`、count `−n−1`、staging→expert-major 打包、与 normal 对照、Python 验证 |
 | [13-deepep-v1-low-latency-dispatch-qa.md](communication/13-deepep-v1-low-latency-dispatch-qa.md) | LL dispatch 精读问答：条带与 warp 角色、staging/slot、finish 三笔账与发 count、`responsible_expert_idx` 双重语义、与 normal channel 类比 |
+| [14-deepep-v1-low-latency-combine-and-pack.md](communication/14-deepep-v1-low-latency-combine-and-pack.md) | LL expert-major 先来后到打包、`row`/`slot`/`src_idx` 名词表、`layout_range`+`src_info` 回程、combine SEND/RECV 与加权 reduce |
 
 ## DeepSeek-V4
 

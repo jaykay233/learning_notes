@@ -247,8 +247,8 @@ SEND idx→dst_*；RECV idx→src_*（公式同，语义反）
 
 - [x] LL dispatch 主流程（12）
 - [x] LL dispatch 精读问答：条带、staging/slot、finish/count、双重 idx 语义
-- [ ] LL combine
+- [x] LL combine 与打包回程（14）
 
 ### 下一知识点
 
-low-latency `combine`：`layout_range` / `src_info` + `topk_weights` 加权收回。
+[14](./14-deepep-v1-low-latency-combine-and-pack.md)：expert-major 打包 + `layout_range` / `src_info` 回程 + 加权 combine。

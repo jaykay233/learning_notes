@@ -363,4 +363,4 @@ phases：可只 SEND，hook 再 RECV；同核则 grid.sync
 
 ### 下一知识点
 
-low-latency `combine`。精读易混点见 [13-deepep-v1-low-latency-dispatch-qa.md](./13-deepep-v1-low-latency-dispatch-qa.md)。
+[14](./14-deepep-v1-low-latency-combine-and-pack.md)：expert-major 打包与 combine 回程。精读易混点见 [13](./13-deepep-v1-low-latency-dispatch-qa.md)。
