@@ -10,7 +10,7 @@
 小节：low-latency dispatch kernel 读码
 知识点：SEND/RECV phase；warp 分工（发数据 / 计专家人数）；atomic 槽位；finish 计数凑齐 2×TAG；count 编码 −n−1；收端按 (local_expert, src_rank) 打包进 [L,C·P,H]
 上次：机内 combine / warp / handle·cached notify
-下次：low-latency combine（layout_range + topk_weights 加权收回）
+下次：LL dispatch 精读问答（见 13）；再后是 low-latency combine
 PTX / 原语：atomicAdd、ld.acquire / st.release.sys、ibgda put、nvshmem P2P、cg::this_grid().sync、bar.sync
 ```
 
@@ -359,7 +359,8 @@ phases：可只 SEND，hook 再 RECV；同核则 grid.sync
 - [x] DeepEP V1 normal 机内：layout → notify → dispatch → combine / warp / handle
 - [x] DeepEP V1 low-latency 数据流与布局概念（05/06）
 - [x] Low-latency `dispatch` kernel：phase、槽位原子、finish/`−n−1`、expert-major 打包
+- [x] LL dispatch 精读问答（见 [13](./13-deepep-v1-low-latency-dispatch-qa.md)）
 
 ### 下一知识点
 
-low-latency `combine`：用 `layout_range` / `src_info` 把 expert 输出按 `topk_weights` 加权写回源 rank，以及 SEND/RECV phase 与 `zero_copy`。
+low-latency `combine`。精读易混点见 [13-deepep-v1-low-latency-dispatch-qa.md](./13-deepep-v1-low-latency-dispatch-qa.md)。
