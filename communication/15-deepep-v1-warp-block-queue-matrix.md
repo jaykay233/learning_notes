@@ -12,9 +12,9 @@
 本次讲解位置
 章节：communication / DeepEP V1
 小节：SM / warp / 队列三维对照（图文版）
-知识点：偶发奇收 × 单环；跨机双环 + forwarder；LL 无 channel、staging+门铃
+知识点：偶发奇收 × 单环；跨机双环 + forwarder；LL 无 channel、staging+门铃；中转数据模型（head/tail 所有权）
 上次：LL combine 打包回程（14）
-下次：normal internode 按 WarpRole 走读
+下次：跨机 WarpRole 走读（16）→ 深挖问答（17）
 PTX / 原语：st.release.sys / ld.acquire.sys、bar.sync、atomicAdd、ibgda put、grid.sync
 ```
 
@@ -99,6 +99,75 @@ flowchart LR
     RDMA[RDMA环] --> FWD[forwarder] --> NVL[NVL环]
   end
 ```
+
+### 0.2.1 中转数据模型（对照表，细节见 16/17）
+
+读路径前先认清四件事：**槽里放什么、谁推 tail、谁推 head、回家靠什么线索**。
+
+#### A. Normal 单环（机内）不变量
+
+```text
+逻辑序号单调：head / tail 只增不减
+物理槽位：    slot = 序号 % N
+占用长度：    occupied = tail - head
+生产者：写 data[slot] → release/推 tail
+消费者：acquire 读 tail → 搬 [head,tail) → 写 head（或 Coord 取 min 再写）
+```
+
+| 字段 | 含义 |
+|---|---|
+| `data[N]` | 定长槽：hidden + 元数据（src / topk / scales…） |
+| `head` / `tail` | 单调计数器，**不是**链表 next |
+| `send_head[token][dst]` | 旁路线索：本 channel 内序号，或 `-1` 表示没发 |
+
+#### B. Normal 跨机双环（数据结构）
+
+```text
+RDMA 层（SymBuffer，NVSHMEM 对称堆）
+  send_half[dst_rdma][channel][slot]   本卡装箱区
+  recv_half[src_rdma][channel][slot]   对端 put 进来（槽序号镜像）
+  + meta[18]（每 channel 一次）+ head + tail
+
+NVL 层（AsymBuffer，IPC）
+  peer 上的环：data / head / tail / prefix
+  combine 时再按「RDMA 来源」拆成 R 段子环（防死锁）
+```
+
+| 指针 | 谁写（dispatch） | 谁写（combine） |
+|---|---|---|
+| RDMA **tail** | 源节点 SenderCoordinator（AMO） | 目标节点 Forwarder 末 sub_warp（AMO） |
+| RDMA **head** | 目标节点 FwdCoord（AMO 推回源） | 源节点 ReceiverCoord（AMO 推回目标） |
+| NVL **tail** | Forwarder（`st_release`） | NVLSender（按 RDMA 源子环） |
+| NVL **head** | NVLReceivers / Coord 取 min | Forwarder Coord 取 min |
+
+**消费侧口诀：** 多 warp **各自读**远端/本端 tail，不用互相同步；要跨 warp 共识的是 **head（取 min）**。生产侧推 remote tail 通常收成「一个人发」（SenderCoord / large-warp 末 warp）。深挖见 [17 §7](./17-deepep-v1-internode-deep-dive-qa.md)。
+
+**meta（18 个 int，编码 `-v-1`）≠ token 内容**：是每 channel 的前缀数量（每目标卡 start/end + 节点级 start/end），告诉 Forwarder/NVLReceiver「本 channel 收多少、写到哪」。深挖见 [17 §2](./17-deepep-v1-internode-deep-dive-qa.md)。
+
+旁路线索（combine 回家）：
+
+| 表 | 含义 |
+|---|---|
+| `send_rdma_head[token][rdma]` | token 在某节点 RDMA 环上的槽（或 -1） |
+| `send_nvl_head[...]` | Forwarder 记下的「该回程 token 在各 NVL 源环上的槽」 |
+
+#### C. LL staging（无 head/tail 环）
+
+```text
+dispatch: staging[local_expert][src_rank][slot]   slot = atomic 抢坑
+          门铃 rdma_recv_count = -n-1
+          旁路 layout_range / src_info（打包时写下）
+
+combine:  rdma_recv_x[global_expert][src_token]   按下标直写，不抢环
+          门铃 rdma_recv_flag = 1（每 expert 一段发完敲一次）
+```
+
+| | Normal 环 | LL staging |
+|---|---|---|
+| 寻址 | 单调序号 `% N` | 抢坑 / 或直接 `src_token` |
+| 「到齐」 | 看 tail 前进 | 看 **count / flag** |
+| 槽复用 | head 前进后复用 | 同一次 dispatch 不回收（容量按 worst-case） |
+| 身份 | 序号本身 + 旁路 `send_*_head` | 消息头 / `src_info`（**slot ≠ 源 token**） |
 
 ### 0.3 默认数量级（脑内代入用）
 
@@ -311,20 +380,24 @@ is_forwarder = (sm_id % 2 == 0)   <- 偶数是中转站，不是「业务发送�
 | 奇数 | 7 | SenderCoordinator | 推 RDMA **tail** |
 | 奇数 | 8..15 | NVLReceivers | NVL 环 -> `recv_x` |
 
-### 3.3 中转：两层环
+### 3.3 中转：两层环（对照 §0.2.1）
 
 ```text
         +-- RDMA 环（机间，SymBuffer）--+
-        | data[槽]  head  tail  meta    |
+        | data[槽]  head  tail  meta    |  meta=18×(-v-1) 前缀数量
         +---------------+---------------+
-                        | forwarder 搬运
+                        | forwarder 过滤 SourceMeta → 只转需要的 peer
         +---------------v---------------+
         | NVL 环（机内 peer，AsymBuffer）|
         | data[槽]  head  tail  prefix  |
         +-------------------------------+
+
+所有权（dispatch）：
+  SenderCoord 推 RDMA tail；FwdCoord 推 RDMA head（释放源侧槽）
+  Forwarder 推 NVL tail；NVLReceivers（+min）推 NVL head
 ```
 
-回程元数据：`send_rdma_head` / `send_nvl_head`（类似机内 `send_head`）。
+回程元数据：`send_rdma_head` / `send_nvl_head`（类似机内 `send_head`）。角色走读见 [16](./16-deepep-v1-internode-dispatch-combine.md)；meta / Sender / sync 见 [17](./17-deepep-v1-internode-deep-dive-qa.md)。
 
 ---
 
@@ -351,7 +424,18 @@ flowchart LR
   H --> C["combined_x"]
 ```
 
-NVL 侧按不同 RDMA 源拆 buffer，避免死锁（约 L1794）。
+### 4.2 中转差异（相对 dispatch）
+
+```text
+NVL 环按「RDMA 来源」拆成 R 段子环（约 L1794）—— 防多回程方向抢同一条环死锁
+  NVLSender lane j 只推「来源节点 j」那段的 tail
+
+两级 reduce（不是纯搬运）：
+  1) Forwarder：用 combined_nvl_head 对齐各 NVL 源槽 → combine_token（机内 8 卡求和）
+  2) RDMAReceiver：用 combined_rdma_head 对齐各节点槽 → combine_token（跨节点求和）→ combined_x
+
+Coord：偶 SM 推 RDMA head；奇 SM 推 NVL head（都是对 worker 进度取 min）
+```
 
 ---
 
@@ -557,6 +641,8 @@ flowchart LR
 跨机 Normal：双环 · dispatch 偶 FWD / combine 奇 FWD · 箭头相反
 LL：无 channel · SM 扫 token · group 认 expert · 数组+门铃 · expert-major
 环 != 链表；slot != src_idx != row
+中转：生产者推 tail · 消费者取 min 推 head · 多 warp 读 tail 不用互相同步
+跨机 meta：18 个 -v-1 前缀数量，不是 token 内容
 ```
 
 ---
@@ -640,6 +726,8 @@ if __name__ == "__main__":
 | internode combine/dispatch 同极性 | combine 奇偶对调 | 读错谁是 forwarder |
 | staging slot = 源 token | 身份在消息头 / `src_info` | combine 写错槽 |
 | 机内 combine 仍 3 warp 按来源搬 | warp0 推 head，其余按 token 求和 | 对不上 `__any_sync` |
+| 多 consumer warp 要同步远端 tail | tail 只读；共识在 **head 取 min** | 多余 barrier / 漏推 head |
+| 跨机 meta 是 token 内容 | 18 个前缀数量（`-v-1`） | Forwarder 等不到 / 写错 offset |
 
 ## 10. 自测题与答案
 
@@ -658,13 +746,19 @@ if __name__ == "__main__":
 5. **LL dispatch 接收端「等齐」看 head 还是 count？**
    答：`rdma_recv_count`（`-n-1`）。
 
+6. **跨机 dispatch：谁推 RDMA tail？谁推 RDMA head？**
+   答：SenderCoordinator 推 tail；目标节点 FwdCoord 取 min 后 AMO 推 head。
+
+7. **多个 RDMAReceiver warp 要不要同步远端 tail？**
+   答：不要，各自 `ld_acquire` 即可；要取 min 再推的是 head。
+
 ## 11. 学习进度
 
 - [x] 机内 / LL 各路径精读（10–14）
-- [x] Warp·block·队列矩阵（图文版）
+- [x] Warp·block·队列矩阵（图文版）+ 中转数据模型（§0.2.1）
 - [x] Normal internode 按 WarpRole 逐段精读（16）
 - [x] 跨机深挖问答（17）
 
 ### 下一知识点
 
-[17](./17-deepep-v1-internode-deep-dive-qa.md)：跨机 layout / meta / Sender / sync / combine 追问。
+中转数据模型已收进本节 §0.2.1；角色走读 [16](./16-deepep-v1-internode-dispatch-combine.md)，meta/Sender/sync 深挖 [17](./17-deepep-v1-internode-deep-dive-qa.md)。
