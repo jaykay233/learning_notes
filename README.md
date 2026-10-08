@@ -99,7 +99,8 @@ communication/
 ├── 14-deepep-v1-low-latency-combine-and-pack.md # LL 打包顺序 + combine 回程：row/slot/src_idx / layout / 加权
 ├── 15-deepep-v1-warp-block-queue-matrix.md # Normal×LL × dispatch/combine × intra/inter：warp·block·队列 + 中转数据模型
 ├── 16-deepep-v1-internode-dispatch-combine.md # Normal 跨机 dispatch/combine：双环 + WarpRole 走读
-└── 17-deepep-v1-internode-deep-dive-qa.md # 跨机深挖：layout/meta/Sender/sync/combine/LL combine
+├── 17-deepep-v1-internode-deep-dive-qa.md # 跨机深挖：layout/meta/Sender/sync/combine/LL combine
+└── 18-deepep-v1-ll-recv-hook-zero-sm.md # LL return_recv_hook：SEND/RECV 拆枪与「0 SM」重叠
 ```
 
 ```
@@ -218,6 +219,7 @@ models/
 | DeepEP V1 warp·block·队列对照 / 中转数据模型 | [communication/15](communication/15-deepep-v1-warp-block-queue-matrix.md) |
 | DeepEP V1 跨机 dispatch·combine / 双环 WarpRole | [communication/16](communication/16-deepep-v1-internode-dispatch-combine.md) |
 | DeepEP V1 跨机深挖 / layout·meta·Sender·sync·combine | [communication/17](communication/17-deepep-v1-internode-deep-dive-qa.md) |
+| DeepEP V1 LL recv hook / 「0 SM」重叠 | [communication/18](communication/18-deepep-v1-ll-recv-hook-zero-sm.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |

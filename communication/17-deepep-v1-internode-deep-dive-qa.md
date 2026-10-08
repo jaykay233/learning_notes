@@ -10,7 +10,7 @@
 小节：normal internode 精读追问
 知识点：跨机 layout+notify；meta=-v-1 前缀；Sender 扫全量+窗口；shfl 广播值 / syncwarp 对齐时序；combine 两级 reduce；LL staging+flag；tail 只读 / head 取 min
 上次：跨机 dispatch/combine WarpRole 走读（16）
-下次：SourceMeta 位图细节，或 V2 elastic
+下次：LL recv hook / 「0 SM」重叠（18）
 PTX / 原语：__shfl_sync、__syncwarp、barrier.sync、ld.acquire.sys、st.release、AMO、TMA
 ```
 
@@ -319,8 +319,8 @@ Consumer：tail 只读不互相同步；head 取 min 再推
 
 - [x] Normal 跨机 WarpRole 走读（16）
 - [x] 跨机 layout / notify / meta / Sender / sync / combine / LL combine 追问
-- [ ] SourceMeta 位图与 `is_token_in_nvl_rank` 边界情况（可选）
+- [x] LL recv hook / 「0 SM」重叠（18）
 
 ### 下一知识点
 
-`SourceMeta` 打包细节（`src_rdma_rank` + 8-bit NVL 位图）与 combine 侧如何消费；或转入 V2 elastic 路径。
+[18](./18-deepep-v1-ll-recv-hook-zero-sm.md)：`return_recv_hook` 拆 SEND/RECV、IBGDA `put_nbi` 后台传、与 `async_finish` 互斥。
