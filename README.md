@@ -98,7 +98,8 @@ communication/
 ├── 13-deepep-v1-low-latency-dispatch-qa.md # LL dispatch 精读：条带 / staging / finish·count / 双重 idx
 ├── 14-deepep-v1-low-latency-combine-and-pack.md # LL 打包顺序 + combine 回程：row/slot/src_idx / layout / 加权
 ├── 15-deepep-v1-warp-block-queue-matrix.md # Normal×LL × dispatch/combine × intra/inter：warp·block·队列对照
-└── 16-deepep-v1-internode-dispatch-combine.md # Normal 跨机 dispatch/combine：双环 + WarpRole 走读
+├── 16-deepep-v1-internode-dispatch-combine.md # Normal 跨机 dispatch/combine：双环 + WarpRole 走读
+└── 17-deepep-v1-internode-deep-dive-qa.md # 跨机深挖：layout/meta/Sender/sync/combine/LL combine
 ```
 
 ```
@@ -216,6 +217,7 @@ models/
 | DeepEP V1 LL combine / expert-major 打包回程 / src_idx | [communication/14](communication/14-deepep-v1-low-latency-combine-and-pack.md) |
 | DeepEP V1 warp·block·队列对照 / Normal×LL×intra/inter | [communication/15](communication/15-deepep-v1-warp-block-queue-matrix.md) |
 | DeepEP V1 跨机 dispatch·combine / 双环 WarpRole | [communication/16](communication/16-deepep-v1-internode-dispatch-combine.md) |
+| DeepEP V1 跨机深挖 / layout·meta·Sender·sync·combine | [communication/17](communication/17-deepep-v1-internode-deep-dive-qa.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
@@ -469,6 +471,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [14-deepep-v1-low-latency-combine-and-pack.md](communication/14-deepep-v1-low-latency-combine-and-pack.md) | LL expert-major 先来后到打包、`row`/`slot`/`src_idx` 名词表、`layout_range`+`src_info` 回程、combine SEND/RECV 与加权 reduce |
 | [15-deepep-v1-warp-block-queue-matrix.md](communication/15-deepep-v1-warp-block-queue-matrix.md) | Normal/LL × dispatch/combine × intra/inter：发送·接收 warp/block 分工与环形 head/tail vs 定容 staging 对照矩阵 |
 | [16-deepep-v1-internode-dispatch-combine.md](communication/16-deepep-v1-internode-dispatch-combine.md) | Normal 跨机：RDMA+NVL 双环、dispatch/combine WarpRole 走读、Sender 装箱 vs Coordinator put、极性对调 |
+| [17-deepep-v1-internode-deep-dive-qa.md](communication/17-deepep-v1-internode-deep-dive-qa.md) | 跨机深挖问答：layout+notify、18 个 meta、`kRDMASender`、shfl vs syncwarp、combine 两级 reduce、LL combine、tail 只读 / head 取 min |
 
 ## DeepSeek-V4
 

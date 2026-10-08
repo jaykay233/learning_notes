@@ -10,7 +10,7 @@
 小节：normal internode dispatch / combine
 知识点：偶 SM=forwarder（dispatch）/ 奇 SM=forwarder（combine）；RDMA+NVL 双环；Sender→Coordinator→Forwarder→NVLReceivers；回程 NVLSender→Forwarder→RDMAReceiver
 上次：warp·block·队列矩阵（15）
-下次：SourceMeta / notify_dispatch 跨机前缀，或 V2 elastic
+下次：跨机深挖问答（layout / meta / Sender / sync / combine）（17）
 PTX / 原语：ibgda put、amo_nonfetch_add、st.release.sys / ld.acquire.sys、TMA、bar.sync
 ```
 
@@ -317,8 +317,8 @@ Sender 装箱 / Coordinator 发；Forwarder 转；Receiver 落
 - [x] 机内 dispatch / combine（10/11）
 - [x] LL 路径与矩阵（12–15）
 - [x] Normal 跨机 dispatch / combine WarpRole 走读
-- [ ] SourceMeta 与跨机 notify 前缀精读（可选）
+- [x] 跨机深挖问答（17）：layout / meta / Sender / sync / combine / LL combine
 
 ### 下一知识点
 
-`SourceMeta` 打包与 `notify_dispatch` 跨机 prefix（`rdma_channel_prefix_matrix` / `gbl_channel_prefix_matrix`）如何喂给本课的 meta 发送。
+[17](./17-deepep-v1-internode-deep-dive-qa.md)：跨机 layout、18 个 meta、`kRDMASender`、shfl vs syncwarp、combine 两级 reduce、LL combine、tail/head 同步约定。

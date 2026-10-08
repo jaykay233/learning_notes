@@ -663,7 +663,8 @@ if __name__ == "__main__":
 - [x] 机内 / LL 各路径精读（10–14）
 - [x] Warp·block·队列矩阵（图文版）
 - [x] Normal internode 按 WarpRole 逐段精读（16）
+- [x] 跨机深挖问答（17）
 
 ### 下一知识点
 
-[16](./16-deepep-v1-internode-dispatch-combine.md)：跨机 dispatch/combine 双环与 WarpRole 走读。
+[17](./17-deepep-v1-internode-deep-dive-qa.md)：跨机 layout / meta / Sender / sync / combine 追问。
