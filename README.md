@@ -10,7 +10,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
 | [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、Blackwell TMEM，以及 CUDA kernel launch 机制 |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
-| [`communication/`](communication/) | GPU 通信提交、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
+| [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
 | [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、SP 布局转换与 Vocab Embedding、数据随机性与 SLURM |
@@ -100,7 +100,10 @@ communication/
 ├── 15-deepep-v1-warp-block-queue-matrix.md # Normal×LL × dispatch/combine × intra/inter：warp·block·队列 + 中转数据模型
 ├── 16-deepep-v1-internode-dispatch-combine.md # Normal 跨机 dispatch/combine：双环 + WarpRole 走读
 ├── 17-deepep-v1-internode-deep-dive-qa.md # 跨机深挖：layout/meta/Sender/sync/combine/LL combine
-└── 18-deepep-v1-ll-recv-hook-zero-sm.md # LL return_recv_hook：SEND/RECV 拆枪与「0 SM」重叠
+├── 18-deepep-v1-ll-recv-hook-zero-sm.md # LL return_recv_hook：SEND/RECV 拆枪与「0 SM」重叠
+├── 19-deepep-elect-one-shfl-lane0-hazard.md # elect_one_sync + shfl lane0 陷阱
+├── 20-deepep-v2-buffer-coordinates-and-handle-arrays.md # V2 直连坐标 / handle 数组 / 寄信模型
+└── 21-gpu-initiated-rdma-submission-dc-qp-sharing.md # payload / doorbell / WQE fetch / CQE / DCI / DCT / QP sharing
 ```
 
 ```
@@ -220,6 +223,7 @@ models/
 | DeepEP V1 跨机 dispatch·combine / 双环 WarpRole | [communication/16](communication/16-deepep-v1-internode-dispatch-combine.md) |
 | DeepEP V1 跨机深挖 / layout·meta·Sender·sync·combine | [communication/17](communication/17-deepep-v1-internode-deep-dive-qa.md) |
 | DeepEP V1 LL recv hook / 「0 SM」重叠 | [communication/18](communication/18-deepep-v1-ll-recv-hook-zero-sm.md) |
+| GPU-initiated RDMA / doorbell / WQE fetch / CQE / DC / QP sharing | [communication/21](communication/21-gpu-initiated-rdma-submission-dc-qp-sharing.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
@@ -477,6 +481,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [18-deepep-v1-ll-recv-hook-zero-sm.md](communication/18-deepep-v1-ll-recv-hook-zero-sm.md) | LL `return_recv_hook`：phases 拆 SEND/RECV、IBGDA `put_nbi` 后台 DMA、「0 SM」= 等网窗口、与 `async_finish` 互斥 |
 | [19-deepep-elect-one-shfl-lane0-hazard.md](communication/19-deepep-elect-one-shfl-lane0-hazard.md) | `elect_one_sync` + `__shfl_sync(..., 0)`：elect 不保证 lane 0、危险/合法对照、CPU 模拟验证 |
 | [20-deepep-v2-buffer-coordinates-and-handle-arrays.md](communication/20-deepep-v2-buffer-coordinates-and-handle-arrays.md) | V2 直连：一块 buffer 两套视图、去程 `[src][slot]` vs 回程 `[贡献者][原 token_idx]`；rank-major / expert-major 寄信模型（Route/Layout/ForwardLoc/ReturnInfo/LocalMap）+ 装箱单 + Python 模拟 |
+| [21-gpu-initiated-rdma-submission-dc-qp-sharing.md](communication/21-gpu-initiated-rdma-submission-dc-qp-sharing.md) | GPU-initiated RDMA 完整提交链：SM source payload、GPU/proxy-submitted、dbrec/UAR doorbell、WQE fetch、CQE、GPU/NIC DMA、DC/DCI/DCT/AV、QP sharing 与 fence scope |
 
 ## DeepSeek-V4
 
