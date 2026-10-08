@@ -476,7 +476,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [17-deepep-v1-internode-deep-dive-qa.md](communication/17-deepep-v1-internode-deep-dive-qa.md) | 跨机深挖问答：layout+notify、18 个 meta、`kRDMASender`、shfl vs syncwarp、combine 两级 reduce、LL combine、tail 只读 / head 取 min |
 | [18-deepep-v1-ll-recv-hook-zero-sm.md](communication/18-deepep-v1-ll-recv-hook-zero-sm.md) | LL `return_recv_hook`：phases 拆 SEND/RECV、IBGDA `put_nbi` 后台 DMA、「0 SM」= 等网窗口、与 `async_finish` 互斥 |
 | [19-deepep-elect-one-shfl-lane0-hazard.md](communication/19-deepep-elect-one-shfl-lane0-hazard.md) | `elect_one_sync` + `__shfl_sync(..., 0)`：elect 不保证 lane 0、危险/合法对照、CPU 模拟验证 |
-| [20-deepep-v2-buffer-coordinates-and-handle-arrays.md](communication/20-deepep-v2-buffer-coordinates-and-handle-arrays.md) | V2 直连：一块 buffer 两套视图、去程 `[src][slot]` vs 回程 `[贡献者][原 token_idx]`、expand、V1 对照；rank-major / expert-major 通用 handle 数组（编号/布局/去程定位/回程信息/本地 expert 映射）+ Python 模拟 |
+| [20-deepep-v2-buffer-coordinates-and-handle-arrays.md](communication/20-deepep-v2-buffer-coordinates-and-handle-arrays.md) | V2 直连：一块 buffer 两套视图、去程 `[src][slot]` vs 回程 `[贡献者][原 token_idx]`；rank-major / expert-major 寄信模型（Route/Layout/ForwardLoc/ReturnInfo/LocalMap）+ 装箱单 + Python 模拟 |
 
 ## DeepSeek-V4
 

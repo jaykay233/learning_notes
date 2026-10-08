@@ -262,103 +262,255 @@ V2 去掉了 V1 normal 的环形队列和 `send_head` 查表，借鉴 LL「按�
 
 ## 8. 通用整理：rank-major / expert-major 下的数组结构
 
-### 8.1 五类数组
+先忘掉 DeepEP 里那些具体名字，只问一件事：
 
-不管哪个实现，dispatch 产出、combine 消费的东西都可以归进五类：
+**dispatch 之后，目的卡上的 `recv_x` 每一行代表什么？**
 
-| 类别 | 回答的问题 | 记在哪张卡 | 谁写 |
+答案只有两种。这两种决定了后面所有数组该长什么样。
+
+### 8.1 用一个具体例子钉死两种布局
+
+假设：4 张卡，每张 2 个 expert（全局 expert `0..7`），topk = 2。源卡 rank0 的 token `t=5` 选中 expert `1` 和 `4`：
+
+- expert1 → 落在 rank0
+- expert4 → 落在 rank2
+
+所以这个 token 要发给 **rank0** 和 **rank2** 各一份。
+
+**Rank-major：一行 =「这个 token 到了这张卡」**
+
+目的卡 rank2 收到后只占一行：
+
+```text
+recv_x 第 r 行 = token5 整份向量
+旁边必须另有一张表告诉你：本卡该喂给哪个 expert
+→ LocalMap[r] = [本地 expert0(=全局4),  -1, ...]
+```
+
+本卡如果有两个 expert 都命中同一个 token，**仍然只有一行**，LocalMap 里写两个本地 id。用户自己按 LocalMap 拆开做 GEMM，再自己把结果合成一份交给 combine。
+
+**Expert-major：一行 =「这个 token × 某一个 expert」**
+
+同样的 token，在 rank2 上可能占多行（每个命中的本地 expert 一行）：
+
+```text
+recv_x 第 e0 区间里某一行 = token5 给 expert4 的副本
+recv_x 第 e1 区间里某一行 = token5 给 expert5 的副本（若也命中）
+```
+
+行落在哪个区间，就等于告诉你 expert 是谁，所以 **不需要** 再存一张 `recv_topk_idx`。用户可以直接 grouped GEMM；求和交给 combine。
+
+| | Rank-major | Expert-major |
+|---|---|---|
+| 一行是什么 | 到这张卡的一个 token | 到这张卡某个 expert 的一个副本 |
+| 行数 | 少（按 token 去重） | 多（按 topk 命中展开） |
+| 「属于哪个 expert」写在哪 | 旁边一张表（LocalMap） | 行本身所在的区间 |
+
+DeepEP 里开关就是 `kDoExpand`：关 = rank-major，开 = expert-major（`dispatch_copy_epilogue.cuh` L108–L121）。
+
+### 8.2 不管哪种布局，通信都要答 4 个问题
+
+把一次 EP 想成寄信再回信：
+
+```text
+去程（dispatch）
+  源卡：token5 要寄到 rank0、rank2
+  目的卡：信放到自己邮箱的哪一格？邮箱里有几封？
+
+回程（combine）
+  目的卡：算完了，回信寄回 rank0 的 token5
+  源卡：token5 要收几封回信？从哪几格读？
+```
+
+对应到数据结构，就是 **5 块**（其中 1 块可选）：
+
+```text
+源卡手里
+  ① Route（路由）        「token5 去哪些 expert」→ 也推出「该收哪几份回信」
+  ② ForwardLoc（去程定位）「token5 在对端邮箱的第几格」（有时可以不要）
+
+目的卡手里
+  ③ Layout（布局/计数）   「邮箱怎么分段、每段多长」
+  ④ ReturnInfo（回程信息）「我这一行的结果，该寄回哪张卡的哪个 token」
+  ⑤ LocalMap（本地映射） 「我这一行对应哪些本地 expert」
+                           （rank-major 必有；expert-major 常隐含在区间里）
+```
+
+| 抽象名 | 回答的问题 | 记在哪张卡 | 谁写 |
 |---|---|---|---|
-| **路由** | 每个 token 去哪些 expert、权重多少 | 源卡 | 用户（gate） |
-| **布局 / 计数** | 每段多长、从哪开始（按源 rank 段、按本地 expert） | 两边 | dispatch（notify） |
-| **去程定位** | 我的 token `t` 在对端放到了哪格 | 源卡 | dispatch 发送方 |
-| **回程信息** | 我这一行来自哪张卡的哪个 token（以及该回哪一条） | 目的卡 | dispatch 接收方 |
-| **本地 expert 映射** | 这一行要给哪些本地 expert / 对应哪些展开行 | 目的卡 | dispatch 接收方 |
+| Route | 每个 token 去哪些 expert、权重多少 | 源卡 | 用户（gate） |
+| Layout | 每段多长、从哪开始 | 两边 | dispatch（notify） |
+| ForwardLoc | 我的 token `t` 在对端放到了哪格 | 源卡 | dispatch 发送方 |
+| ReturnInfo | 我这一行来自哪张卡的哪个 token | 目的卡 | dispatch 接收方 |
+| LocalMap | 这一行要给哪些本地 expert / 对应哪些展开行 | 目的卡 | dispatch 接收方 |
 
-### 8.2 各实现对号入座
+### 8.3 Rank-major：必有什么、可选什么
 
-| 类别 | V1 normal 机内 | V1 normal 跨机 | V1 LL | V2 直连 |
-|---|---|---|---|---|
-| 路由 | `topk_idx`、`topk_weights`（combine 时不需要 topk_idx） | 同左 | `topk_idx`、`topk_weights`（combine 必须再传，用于加权） | `topk_idx`（handle 里存一份，combine epilogue 用） |
-| 布局 / 计数 | `rank_prefix_matrix`、`channel_prefix_matrix`、`recv_channel_prefix_matrix`、`num_recv_tokens_per_expert_list` | `rdma/gbl_channel_prefix_matrix`、`recv_rdma_rank_prefix_sum`、`recv_gbl_rank_prefix_sum` 等 | `packed_recv_count`、`packed_recv_layout_range`（每 (expert, src rank) 的 `(count, begin)`，`internode_ll.cu` L411） | `psum_num_recv_tokens_per_scaleup_rank`、`psum_num_recv_tokens_per_expert`、`num_unaligned_recv_tokens_per_expert` |
-| 去程定位 | `send_head[t][rank]`（环形尾位置，−1 不发；`intranode.cu` L359–L360） | `send_rdma_head`、`send_nvl_head` | 无（回程直接按 `[expert][t]`） | `dst_buffer_slot_idx[t][k]`（仅 cached dispatch 用） |
-| 回程信息 | `recv_src_idx[r]`（`intranode.cu` L500–L501） | `recv_src_meta[r]` = `SourceMeta{src_rdma_rank, nvl 位图}`（`internode.cu` L22–L23） | `packed_recv_src_info[e][j]` = 源 token 号（L429） | `recv_src_metadata[r] = [g, src*K+master, 展开行×K]` |
-| 本地 expert 映射 | `recv_topk_idx[r][k]`（本地 id 或 −1） | 同左 | 隐含在 `[e][j]` 布局里 | 非 expand：`recv_topk_idx[r][k]`；expand：`metadata[r][2+k]` |
+目的卡 rank2 的 `recv_x` 按源卡分段排：
 
-handle 组成（Python 层）：V1 机内 `(rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)`（`legacy.py` L401）；V1 跨机 10 元组含 `recv_src_meta, send_rdma_head, send_nvl_head`（L500–L502）；V1 LL `(packed_recv_src_info, packed_recv_layout_range, MaxTok, hidden, num_experts)`（L617）；V2 是 `EPHandle` 对象（`elastic.py` L25 起）。
+```text
+recv_x:
+  [来自 rank0 ...] [来自 rank1 ...] [来自 rank3 ...]
+       ↑
+     其中某一行 r = 源 rank0 的 token5
+```
 
-### 8.3 Rank-major：dispatch 产出什么、combine 需要什么
+**必有三张表**
 
-适用：V1 normal（机内 / 跨机）、V2 非 expand。
+1. **Layout**：第几行到第几行是 rank0 发来的。没有它，不知道该扫哪一段。
+2. **ReturnInfo**：`ReturnInfo[r] = (源卡, 源 token 号)`，例如 `(rank0, t=5)`。combine 靠它寄回去。
+3. **LocalMap**：因为一行只代表「到了这张卡」，不代表「某个 expert」：
+
+```text
+LocalMap[r] = [0, -1, ...]   # 本卡本地 expert0（=全局4）要命中
+```
+
+**可选一张表**
+
+4. **ForwardLoc**：源卡记 `token5 在 rank2 邮箱的第 slot 格`。V1 环形队列要靠它找回程格；V2 回程直接写源卡 `[贡献者][t=5]`，这张表通常不要（cached dispatch 才留着复用）。
+
+**数据流**
+
+```text
+dispatch 后，目的卡有：
+  recv_x[r]          一行一个去重 token
+  LocalMap[r][k]     本地 expert
+  ReturnInfo[r]      回哪张卡、哪个 t
+  Layout             各源 rank 段从哪到哪
+
+用户：按 LocalMap 自己拆开做 expert，再合成一行结果 y[r]
+combine：读 ReturnInfo[r] → 写回源卡「token t 的某一格」
+源卡：看自己的 Route，知道 token5 该从哪些格把结果加起来
+```
+
+适用：V1 normal（机内 / 跨机）、V2 非 expand。产出清单：
 
 ```text
 dispatch 产出（目的卡）
   recv_x            [R, H]       R = Σ_src 去重后发来的 token 数，按源 rank 段排
-  recv_topk_idx     [R, K]       本地 expert id 或 −1
+  recv_topk_idx     [R, K]       = LocalMap；本地 expert id 或 −1
   recv_topk_weights [R, K]
   每 expert 计数     [E_local]    给用户开 GEMM buffer
-  rank 段前缀和                  第 src 段从哪行开始
-  回程信息           [R] 或 [R, 2+K]
+  rank 段前缀和                  = Layout
+  回程信息           [R] 或 [R, 2+K]  = ReturnInfo
 dispatch 产出（源卡）
-  去程定位（V1：send_head 等；V2：dst_buffer_slot_idx，可选）
-
-用户要做
-  按 recv_topk_idx 自己 permute / grouped GEMM
-  每个接收行输出一份（本卡多个 expert 已加权合并），行序保持 R 不变
+  去程定位（V1：send_head；V2：dst_buffer_slot_idx，可选）= ForwardLoc
 
 combine 需要
-  x [R, H]（与 recv_x 同行序）+ handle（布局 + 回程 + V1 的去程定位）
+  x [R, H]（与 recv_x 同行序）+ handle（Layout + ReturnInfo + V1 的 ForwardLoc）
 ```
 
-### 8.4 Expert-major：dispatch 产出什么、combine 需要什么
+### 8.4 Expert-major：必有什么
 
-适用：V1 LL、V2 expand。
+同样的 token5，在目的卡上落在某个 expert 区间里：
+
+```text
+recv_x:
+  expert0 区间: [tokenA, token5, tokenC, pad, pad, ...]
+  expert1 区间: [tokenD, ...]
+```
+
+**必有两张表（LocalMap 被吃掉了）**
+
+1. **Layout（按 expert 分段）**：expert0 从第 0 行到第 7 行，expert1 从第 8 行起……行落在哪个区间，就等于 LocalMap。所以不再需要 `recv_topk_idx[r][k]`。
+2. **ReturnInfo**：仍然要回答「这一行结果寄回谁」。有两种记法，本质一样：
+
+| 记法 | 怎么记 | DeepEP 哪里用 |
+|---|---|---|
+| A. 按展开行记 | 每个 GEMM 输入行一条 `(src, t)` | V1 LL：`src_info[e][j]` |
+| B. 按去重行记 + 指针 | 去重行记 `(src, t)`，再另存「第 k 个 topk 对应展开行几」 | V2 expand：`metadata[0..1]` + `metadata[2+k]` |
+
+V2 用记法 B（`combine.cuh` L89–L92 解 `(src, t)`；L114–L117 读展开行指针）：
+
+```text
+metadata[i] = [全局 token 号 g,  src*K+master,  展开行0, 展开行1, ...]
+                 ↑ 回哪个 t        ↑ 回哪张卡      ↑ LocalMap 被换成「展开行指针」
+```
+
+**数据流**
+
+```text
+dispatch 后，目的卡有：
+  recv_x[展开行]     一行一个 (token, expert) 副本
+  Layout             每个本地 expert 的起止
+  ReturnInfo         怎么寄回源卡（记法 A 或 B）
+
+用户：直接 grouped GEMM，每行出一个结果
+combine：用 ReturnInfo（+展开行指针）找到源卡的 t，把各 expert 结果寄回去
+源卡：仍用 Route 决定 token5 收哪几份，再求和
+```
+
+适用：V1 LL、V2 expand。产出清单：
 
 ```text
 dispatch 产出（目的卡）
   recv_x
     V1 LL：[E_local, ranks × MaxTok, H]，每 expert 固定容量，内部按 src rank 分段
     V2 expand：[Σ_e align(count_e), H]，expert 间对齐 padding
-  每 expert 计数 / 前缀和
-  回程信息
+  每 expert 计数 / 前缀和          = Layout
+  回程信息                         = ReturnInfo
     V1 LL：每个展开行一条 src_info（源 token 号）+ 每 (expert, src) 的 (count, begin)
     V2 expand：仍按 rank-major 接收行记 metadata，[2+k] 指向展开行
 
-用户要做
-  直接 grouped GEMM，每个展开行输出一份（单 expert 结果）
-
 combine 需要
-  x 与 recv_x 同布局 + 回程信息
-  源卡还需要自己的 topk_idx（判断收哪几份）；V1 LL 另需 topk_weights（源卡加权）
+  x 与 recv_x 同布局 + ReturnInfo
+  源卡还需要自己的 Route（topk_idx）；V1 LL 另需 topk_weights（源卡加权）
 ```
 
-### 8.5 两种布局的本质差
+### 8.5 装箱单：两种布局最少要带什么
 
-| | rank-major | expert-major |
-|---|---|---|
-| 一行代表 | (token, 目的 rank) 去重一份 | (token, 本地 expert) 一份 |
-| 行数 | Σ 去重 token | Σ topk 命中（V2 加对齐，LL 固定容量） |
-| 本地 expert 信息 | 显式 `recv_topk_idx` | 隐含在行所属区间 |
-| GEMM 前 | 用户自己重排 | 直接 grouped GEMM |
-| 本卡多 expert 的求和 | 用户在 expert 侧做 | combine 做（V2 Case B 本卡先加；V2 Case C / V1 LL 留给源卡） |
+```text
+                    Rank-major              Expert-major
+────────────────────────────────────────────────────────────
+recv_x 一行是啥      (token, 目的卡)          (token, 本地 expert)
+行数                 少（去重）               多（展开）
 
-### 8.6 回程的最小信息
+Layout               按「源 rank」分段         按「本地 expert」分段
+LocalMap             必有：recv_topk_idx      没有：区间本身就是
+ReturnInfo           每去重行一条 (src,t)     每展开行一条，或
+                                              去重行+(展开行指针)
+ForwardLoc           环形/cached 才要         通常不要
+多 expert 谁求和     用户在 expert 侧          combine（本卡或源卡）
+```
+
+一句话：**布局只决定「一行代表 token 还是 (token,expert)」；其余数组都是在为「怎么分段读、怎么寄回去」服务。** Rank-major 缺不了 LocalMap；Expert-major 把 LocalMap 融进 Layout，但 ReturnInfo 一点都不能少。
+
+### 8.6 回程四问 + DeepEP 对号入座
 
 每一份部分结果要回到源卡，必须能回答：
 
 1. 回哪张卡（src rank）
 2. 回到哪个 token（src token 号）
 3. 放在源卡哪一格、怎么和同一 token 的其他份区分
+4. 源卡上 token `t` 要收哪几份
 
-源卡还要知道：
+| 问题 | Rank-major 怎么答 | Expert-major 怎么答 |
+|---|---|---|
+| 去程放到哪 | Layout 的 rank 段 + 紧凑 slot | Layout 的 expert 段 + 展开行 |
+| 这一行属于谁算 | LocalMap 显式写本地 expert | 看行落在哪个 expert 区间 |
+| 结果寄回谁 | ReturnInfo[r]=(rank0,5) | ReturnInfo 同左（或带展开行指针） |
+| 源卡收几份 | 看 Route：命中几个 rank | 看 Route：命中几个 expert/rank |
 
-4. token `t` 要收哪几份
+DeepEP 各实现的具体名字：
+
+| 抽象 | V1 normal 机内 | V1 normal 跨机 | V1 LL | V2 直连 |
+|---|---|---|---|---|
+| Route | `topk_idx`、`topk_weights`（combine 时不需要 topk_idx） | 同左 | `topk_idx`、`topk_weights`（combine 必须再传，用于加权） | `topk_idx`（handle 里存一份，combine epilogue 用） |
+| Layout | `rank_prefix_matrix`、`channel_prefix_matrix`、`recv_channel_prefix_matrix`、`num_recv_tokens_per_expert_list` | `rdma/gbl_channel_prefix_matrix`、`recv_rdma_rank_prefix_sum`、`recv_gbl_rank_prefix_sum` 等 | `packed_recv_count`、`packed_recv_layout_range`（每 (expert, src rank) 的 `(count, begin)`，`internode_ll.cu` L411） | `psum_num_recv_tokens_per_scaleup_rank`、`psum_num_recv_tokens_per_expert`、`num_unaligned_recv_tokens_per_expert` |
+| ForwardLoc | `send_head[t][rank]`（环形尾位置，−1 不发；`intranode.cu` L359–L360） | `send_rdma_head`、`send_nvl_head` | 无（回程直接按 `[expert][t]`） | `dst_buffer_slot_idx[t][k]`（仅 cached dispatch 用） |
+| ReturnInfo | `recv_src_idx[r]`（`intranode.cu` L500–L501） | `recv_src_meta[r]` = `SourceMeta{src_rdma_rank, nvl 位图}`（`internode.cu` L22–L23） | `packed_recv_src_info[e][j]` = 源 token 号（L429） | `recv_src_metadata[r] = [g, src*K+master, 展开行×K]` |
+| LocalMap | `recv_topk_idx[r][k]`（本地 id 或 −1） | 同左 | 隐含在 `[e][j]` 布局里 | 非 expand：`recv_topk_idx[r][k]`；expand：`metadata[r][2+k]` |
+
+回程四问在各实现里的落点：
 
 | 问题 | V1 normal 机内 | V1 LL | V2 直连 |
 |---|---|---|---|
 | 回哪张卡 | 行所在的 rank 段 | `layout_range` 的 src rank 下标 | `metadata[1] / K` |
-| 哪个 token | `recv_src_idx[r]`（随数据入环） | `src_info[e][j]` | `metadata[0] % MaxTok` |
+| 哪个 token | `recv_src_idx[r]` | `src_info[e][j]` | `metadata[0] % MaxTok` |
 | 放哪格 | 环形 slot（head/tail 流控） | `[全局 expert][t]` | `[贡献者][t]` |
 | `t` 收哪几份 | `send_head[t][rank] ≥ 0` | 源卡 `topk_idx[t]` | 源卡 `topk_idx[t]`（去重到 rank 或 lane） |
+
+handle 组成（Python 层）：V1 机内 `(rank_prefix_matrix, channel_prefix_matrix, recv_channel_prefix_matrix, recv_src_idx, is_token_in_rank, send_head)`（`legacy.py` L401）；V1 跨机 10 元组含 `recv_src_meta, send_rdma_head, send_nvl_head`（L500–L502）；V1 LL `(packed_recv_src_info, packed_recv_layout_range, MaxTok, hidden, num_experts)`（L617）；V2 是 `EPHandle` 对象（`elastic.py` L25 起）。
 
 V1 跨机 normal 结构同机内，只是两级：RDMA 段 + NVL 段，靠 `SourceMeta` 位图和 `send_rdma_head` / `send_nvl_head`。
 
