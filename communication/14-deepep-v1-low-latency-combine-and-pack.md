@@ -271,4 +271,4 @@ slot≠src_idx≠row
 
 ### 下一知识点
 
-normal vs LL 全链路对照复习，或进入 internode / DeepEP V2（elastic）布局。
+[15](./15-deepep-v1-warp-block-queue-matrix.md)：Normal×LL × dispatch/combine × intra/inter 的 warp·block·队列矩阵。
