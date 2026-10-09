@@ -103,7 +103,8 @@ communication/
 ├── 18-deepep-v1-ll-recv-hook-zero-sm.md # LL return_recv_hook：SEND/RECV 拆枪与「0 SM」重叠
 ├── 19-deepep-elect-one-shfl-lane0-hazard.md # elect_one_sync + shfl lane0 陷阱
 ├── 20-deepep-v2-buffer-coordinates-and-handle-arrays.md # V2 直连坐标 / handle 数组 / 寄信模型
-└── 21-gpu-initiated-rdma-submission-dc-qp-sharing.md # payload / doorbell / WQE fetch / CQE / DCI / DCT / QP sharing
+├── 21-gpu-initiated-rdma-submission-dc-qp-sharing.md # payload / doorbell / WQE fetch / CQE / DCI / DCT / QP sharing
+└── 22-gpu-initiated-communication-performance-cost-model.md # issue / proxy R-T-B / message rate / kernel·NIC 资源
 ```
 
 ```
@@ -224,6 +225,7 @@ models/
 | DeepEP V1 跨机深挖 / layout·meta·Sender·sync·combine | [communication/17](communication/17-deepep-v1-internode-deep-dive-qa.md) |
 | DeepEP V1 LL recv hook / 「0 SM」重叠 | [communication/18](communication/18-deepep-v1-ll-recv-hook-zero-sm.md) |
 | GPU-initiated RDMA / doorbell / WQE fetch / CQE / DC / QP sharing | [communication/21](communication/21-gpu-initiated-rdma-submission-dc-qp-sharing.md) |
+| GPU-initiated 通信成本 / ordering / proxy / message rate / kernel·NIC 资源 | [communication/22](communication/22-gpu-initiated-communication-performance-cost-model.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
@@ -482,6 +484,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [19-deepep-elect-one-shfl-lane0-hazard.md](communication/19-deepep-elect-one-shfl-lane0-hazard.md) | `elect_one_sync` + `__shfl_sync(..., 0)`：elect 不保证 lane 0、危险/合法对照、CPU 模拟验证 |
 | [20-deepep-v2-buffer-coordinates-and-handle-arrays.md](communication/20-deepep-v2-buffer-coordinates-and-handle-arrays.md) | V2 直连：一块 buffer 两套视图、去程 `[src][slot]` vs 回程 `[贡献者][原 token_idx]`；rank-major / expert-major 寄信模型（Route/Layout/ForwardLoc/ReturnInfo/LocalMap）+ 装箱单 + Python 模拟 |
 | [21-gpu-initiated-rdma-submission-dc-qp-sharing.md](communication/21-gpu-initiated-rdma-submission-dc-qp-sharing.md) | GPU-initiated RDMA 完整提交链：SM source payload、GPU/proxy-submitted、dbrec/UAR doorbell、WQE fetch、CQE、GPU/NIC DMA、DC/DCI/DCT/AV、QP sharing 与 fence scope |
+| [22-gpu-initiated-communication-performance-cost-model.md](communication/22-gpu-initiated-communication-performance-cost-model.md) | 论文第 4 章性能成本解剖：issue/put+completion/RTT、DBR/ordering、QP lookup/queue management/completion scope、CPU proxy R/T/B/handoff、共享 QP、kernel occupancy 与 NIC active connection 代价 |
 
 ## DeepSeek-V4
 
