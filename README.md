@@ -7,6 +7,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo / Hunyuan Hy4 …） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
+| [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付的学习路线 |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
 | [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、Blackwell TMEM，以及 CUDA kernel launch 机制 |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
@@ -30,6 +31,12 @@ ascendc/                     # AscendC CPU 孪生（Colima + CANN 9.x）
 ├── scripts/setup_linux_cpu.sh
 ├── docker/Dockerfile
 └── examples/add_custom/     # vector add；run.sh -r cpu -v Ascend910B1
+operators/                   # 算子开发（CUDA / Triton / TileLang）
+├── README.md
+└── code/
+    ├── cuda/                # 原生 CUDA / WMMA
+    ├── triton/
+    └── tilelang/
 mlc-tvm/                     # MLC / TVM 课程笔记
 ├── README.md
 ├── 01-tensor-program-abstraction.md
