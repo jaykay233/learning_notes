@@ -8,6 +8,7 @@
 ```text
 operators/
 ├── README.md
+├── 01-triton-for-loops.md  # Triton 分块循环与累加
 └── code/
     ├── cuda/       # 原生 CUDA / WMMA
     ├── triton/     # OpenAI Triton
@@ -36,3 +37,11 @@ operators/
 - GPU layout、Tensor Core、pipeline 细节见 [`modern-gpu-programming-for-mlsys/`](../modern-gpu-programming-for-mlsys/)。
 - 量化相关 GEMM / Attention 算子见 [`quantization/`](../quantization/)。
 - 笔记以「能复现」为准：完整代码、具体数值轨迹、可执行验证命令；缺硬件时写明静态校验与运行时校验的边界。
+
+## Triton 学习笔记
+
+| 文档 | 内容 |
+|---|---|
+| [01-triton-for-loops.md](01-triton-for-loops.md) | `for range` 分块遍历、尾块 mask、跨轮累加与 `tl.static_range` |
+
+示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)。

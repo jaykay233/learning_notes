@@ -7,7 +7,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo / Hunyuan Hy4 …） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
-| [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付的学习路线 |
+| [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton 分块循环入门 |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
 | [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、Blackwell TMEM，以及 CUDA kernel launch 机制 |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
@@ -234,6 +234,7 @@ models/
 | GPU-initiated RDMA / doorbell / WQE fetch / CQE / DC / QP sharing | [communication/21](communication/21-gpu-initiated-rdma-submission-dc-qp-sharing.md) |
 | GPU-initiated 通信成本 / ordering / proxy / message rate / kernel·NIC 资源 | [communication/22](communication/22-gpu-initiated-communication-performance-cost-model.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
+| 算子开发 / Triton `for` 循环、分块与累加 | [operators/01-triton-for-loops.md](operators/01-triton-for-loops.md)；[算子目录](operators/README.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
 | GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
