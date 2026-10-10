@@ -181,4 +181,4 @@ cols     = tile_id * 4 + [0, 1, 2, 3]
 
 下一知识点：
 
-- [ ] GEMM K-loop：`tl.dot` 每轮的 tile 计算和 `acc` 累加，以及 K 尾块 mask。
+- [x] GEMM K-loop：`tl.dot` 每轮的 tile 计算和 `acc` 累加，以及 K 尾块 mask；见 [Triton blocked GEMM](02-triton-matmul-blocked-kernel.md)。

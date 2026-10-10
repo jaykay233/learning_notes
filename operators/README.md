@@ -9,6 +9,7 @@
 operators/
 ├── README.md
 ├── 01-triton-for-loops.md  # Triton 分块循环与累加
+├── 02-triton-matmul-blocked-kernel.md  # Triton blocked GEMM 与 K-loop
 └── code/
     ├── cuda/       # 原生 CUDA / WMMA
     ├── triton/     # OpenAI Triton
@@ -43,5 +44,6 @@ operators/
 | 文档 | 内容 |
 |---|---|
 | [01-triton-for-loops.md](01-triton-for-loops.md) | `for range` 分块遍历、尾块 mask、跨轮累加与 `tl.static_range` |
+| [02-triton-matmul-blocked-kernel.md](02-triton-matmul-blocked-kernel.md) | Triton 官方 blocked GEMM：program/tile 映射、二维 pointer grid、`tl.dot` K-loop、L2 分组与 autotune |
 
-示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)。
+示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)。
