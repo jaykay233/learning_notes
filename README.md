@@ -116,7 +116,8 @@ communication/
 ├── 24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md # V2 hybrid：Scaleout+Scaleup 完整数据流
 ├── 25-deepep-v2-engram-fetch-rdma-get.md # V2 Engram：RDMA GET + defer/aggregate/doorbell
 ├── 26-deepep-v2-pp-send-recv-ring.md # V2 PP：环邻接 send/recv + inflight 槽
-└── 27-deepep-ep-train-infer-and-backward-dual.md # EP 训练/推理边界 + 反传对偶
+├── 27-deepep-ep-train-infer-and-backward-dual.md # EP 训练/推理边界 + 反传对偶
+└── 28-deepep-eplb-logical-physical-expert-map.md # EPLB：逻辑/物理专家与框架 remap
 ```
 
 ```
@@ -503,6 +504,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [25-deepep-v2-engram-fetch-rdma-get.md](communication/25-deepep-v2-engram-fetch-rdma-get.md) | V2 Engram：按 entry index 的 RDMA GET；defer 首包 + Aggregate + flush_async；doorbell=本卡 GPU→本机 NIC；fetch/wait 拆核 |
 | [26-deepep-v2-pp-send-recv-ring.md](communication/26-deepep-v2-pp-send-recv-ring.md) | V2 PP：环上 prev/next；四区×inflight 槽；TMA staging→put+到达 signal；recv 拷出→释放 signal |
 | [27-deepep-ep-train-infer-and-backward-dual.md](communication/27-deepep-ep-train-infer-and-backward-dual.md) | 主路径=EP（推理/训练）；PP/Engram/CP=实验旁路；反传=dispatch↔combine 对偶，复用 handle，无内置 autograd |
+| [28-deepep-eplb-logical-physical-expert-map.md](communication/28-deepep-eplb-logical-physical-expert-map.md) | EPLB：DeepEP 只认物理槽整除；框架 logical→physical + 冗余副本 + 搬权重；DeepSeek/SGLang/vLLM |
 
 ## DeepSeek-V4
 

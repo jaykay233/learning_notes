@@ -222,8 +222,8 @@ product roles:
 
 - [x] PP 环机制（26）
 - [x] EP 训练/推理边界 + 反传对偶（本篇）
-- [ ] AGRS session（若继续 Elastic 实验 API）
+- [x] EPLB × DeepEP 逻辑/物理分层（见 [28](./28-deepep-eplb-logical-physical-expert-map.md)）
 
 ### 下一知识点
 
-`create_agrs_session` / AGRS，或按需回到 EP 某条未写细的路径（如 replay / SM·QP 解析配置）。
+已写 [28](./28-deepep-eplb-logical-physical-expert-map.md)；后续可接 AGRS session。
