@@ -112,7 +112,8 @@ communication/
 ├── 20-deepep-v2-buffer-coordinates-and-handle-arrays.md # V2 直连坐标 / handle 数组 / 寄信模型
 ├── 21-gpu-initiated-rdma-submission-dc-qp-sharing.md # payload / doorbell / WQE fetch / CQE / DCI / DCT / QP sharing
 ├── 22-gpu-initiated-communication-performance-cost-model.md # issue / proxy R-T-B / message rate / kernel·NIC 资源
-└── 23-deepep-rank-major-vs-expert-major-dataflow.md # rank-major vs expert-major 端到端数据流对照卡
+├── 23-deepep-rank-major-vs-expert-major-dataflow.md # rank-major vs expert-major 端到端数据流对照卡
+└── 24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md # V2 hybrid：Scaleout+Scaleup 完整数据流
 ```
 
 ```
@@ -495,6 +496,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [21-gpu-initiated-rdma-submission-dc-qp-sharing.md](communication/21-gpu-initiated-rdma-submission-dc-qp-sharing.md) | GPU-initiated RDMA 完整提交链：SM source payload、GPU/proxy-submitted、dbrec/UAR doorbell、WQE fetch、CQE、GPU/NIC DMA、DC/DCI/DCT/AV、QP sharing 与 fence scope |
 | [22-gpu-initiated-communication-performance-cost-model.md](communication/22-gpu-initiated-communication-performance-cost-model.md) | 论文第 4 章性能成本解剖：issue/put+completion/RTT、DBR/ordering、QP lookup/queue management/completion scope、CPU proxy R/T/B/handoff、共享 QP、kernel occupancy 与 NIC active connection 代价 |
 | [23-deepep-rank-major-vs-expert-major-dataflow.md](communication/23-deepep-rank-major-vs-expert-major-dataflow.md) | DeepEP 两条主干数据流对照卡：V1 机内 rank-major（channel / prefix / send_head）vs V1 LL expert-major（layout_range / src_info / `[expert][t]`） |
+| [24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md](communication/24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md) | V2 Hybrid：Notify→Scaleout→Forward→Epilogue→Combine Scaleup/Forward→reduce；三张钥匙表与极性对偶 |
 
 ## DeepSeek-V4
 

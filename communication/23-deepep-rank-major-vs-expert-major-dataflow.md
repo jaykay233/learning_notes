@@ -297,8 +297,8 @@ python3 communication/23_layout_dataflow_sim.py
 
 - [x] V1/V2 坐标与通用五类数组（20）
 - [x] Rank-major / Expert-major 端到端数据流对照卡
-- [ ] Hybrid：scaleup + scaleout 时两条流如何叠加
+- [x] Hybrid Scaleout+Scaleup 完整数据流（见 [24](./24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md)）
 
 ### 下一知识点
 
-`hybrid_dispatch` / `hybrid_combine`：两级 staging 下，rank-major 段与 expand 段如何衔接，ReturnInfo 多一层 scaleout 元数据。
+Engram fetch 旁路；或对照 [24](./24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md) 看 hybrid 如何叠在两条布局之上。

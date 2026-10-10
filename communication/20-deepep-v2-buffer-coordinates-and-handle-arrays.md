@@ -857,8 +857,8 @@ combine 回程（R=4 ≤ K=4，允许多次 reduce → rank layout）：
 - [x] V1 normal 机内 / 跨机、LL dispatch/combine（10–17）
 - [x] LL recv hook（18）、elect+shfl 陷阱（19）
 - [x] V2 直连：buffer 两套视图、去程/回程坐标、expand、通用 handle 数组
-- [ ] V2 hybrid：scaleout 两级中转与 linked list
+- [x] V2 hybrid：scaleout 两级中转与 linked list（见 [24](./24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md)）
 
 ### 下一知识点
 
-端到端两条数据流对照卡见 [23](./23-deepep-rank-major-vs-expert-major-dataflow.md)。再往后：`hybrid_dispatch.cuh` / `hybrid_combine.cuh` 的 scaleup / scaleout 两级中转。
+Engram fetch 旁路；或回顾 [23](./23-deepep-rank-major-vs-expert-major-dataflow.md) / [24](./24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md) 对照直连与 hybrid。
