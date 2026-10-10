@@ -115,7 +115,8 @@ communication/
 ├── 23-deepep-rank-major-vs-expert-major-dataflow.md # rank-major vs expert-major 端到端数据流对照卡
 ├── 24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md # V2 hybrid：Scaleout+Scaleup 完整数据流
 ├── 25-deepep-v2-engram-fetch-rdma-get.md # V2 Engram：RDMA GET + defer/aggregate/doorbell
-└── 26-deepep-v2-pp-send-recv-ring.md # V2 PP：环邻接 send/recv + inflight 槽
+├── 26-deepep-v2-pp-send-recv-ring.md # V2 PP：环邻接 send/recv + inflight 槽
+└── 27-deepep-ep-train-infer-and-backward-dual.md # EP 训练/推理边界 + 反传对偶
 ```
 
 ```
@@ -501,6 +502,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md](communication/24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md) | V2 Hybrid：Notify→Scaleout→Forward→Epilogue→Combine Scaleup/Forward→reduce；三张钥匙表与极性对偶 |
 | [25-deepep-v2-engram-fetch-rdma-get.md](communication/25-deepep-v2-engram-fetch-rdma-get.md) | V2 Engram：按 entry index 的 RDMA GET；defer 首包 + Aggregate + flush_async；doorbell=本卡 GPU→本机 NIC；fetch/wait 拆核 |
 | [26-deepep-v2-pp-send-recv-ring.md](communication/26-deepep-v2-pp-send-recv-ring.md) | V2 PP：环上 prev/next；四区×inflight 槽；TMA staging→put+到达 signal；recv 拷出→释放 signal |
+| [27-deepep-ep-train-infer-and-backward-dual.md](communication/27-deepep-ep-train-infer-and-backward-dual.md) | 主路径=EP（推理/训练）；PP/Engram/CP=实验旁路；反传=dispatch↔combine 对偶，复用 handle，无内置 autograd |
 
 ## DeepSeek-V4
 

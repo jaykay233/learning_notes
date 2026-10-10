@@ -355,8 +355,8 @@ rank2 -> prev(1):
 
 - [x] Engram fetch（25）
 - [x] PP 环 send/recv + inflight 槽
-- [ ] AGRS session（Elastic 下一条实验 API）
+- [x] EP 训练/推理边界与反传对偶（见 [27](./27-deepep-ep-train-infer-and-backward-dual.md)）
 
 ### 下一知识点
 
-`create_agrs_session` / all-gather reduce-scatter：session 内多 tensor 共享 buffer 槽与 signal。
+已写 [27](./27-deepep-ep-train-infer-and-backward-dual.md)；后续可接 AGRS session。
