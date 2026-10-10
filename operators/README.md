@@ -10,6 +10,7 @@ operators/
 ├── README.md
 ├── 01-triton-for-loops.md  # Triton 分块循环与累加
 ├── 02-triton-matmul-blocked-kernel.md  # Triton blocked GEMM 与 K-loop
+├── 03-triton-low-memory-dropout.md  # Triton seeded low-memory dropout
 └── code/
     ├── cuda/       # 原生 CUDA / WMMA
     ├── triton/     # OpenAI Triton
@@ -45,5 +46,6 @@ operators/
 |---|---|
 | [01-triton-for-loops.md](01-triton-for-loops.md) | `for range` 分块遍历、尾块 mask、跨轮累加与 `tl.static_range` |
 | [02-triton-matmul-blocked-kernel.md](02-triton-matmul-blocked-kernel.md) | Triton 官方 blocked GEMM：program/tile 映射、二维 pointer grid、`tl.dot` K-loop、L2 分组与 autotune |
+| [03-triton-low-memory-dropout.md](03-triton-low-memory-dropout.md) | Triton 官方 low-memory dropout：`(seed, global offset)` 现场生成 mask、Philox PRNG、inverted dropout 与 recompute 状态管理 |
 
-示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)。
+示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)。
