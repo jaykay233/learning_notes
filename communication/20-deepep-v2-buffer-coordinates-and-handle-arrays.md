@@ -861,4 +861,4 @@ combine 回程（R=4 ≤ K=4，允许多次 reduce → rank layout）：
 
 ### 下一知识点
 
-`hybrid_dispatch.cuh` / `hybrid_combine.cuh`：scaleup 与 scaleout 两级 staging、`token_metadata_at_forward`、`channel_linked_list`，以及两级 reduce 时贡献者坐标怎么叠加。
+端到端两条数据流对照卡见 [23](./23-deepep-rank-major-vs-expert-major-dataflow.md)。再往后：`hybrid_dispatch.cuh` / `hybrid_combine.cuh` 的 scaleup / scaleout 两级中转。
