@@ -338,8 +338,8 @@ flat (peer=rank, ranks_per_peer=1):
 
 - [x] V2 直连 / hybrid EP 主干（20、24）
 - [x] Engram fetch：GET + defer/aggregate/flush + doorbell
-- [ ] PP send/recv 流水线环
+- [x] PP send/recv 流水线环（见 [26](./26-deepep-v2-pp-send-recv-ring.md)）
 
 ### 下一知识点
 
-`pp_send_recv.cuh`：PP 环上相邻 rank 的 send/recv buffer 与 inflight 限制。
+已写 [26](./26-deepep-v2-pp-send-recv-ring.md)；后续可接 AGRS session。

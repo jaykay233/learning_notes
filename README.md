@@ -114,7 +114,8 @@ communication/
 ├── 22-gpu-initiated-communication-performance-cost-model.md # issue / proxy R-T-B / message rate / kernel·NIC 资源
 ├── 23-deepep-rank-major-vs-expert-major-dataflow.md # rank-major vs expert-major 端到端数据流对照卡
 ├── 24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md # V2 hybrid：Scaleout+Scaleup 完整数据流
-└── 25-deepep-v2-engram-fetch-rdma-get.md # V2 Engram：RDMA GET + defer/aggregate/doorbell
+├── 25-deepep-v2-engram-fetch-rdma-get.md # V2 Engram：RDMA GET + defer/aggregate/doorbell
+└── 26-deepep-v2-pp-send-recv-ring.md # V2 PP：环邻接 send/recv + inflight 槽
 ```
 
 ```
@@ -499,6 +500,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [23-deepep-rank-major-vs-expert-major-dataflow.md](communication/23-deepep-rank-major-vs-expert-major-dataflow.md) | DeepEP 两条主干数据流对照卡：V1 机内 rank-major（channel / prefix / send_head）vs V1 LL expert-major（layout_range / src_info / `[expert][t]`） |
 | [24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md](communication/24-deepep-v2-hybrid-scaleout-scaleup-dataflow.md) | V2 Hybrid：Notify→Scaleout→Forward→Epilogue→Combine Scaleup/Forward→reduce；三张钥匙表与极性对偶 |
 | [25-deepep-v2-engram-fetch-rdma-get.md](communication/25-deepep-v2-engram-fetch-rdma-get.md) | V2 Engram：按 entry index 的 RDMA GET；defer 首包 + Aggregate + flush_async；doorbell=本卡 GPU→本机 NIC；fetch/wait 拆核 |
+| [26-deepep-v2-pp-send-recv-ring.md](communication/26-deepep-v2-pp-send-recv-ring.md) | V2 PP：环上 prev/next；四区×inflight 槽；TMA staging→put+到达 signal；recv 拷出→释放 signal |
 
 ## DeepSeek-V4
 
