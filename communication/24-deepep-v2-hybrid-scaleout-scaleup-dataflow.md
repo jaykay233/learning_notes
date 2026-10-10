@@ -348,8 +348,8 @@ decode g=13: rank=1 t=5 so=0
 - [x] V2 直连坐标与 handle（20）
 - [x] Rank-major / Expert-major 数据流卡（23）
 - [x] V2 Hybrid Scaleout+Scaleup 完整数据流
-- [ ] Engram fetch 旁路
+- [x] Engram fetch 旁路（见 [25](./25-deepep-v2-engram-fetch-rdma-get.md)）
 
 ### 下一知识点
 
-`engram_fetch.cuh` / `engram_fetch_wait.cuh`：与 EP dispatch/combine 并列的取数路径，何时走 hybrid 拓扑。
+已写 [25](./25-deepep-v2-engram-fetch-rdma-get.md)；后续可接 PP send/recv。
