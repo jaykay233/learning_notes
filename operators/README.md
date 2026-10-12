@@ -12,6 +12,8 @@ operators/
 ├── 02-triton-matmul-blocked-kernel.md  # Triton blocked GEMM 与 K-loop
 ├── 03-triton-low-memory-dropout.md  # Triton seeded low-memory dropout
 ├── 04-triton-type-promotion.md  # Triton type promotion
+├── 05-triton-broadcasting-and-chained-comparisons.md  # Broadcasting 与链式比较
+├── 06-triton-differences-from-numpy.md  # 与 NumPy/Python 的语义差异
 └── code/
     ├── cuda/       # 原生 CUDA / WMMA
     ├── triton/     # OpenAI Triton
@@ -49,5 +51,7 @@ operators/
 | [02-triton-matmul-blocked-kernel.md](02-triton-matmul-blocked-kernel.md) | Triton 官方 blocked GEMM：program/tile 映射、二维 pointer grid、`tl.dot` K-loop、L2 分组与 autotune |
 | [03-triton-low-memory-dropout.md](03-triton-low-memory-dropout.md) | Triton 官方 low-memory dropout：`(seed, global offset)` 现场生成 mask、Philox PRNG、inverted dropout 与 recompute 状态管理 |
 | [04-triton-type-promotion.md](04-triton-type-promotion.md) | Triton type promotion：kind/width/signedness、tensor-scalar 特殊规则、除法取模例外与 broadcasting 的区别 |
+| [05-triton-broadcasting-and-chained-comparisons.md](05-triton-broadcasting-and-chained-comparisons.md) | Triton broadcasting：左补一、维度相等或为 1、虚拟扩展成本边界；chained comparisons：逐对比较、elementwise AND、操作数只求值一次与 runtime 不短路 |
+| [06-triton-differences-from-numpy.md](06-triton-differences-from-numpy.md) | Triton 与 NumPy/Python 的差异：runtime 整数除法/取模向零截断、`tl.constexpr` 的 Python 取整、越界 float-to-int cast 与变量作用域 |
 
-示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)。
+示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。

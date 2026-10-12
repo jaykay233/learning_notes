@@ -625,4 +625,4 @@ tl.where(cond, fp16, fp32) -> fp32
 
 下一知识点：
 
-- [ ] Triton Broadcasting 与 chained comparisons：shape 如何按维度对齐，以及比较表达式为什么不能按普通 Python 链式语义理解。
+- [ ] [Triton Broadcasting 与 chained comparisons](05-triton-broadcasting-and-chained-comparisons.md)：shape 如何按维度对齐，以及比较表达式为什么不能按普通 Python 链式语义理解。
