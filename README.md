@@ -246,6 +246,7 @@ models/
 | 算子开发 / Triton `for` 循环、分块与累加 | [operators/01-triton-for-loops.md](operators/01-triton-for-loops.md)；[算子目录](operators/README.md) |
 | 算子开发 / Triton blocked GEMM 与 K-loop | [operators/02-triton-matmul-blocked-kernel.md](operators/02-triton-matmul-blocked-kernel.md)；[算子目录](operators/README.md) |
 | 算子开发 / Triton low-memory dropout 与 seeded PRNG | [operators/03-triton-low-memory-dropout.md](operators/03-triton-low-memory-dropout.md)；[算子目录](operators/README.md) |
+| 算子开发 / Triton type promotion 与 broadcasting 边界 | [operators/04-triton-type-promotion.md](operators/04-triton-type-promotion.md)；[算子目录](operators/README.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
 | GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
