@@ -160,6 +160,140 @@ offsets = offs_m[:, None] * stride_m + offs_n[None, :] * stride_n
 
 `[:, None]` 和 `[None, :]` 只负责广播 shape；元素最终由 `layout` 及其 slice 决定。不能把 NumPy 中“数组是什么形状”直接等同于 Gluon 中“谁拥有这些元素”。
 
+## `SliceLayout` 深挖：ownership 不是逻辑下标
+
+### 本次讲解位置
+
+章节：`chapter_gluon_foundations`（算子开发 / Triton Gluon）<br>
+小节：`SliceLayout` 与 distributed ownership<br>
+知识点：逻辑坐标、物理 owner、降维 ownership、`expand_dims` 虚拟广播<br>
+上次：`BlockedLayout` 如何把二维 tile 分给 thread、warp 和 register<br>
+下次：用 `cp.async`、TMA 和软件流水把 global-memory 传输移出关键路径<br>
+PTX：不指定单条 PTX；对应 thread/register、shared-memory 和 tensor-memory 的映射语义
+
+### 为什么现在讲这个
+
+前面的 `BlockedLayout` 已经说明元素属于哪个 thread/register，但 `SliceLayout` 很容易被误读成“从原始 tensor 里删掉一维”。如果只把 ownership 理解成逻辑下标，就会无法解释为什么 `offs_m` 和 `offs_n` 降成一维后还能无转换地扩回 parent 2D layout，也无法判断广播、重复存储和 `convert_layout` 的成本来自哪里。
+
+这一节要把三件事拆开：
+
+```text
+逻辑坐标：       (m, n)
+逻辑值：         X[m, n]
+物理 ownership： (m, n) -> thread / register / SMEM / TMEM 位置
+```
+
+ownership 不是“数据下标本身”，而是“给定一个逻辑坐标，哪个执行资源持有它”的映射。下标回答元素是谁，ownership 回答元素放在哪里。
+
+### 同一个 shape 可以有两种 ownership
+
+考虑同一个 `4 x 4` tensor。它的逻辑坐标完全相同，但下面两种 layout 的存放方式完全不同：
+
+```text
+Layout A：row 0 的四个元素都在 T0 的四个寄存器里
+
+                 n=0       n=1       n=2       n=3
+m=0            T0:r0     T0:r1     T0:r2     T0:r3
+
+
+Layout B：row 0 的四个元素分别由四个 lane 持有
+
+                 n=0       n=1       n=2       n=3
+m=0            T0:r0     T1:r0     T2:r0     T3:r0
+```
+
+两种情况的 `X[0,0]`、`X[0,1]` 等逻辑值相同，shape 也相同，但 ownership 不同。因此 layout 不是数据的替代表达，而是元素到物理资源的映射。
+
+这个映射可以落到不同存储层级：
+
+| 存储层级 | ownership 位置示例 |
+|---|---|
+| register tile | `thread_id + register_index` |
+| shared memory | `CTA + shared-memory offset` |
+| tensor memory | `CTA + TMEM lane/column` |
+| cluster | `CTA id + local resource` |
+
+### 从二维 ownership 降成一维
+
+设 parent 2D layout 对每个坐标都定义了 owner：
+
+```text
+L2D(m, n) = (thread, register)
+```
+
+`SliceLayout(dim=1, parent)` 丢掉第 1 维 N，生成 M 方向的一维 ownership：
+
+```text
+L1D_M(m) = 原来 L2D(m, 0..N-1) 中沿 N 方向保留的 owner 信息
+```
+
+这里的关键不是“把 N 方向的数据删掉”，而是在一维视图中保留足够信息，使之后扩维时能重新得到 parent layout：
+
+```mermaid
+flowchart TB
+    P["Parent 2D Layout<br/>shape = 64 x 16<br/>每个 (m,n) 都有 owner"]
+
+    P --> M["SliceLayout(dim=1, parent)<br/>降掉 N 方向<br/>生成 1D M-index ownership"]
+    P --> N["SliceLayout(dim=0, parent)<br/>降掉 M 方向<br/>生成 1D N-index ownership"]
+
+    M --> ME["offs_m[:, None]<br/>expand_dims 到 64 x 1<br/>沿 N 方向虚拟广播"]
+    N --> NE["offs_n[None, :]<br/>expand_dims 到 1 x 16<br/>沿 M 方向虚拟广播"]
+
+    ME --> ADD["offsets = m * stride_m + n * stride_n<br/>恢复为 parent 2D ownership"]
+    NE --> ADD
+```
+
+`dim` 表示“结果里丢掉哪一维”，不是“保留哪一维”：
+
+| 一维 tensor | layout | 丢掉 | 扩展方向 |
+|---|---|---|---|
+| `offs_m` | `SliceLayout(dim=1, parent)` | N 维度 | `[BLOCK_M, 1]`，沿 N 广播 |
+| `offs_n` | `SliceLayout(dim=0, parent)` | M 维度 | `[1, BLOCK_N]`，沿 M 广播 |
+
+### 用具体 owner 轨迹理解
+
+不要把 `SliceLayout` 简化成“每个 M 索引只属于一个线程”。更准确的做法是先看 parent 对同一行的不同元素分别交给了谁：
+
+```text
+(m, 0) -> owner_0(m)
+(m, 1) -> owner_1(m)
+(m, 2) -> owner_2(m)
+(m, 3) -> owner_3(m)
+```
+
+`SliceLayout(dim=1, parent)` 会把同一 `m` 在 N 方向上的 owner 信息投影成一维 M 索引的 ownership。如果不同 N 位最终落在不同线程上，这些线程位就会变成广播位；如果它们只是同一线程内的多个 register，对应的重复 register 映射则会被去掉。具体是哪一种，由 parent 的 `size_per_thread`、`threads_per_warp`、`warps_per_cta` 和 `order` 共同决定。
+
+官方 `02-layouts.py` 给出的结论是：对那里使用的 parent `BlockedLayout` 做 `SliceLayout(dim=1)` 后，每个 reduction 结果元素会广播到两个线程。这个例子说明不能把 slice layout 当成普通的 1D blocked layout；它携带着 parent 中被丢掉那一维的所有权关系。
+
+执行：
+
+```python
+offs_m = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(dim=1, parent))
+offs_m_2d = offs_m[:, None]
+```
+
+概念轨迹是：
+
+```text
+一维 M index              广播到 N 方向
+[M0, M1, M2, M3]   ->    [[M0, M0, M0, M0],
+                          [M1, M1, M1, M1],
+                          [M2, M2, M2, M2],
+                          [M3, M3, M3, M3]]
+```
+
+扩展回去时，编译器会为每个 `(m, n)` 重新选择与 parent 对应的 owner。这不是通过 shared memory 把同一个值复制到多个线程，而是编译器在 register ownership 层面插入虚拟 broadcast；只要目标 layout 与 parent 完全兼容，通常不需要显式搬运。
+
+### 常见误解与症状
+
+| 误解 | 实际含义 | 可能症状 |
+|---|---|---|
+| `SliceLayout` 删掉了原始 tensor 的一维 | 只生成低维 ownership 视图，parent 没被修改 | 误以为数据丢失，后续广播逻辑无法推理 |
+| `dim=1` 表示取第 1 维 | 表示结果丢掉第 1 维 | M/N owner 对调，出现布局不兼容或性能下降 |
+| shape 相同就代表 layout 相同 | shape 和 owner 是两件事 | 编译器插入 `convert_layout`，经过 SMEM 并产生同步 |
+| 广播一定会复制全局数据 | 这里是 register 级虚拟广播 | 把编译期布局展开误判为 HBM 或 SMEM 流量 |
+| `[:, None]` 只是补一个维度 | 它还会触发 slice layout 到 parent layout 的扩展 | 忽略 ownership 变化，后面无法解释 MMA operand 约束 |
+
 ## 完整可运行小例程：显式 layout 的 1D 拷贝
 
 文件位置：[`operators/code/triton/gluon/tutorials/01-intro.py`](code/triton/gluon/tutorials/01-intro.py) 和 [`02-layouts.py`](code/triton/gluon/tutorials/02-layouts.py)。
@@ -259,7 +393,7 @@ value = gl.convert_layout(value, layout_out, assert_trivial=True)
    - 答：每个 block 内 thread tile 有 `2*4=8` 个元素；`128x128` 被 `64x16` 平铺成 `2x8=16` 个 block；`8*16=128`。
 3. **为什么一个 `32 x 8` tensor 可能占用 `64 x 16` 个物理 register 位置？**
    - 答：layout block 比 tensor 大时需要 broadcast，逻辑元素数不等于物理展开位置数。
-4. **`SliceLayout` 解决什么问题？**
-   - 答：从二维 parent layout 中取出某一维的分布，分别构造 M/N 坐标，同时保持与父 layout 的兼容关系。
+4. **逻辑下标和 ownership 的区别是什么，`SliceLayout` 为何能让一维索引扩回二维？**
+   - 答：下标是 `(m,n)` 这样的逻辑坐标，ownership 是坐标到 thread/register/SMEM/TMEM 的映射；`SliceLayout` 在降维时保留 parent layout 的 owner 关系，`expand_dims` 再用虚拟广播恢复 parent 2D ownership，因此通常不需要 `convert_layout`。
 5. **`convert_layout` 为什么可能值得做？**
    - 答：如果它能避免极差的 global-memory 访问，寄存器重排成本可能远低于访存损失。
