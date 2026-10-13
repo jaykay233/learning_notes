@@ -14,9 +14,15 @@ operators/
 ├── 04-triton-type-promotion.md  # Triton type promotion
 ├── 05-triton-broadcasting-and-chained-comparisons.md  # Broadcasting 与链式比较
 ├── 06-triton-differences-from-numpy.md  # 与 NumPy/Python 的语义差异
+├── 07-triton-gluon-programming-model-and-layouts.md  # Gluon 编程模型与 layouts
+├── 08-triton-gluon-async-tma-and-pipelining.md  # async copy、TMA 与流水线
+├── 09-triton-gluon-wgmma-and-tcgen05.md  # WGMMA、TMEM 与 tcgen05
+├── 10-triton-gluon-persistent-warp-specialization.md  # persistent 与 warp specialization
+├── 11-triton-gluon-blackwell-dataflow-and-convolution.md  # gather/scatter、scaled MMA、CLC、im2col
+├── 12-triton-gluon-multicta-and-capstone.md  # CGA、multicast、2CTA 与 capstone GEMM
 └── code/
     ├── cuda/       # 原生 CUDA / WMMA
-    ├── triton/     # OpenAI Triton
+    ├── triton/     # OpenAI Triton；含固定 revision 的 gluon 教程归档
     └── tilelang/   # TileLang DSL
 ```
 
@@ -53,5 +59,11 @@ operators/
 | [04-triton-type-promotion.md](04-triton-type-promotion.md) | Triton type promotion：kind/width/signedness、tensor-scalar 特殊规则、除法取模例外与 broadcasting 的区别 |
 | [05-triton-broadcasting-and-chained-comparisons.md](05-triton-broadcasting-and-chained-comparisons.md) | Triton broadcasting：左补一、维度相等或为 1、虚拟扩展成本边界；chained comparisons：逐对比较、elementwise AND、操作数只求值一次与 runtime 不短路 |
 | [06-triton-differences-from-numpy.md](06-triton-differences-from-numpy.md) | Triton 与 NumPy/Python 的差异：runtime 整数除法/取模向零截断、`tl.constexpr` 的 Python 取整、越界 float-to-int cast 与变量作用域 |
+| [07-triton-gluon-programming-model-and-layouts.md](07-triton-gluon-programming-model-and-layouts.md) | Gluon 编程模型与 layouts：`BlockedLayout`、`SliceLayout`、`NVMMASharedLayout`、distributed layout 与显式 layout 控制 |
+| [08-triton-gluon-async-tma-and-pipelining.md](08-triton-gluon-async-tma-and-pipelining.md) | Gluon async copy、TMA 与软件流水：`cp.async`、commit group、`mbarrier`、tensor descriptor、代理 fence 与多缓冲 |
+| [09-triton-gluon-wgmma-and-tcgen05.md](09-triton-gluon-wgmma-and-tcgen05.md) | Hopper WGMMA 与 Blackwell tcgen05：warpgroup MMA、异步等待、Tensor Memory、TMEM layout 与 K-loop |
+| [10-triton-gluon-persistent-warp-specialization.md](10-triton-gluon-persistent-warp-specialization.md) | Persistent kernel 与 `gl.warp_specialize`：grouped scheduler、`@gluon.aggregate`、producer/MMA/epilogue 分工与 barrier phase |
+| [11-triton-gluon-blackwell-dataflow-and-convolution.md](11-triton-gluon-blackwell-dataflow-and-convolution.md) | Blackwell 数据流与卷积：TMA gather/scatter、`tcgen05_copy`、block-scaled MMA、CLC、TMA im2col 与 implicit GEMM |
+| [12-triton-gluon-multicta-and-capstone.md](12-triton-gluon-multicta-and-capstone.md) | CGA/multi-CTA：`cga_layout` 分片与广播、cluster barrier、TMA multicast、2CTA tcgen05、CLC+四角色 capstone GEMM |
 
-示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。
+示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。Gluon 官方教程按固定 revision 归档在 [code/triton/gluon](code/triton/gluon/)，provenance 与运行范围见 [PROVENANCE.md](code/triton/gluon/PROVENANCE.md)。

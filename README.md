@@ -7,7 +7,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo / Hunyuan Hy4 …） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
-| [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton 分块循环、blocked GEMM 与 seeded dropout |
+| [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton 分块循环、blocked GEMM、seeded dropout，以及 Gluon layout / TMA / tensor core / multi-CTA 全链路 |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
 | [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、Blackwell TMEM，以及 CUDA kernel launch 机制 |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
@@ -36,9 +36,18 @@ operators/                   # 算子开发（CUDA / Triton / TileLang）
 ├── 01-triton-for-loops.md
 ├── 02-triton-matmul-blocked-kernel.md
 ├── 03-triton-low-memory-dropout.md
+├── 04-triton-type-promotion.md
+├── 05-triton-broadcasting-and-chained-comparisons.md
+├── 06-triton-differences-from-numpy.md
+├── 07-triton-gluon-programming-model-and-layouts.md
+├── 08-triton-gluon-async-tma-and-pipelining.md
+├── 09-triton-gluon-wgmma-and-tcgen05.md
+├── 10-triton-gluon-persistent-warp-specialization.md
+├── 11-triton-gluon-blackwell-dataflow-and-convolution.md
+├── 12-triton-gluon-multicta-and-capstone.md
 └── code/
     ├── cuda/                # 原生 CUDA / WMMA
-    ├── triton/
+    ├── triton/              # Triton；含固定 revision 的 Gluon 教程归档
     └── tilelang/
 mlc-tvm/                     # MLC / TVM 课程笔记
 ├── README.md
@@ -249,6 +258,12 @@ models/
 | 算子开发 / Triton type promotion | [operators/04-triton-type-promotion.md](operators/04-triton-type-promotion.md)；[算子目录](operators/README.md) |
 | 算子开发 / Triton broadcasting 与 chained comparisons | [operators/05-triton-broadcasting-and-chained-comparisons.md](operators/05-triton-broadcasting-and-chained-comparisons.md)；[算子目录](operators/README.md) |
 | 算子开发 / Triton 与 NumPy/Python 语义差异 | [operators/06-triton-differences-from-numpy.md](operators/06-triton-differences-from-numpy.md)；[算子目录](operators/README.md) |
+| 算子开发 / Gluon 编程模型与 layouts | [operators/07-triton-gluon-programming-model-and-layouts.md](operators/07-triton-gluon-programming-model-and-layouts.md)；[算子目录](operators/README.md) |
+| 算子开发 / Gluon async copy、TMA 与流水线 | [operators/08-triton-gluon-async-tma-and-pipelining.md](operators/08-triton-gluon-async-tma-and-pipelining.md)；[算子目录](operators/README.md) |
+| 算子开发 / Gluon WGMMA、TMEM 与 tcgen05 | [operators/09-triton-gluon-wgmma-and-tcgen05.md](operators/09-triton-gluon-wgmma-and-tcgen05.md)；[算子目录](operators/README.md) |
+| 算子开发 / Gluon persistent kernel 与 warp specialization | [operators/10-triton-gluon-persistent-warp-specialization.md](operators/10-triton-gluon-persistent-warp-specialization.md)；[算子目录](operators/README.md) |
+| 算子开发 / Gluon Blackwell 数据流与卷积 | [operators/11-triton-gluon-blackwell-dataflow-and-convolution.md](operators/11-triton-gluon-blackwell-dataflow-and-convolution.md)；[算子目录](operators/README.md) |
+| 算子开发 / Gluon CGA、multicast、2CTA 与 capstone GEMM | [operators/12-triton-gluon-multicta-and-capstone.md](operators/12-triton-gluon-multicta-and-capstone.md)；[算子目录](operators/README.md) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
 | GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
