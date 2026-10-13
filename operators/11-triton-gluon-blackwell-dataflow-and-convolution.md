@@ -276,6 +276,431 @@ def async_scatter_kernel(tensor_desc, x_offsets_ptr, y_offset,
 
 gather/scatter 仍然经过共享内存，且需要 offsets 布局转换。当不规则度很低时，这种转换和 mbarrier 开销可能超过收益；应当在目标 shape 上测，而不是只看“用了 TMA”这个标签。
 
+## Fused gather–GEMM–scatter：把不规则行选择接进持久化 GEMM
+
+### 本次讲解位置
+
+章节：`chapter_gluon_blackwell_dataflow`（算子开发 / Triton Gluon）<br>
+小节：TMA Gather and Scatter → Fused Gather/Scatter GEMM<br>
+知识点：`out[out_scatter_indx, :] = X[X_gather_indx, :] @ W` 的多缓冲数据流<br>
+上次：单独的 `async_gather` / `async_scatter`：offsets layout、shared memory 和完成同步<br>
+下次：`tcgen05_copy`：为什么 SMEM→TMEM 值得再开一条异步通路<br>
+PTX：Blackwell TMA `gather4` / `scatter4` + `tcgen05.mma`
+
+### 为什么现在讲这个
+
+前面只把若干行搬进/搬出 SMEM；真实算子不会为了搬运而搬运。MoE token 重排、稀疏行选择等场景要做的是“按索引取 X 的行 → 乘 W → 按另一组索引写回”。如果拆成 gather kernel、GEMM kernel、scatter kernel，中间矩阵要落到 global memory，再被重新读取；如果把行号误当连续 tile 的起点，结果又会悄悄算错。本知识点把 TMA gather/scatter 放进同一个 tcgen05 GEMM，并解释它怎样用持久 CTA 和缓冲环把输入加载、MMA、输出散写串成可重叠的数据流。
+
+### 先看数学语义，再看硬件
+
+设 `X.shape=(M,K)`、`W.shape=(K,N)`，两组索引长度都是 `M`：
+
+```text
+Y[i, n] = Σ(k=0..K-1) X[X_gather_indx[i], k] * W[k, n]
+out[out_scatter_indx[i], n] = Y[i, n]
+```
+
+`i` 是“逻辑行号”。它不是 X 的物理行号，也不是 out 的物理行号：
+
+- 从 X 读取时用 `X_gather_indx[i]`；
+- GEMM 的 M 维仍按逻辑行 `i` 分块；
+- 写回时用 `out_scatter_indx[i]`。
+
+所以每个输出 tile `(pid_m,pid_n)` 的三块数据是：
+
+```text
+X tile:  X[X_gather_indx[pid_m*BM : ...], k : k+BK]  -- TMA gather
+W tile:  W[k : k+BK, pid_n*BN : ...]                 -- TMA block load
+Y tile:  acc[0:BM, 0:BN]                              -- tcgen05 MMA
+out:     out[out_scatter_indx[pid_m*BM : ...], ...]   -- TMA scatter
+```
+
+X 的 M 行不连续，但每行 K 列连续，因此正好符合 gather 的“索引行 + 连续列段”。W 仍是普通矩形，不需要 gather。
+
+### 完整核心实现（Blackwell）
+
+下面保留教程的核心路径，并把它依赖的 `MMAv5` accumulator 和 grouped persistent scheduler 一并列出，便于看清 `issue_loads → issue_mma → epilogue`。将代码保存成独立的 `fused_gather_scatter_demo.py`，不要覆盖仓库内固定版本归档的官方脚本；即可使用文末命令在 Blackwell 上跑正确性检查。
+
+```python
+import torch
+import triton
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+from triton.experimental.gluon.language.nvidia.blackwell import (
+    TensorMemoryLayout,
+    tensor_memory_descriptor,
+    allocate_tensor_memory,
+    tcgen05_mma,
+    tcgen05_commit,
+    tma,
+    mbarrier,
+    fence_async_shared,
+)
+
+
+@gluon.aggregate
+class MMAv5:
+    use_acc: gl.tensor
+    acc_tmem: tensor_memory_descriptor
+    bar: gl.shared_memory_descriptor
+    counter: gl.tensor
+
+    @gluon.jit
+    def initialize(dtype: gl.constexpr, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr,
+                   num_warps: gl.constexpr):
+        layout: gl.constexpr = TensorMemoryLayout([BLOCK_M, BLOCK_N], col_stride=1)
+        acc_tmem = allocate_tensor_memory(gl.float32, [BLOCK_M, BLOCK_N], layout)
+        bar = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
+        mbarrier.init(bar, count=1)
+        return MMAv5(gl.to_tensor(False), acc_tmem, bar, gl.to_tensor(0))
+
+    @gluon.jit
+    def issue_async_mma(self, a, b):
+        tcgen05_mma(a, b, self.acc_tmem, use_acc=self.use_acc)
+        tcgen05_commit(self.bar)
+        return MMAv5(gl.to_tensor(True), self.acc_tmem, self.bar, self.counter + 1)
+
+    @gluon.jit
+    def wait_num_outstanding(self, num_outstanding: gl.constexpr):
+        mbarrier.wait(self.bar, (self.counter - 1 - num_outstanding) & 1)
+        return self
+
+    @gluon.jit
+    def take_result(self, splitn: gl.constexpr = False):
+        next_mma = MMAv5(gl.to_tensor(False), self.acc_tmem, self.bar, self.counter)
+        return self.acc_tmem.load(), next_mma
+
+
+def GroupedPersistentTileScheduler(GROUP_SIZE_M):
+    GROUP_SIZE_M = gl.constexpr(GROUP_SIZE_M)
+
+    @gluon.aggregate
+    class Scheduler:
+        start_pid: gl.tensor
+        num_pid_m: gl.tensor
+        num_pid_in_group: gl.tensor
+        num_pid: gl.tensor
+
+        @gluon.jit
+        def initialize(M, N, BLOCK_M: gl.constexpr, BLOCK_N: gl.constexpr):
+            start_pid = gl.program_id(axis=0)
+            num_pid_m = gl.cdiv(M, BLOCK_M)
+            num_pid_n = gl.cdiv(N, BLOCK_N)
+            num_pid_in_group = GROUP_SIZE_M * num_pid_n
+            num_pid = num_pid_m * num_pid_n
+            return Scheduler(start_pid, num_pid_m, num_pid_in_group, num_pid)
+
+        @gluon.jit
+        def get_num_tiles(self):
+            return gl.cdiv(self.num_pid - self.start_pid, gl.num_programs(axis=0))
+
+        @gluon.jit
+        def get_tile(self, idx):
+            tile_id = self.start_pid + idx * gl.num_programs(axis=0)
+            group_id = tile_id // self.num_pid_in_group
+            first_pid_m = group_id * GROUP_SIZE_M
+            group_size_m = min(self.num_pid_m - first_pid_m, GROUP_SIZE_M)
+            pid_m = first_pid_m + (tile_id % group_size_m)
+            pid_n = (tile_id % self.num_pid_in_group) // group_size_m
+            return pid_m, pid_n
+
+    return Scheduler
+
+
+@gluon.jit
+def issue_loads(producer, X_desc, W_desc, X_gather_indx_ptr, off_m, off_n, k,
+                bars, x_bufs, w_bufs, BLOCK_M: gl.constexpr,
+                num_buffers: gl.constexpr, pred=True):
+    gather_indx_layout: gl.constexpr = gl.SliceLayout(
+        0, gl.BlockedLayout([1, 4], [32, 1], [1, gl.num_warps()], [1, 0])
+    )
+    offs_x_m = gl.load(
+        X_gather_indx_ptr + off_m + gl.arange(0, BLOCK_M, gather_indx_layout)
+    )
+
+    index = producer % num_buffers
+    producer += 1
+    bar = bars.index(index)
+
+    mbarrier.expect(
+        bar, W_desc.block_type.nbytes + BLOCK_M * X_desc.block_type.nbytes
+    )
+    tma.async_gather(X_desc, offs_x_m, k, bar, x_bufs.index(index), pred)
+    tma.async_load(W_desc, [k, off_n], bar, w_bufs.index(index), pred)
+    return producer
+
+
+@gluon.jit
+def issue_mma(consumer, mma, bars, x_bufs, w_bufs,
+              num_buffers: gl.constexpr):
+    index = consumer % num_buffers
+    b_index = consumer % num_buffers
+    phase = consumer // num_buffers & 1
+    consumer += 1
+    mbarrier.wait(bars.index(index), phase)
+    mma = mma.wait_num_outstanding(0)
+    mma = mma.issue_async_mma(x_bufs.index(index), w_bufs.index(b_index))
+    return consumer, mma
+
+
+@gluon.jit
+def matmul_fused_gather_scatter_kernel(
+    X_desc, W_desc, out_desc, X_gather_indx_ptr, out_scatter_indx_ptr,
+    BLOCK_M: gl.constexpr, SchedulerImpl: gl.constexpr,
+    num_buffers: gl.constexpr,
+):
+    BLOCK_N: gl.constexpr = W_desc.block_type.shape[1]
+    BLOCK_K: gl.constexpr = W_desc.block_type.shape[0]
+    dtype: gl.constexpr = X_desc.dtype
+    M = X_desc.shape[0]
+    N = W_desc.shape[1]
+    K = X_desc.shape[1]
+
+    x_bufs = gl.allocate_shared_memory(
+        dtype, [num_buffers, BLOCK_M, BLOCK_K], X_desc.layout
+    )
+    w_bufs = gl.allocate_shared_memory(
+        dtype, [num_buffers, BLOCK_K, BLOCK_N], W_desc.layout
+    )
+    out_smem = gl.allocate_shared_memory(
+        dtype, [BLOCK_M, BLOCK_N], out_desc.layout
+    )
+
+    bars = gl.allocate_shared_memory(
+        gl.int64, [num_buffers, 1], mbarrier.MBarrierLayout()
+    )
+    for i in gl.static_range(num_buffers):
+        mbarrier.init(bars.index(i), count=1)
+    producer = 0
+    consumer = 0
+
+    mma = MMAv5.initialize(dtype, BLOCK_M, BLOCK_N, gl.num_warps())
+    scheduler = SchedulerImpl.initialize(M, N, BLOCK_M, BLOCK_N)
+    num_tiles = scheduler.get_num_tiles()
+
+    # Prologue: 先把可用的 load slots 填起来。
+    idx = 0
+    pid_m, pid_n = scheduler.get_tile(idx)
+    off_m = pid_m * BLOCK_M
+    off_n = pid_n * BLOCK_N
+    for ki in gl.static_range(0, BLOCK_K * (num_buffers - 2), BLOCK_K):
+        producer = issue_loads(
+            producer, X_desc, W_desc, X_gather_indx_ptr, off_m, off_n, ki,
+            bars, x_bufs, w_bufs, BLOCK_M, num_buffers
+        )
+    k = BLOCK_K * (num_buffers - 2)
+    producer = issue_loads(
+        producer, X_desc, W_desc, X_gather_indx_ptr, off_m, off_n, k,
+        bars, x_bufs, w_bufs, BLOCK_M, num_buffers
+    )
+
+    # Persistent outer loop: 每轮产出一个 (BM, BN) 输出 tile。
+    for _ in range(num_tiles):
+        consumer, mma = issue_mma(consumer, mma, bars, x_bufs, w_bufs, num_buffers)
+        for k in range(BLOCK_K * (num_buffers - 1), K, BLOCK_K):
+            producer = issue_loads(
+                producer, X_desc, W_desc, X_gather_indx_ptr, off_m, off_n, k,
+                bars, x_bufs, w_bufs, BLOCK_M, num_buffers
+            )
+            consumer, mma = issue_mma(
+                consumer, mma, bars, x_bufs, w_bufs, num_buffers
+            )
+
+        epilogue_off_m = off_m
+        epilogue_off_n = off_n
+        scatter_indx_layout: gl.constexpr = gl.SliceLayout(
+            0, gl.BlockedLayout([1, 4], [32, 1], [1, gl.num_warps()], [1, 0])
+        )
+        out_offs_m = gl.load(
+            out_scatter_indx_ptr + epilogue_off_m
+            + gl.arange(0, BLOCK_M, scatter_indx_layout)
+        )
+
+        # 下一 tile 的 prologue 与当前 tile 的 K-pipeline drain 重叠。
+        # 只在确实有 next tile 时才求 scheduler 坐标、读 offsets、发起 TMA。
+        idx += 1
+        has_next = idx < num_tiles
+        if has_next:
+            next_pid_m, next_pid_n = scheduler.get_tile(idx)
+            next_off_m = next_pid_m * BLOCK_M
+            next_off_n = next_pid_n * BLOCK_N
+
+        for ki in gl.static_range(0, BLOCK_K * (num_buffers - 2), BLOCK_K):
+            if has_next:
+                producer = issue_loads(
+                    producer, X_desc, W_desc, X_gather_indx_ptr,
+                    next_off_m, next_off_n, ki, bars, x_bufs, w_bufs,
+                    BLOCK_M, num_buffers
+                )
+            # 即使没有 next tile，也要消费完当前 tile pipeline 中的最后一个 K slice。
+            consumer, mma = issue_mma(
+                consumer, mma, bars, x_bufs, w_bufs, num_buffers
+            )
+        if has_next:
+            k = BLOCK_K * (num_buffers - 2)
+            producer = issue_loads(
+                producer, X_desc, W_desc, X_gather_indx_ptr,
+                next_off_m, next_off_n, k, bars, x_bufs, w_bufs,
+                BLOCK_M, num_buffers
+            )
+
+        mma = mma.wait_num_outstanding(0)
+        out, mma = mma.take_result()
+        out = out.to(dtype)
+        tma.store_wait(pendings=0)
+        out_smem.store(out)
+        fence_async_shared()
+        tma.async_scatter(out_desc, out_offs_m, epilogue_off_n, out_smem)
+
+    tma.store_wait(pendings=0)
+
+
+def matmul_fused_gather_scatter(X, X_gather_indx, W, out_scatter_indx,
+                                BLOCK_M=128, BLOCK_N=128, BLOCK_K=64,
+                                GROUP_SIZE_M=8, num_buffers=3):
+    M, K = X.shape
+    N = W.shape[1]
+    if M % BLOCK_M or N % BLOCK_N or K % BLOCK_K:
+        raise ValueError("This teaching kernel requires M/N/K divisible by their block sizes")
+    if K < (num_buffers - 1) * BLOCK_K:
+        raise ValueError("K must cover the initial num_buffers-1 stage prefetch")
+    if X_gather_indx.numel() != M or out_scatter_indx.numel() != M:
+        raise ValueError("Both row-index arrays must have length M")
+    out = torch.empty((M, N), dtype=X.dtype, device=X.device)
+    dtype = getattr(gl, str(X.dtype).split('.')[1])
+
+    x_layout = gl.NVMMASharedLayout.get_default_for([BLOCK_M, BLOCK_K], dtype)
+    w_layout = gl.NVMMASharedLayout.get_default_for([BLOCK_K, BLOCK_N], dtype)
+    out_layout = gl.NVMMASharedLayout.get_default_for([BLOCK_M, BLOCK_N], dtype)
+    X_desc = TensorDescriptor.from_tensor(X, [1, BLOCK_K], x_layout)
+    W_desc = TensorDescriptor.from_tensor(W, [BLOCK_K, BLOCK_N], w_layout)
+    out_desc = TensorDescriptor.from_tensor(out, [1, BLOCK_N], out_layout)
+
+    num_sms = torch.cuda.get_device_properties(X.device).multi_processor_count
+    num_pid = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    grid = (min(num_sms, num_pid),)
+    SchedulerImpl = GroupedPersistentTileScheduler(GROUP_SIZE_M)
+    matmul_fused_gather_scatter_kernel[grid](
+        X_desc, W_desc, out_desc, X_gather_indx, out_scatter_indx,
+        BLOCK_M, SchedulerImpl, num_buffers
+    )
+    return out
+
+
+def check_fused_gather_scatter():
+    torch.manual_seed(0)
+    M, N, K = 1024, 1024, 2048
+    X = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+    W = torch.randn((K, N), device="cuda", dtype=torch.bfloat16)
+    X_gather_indx = torch.randperm(M, device="cuda", dtype=torch.int32)
+    out_scatter_indx = torch.randperm(M, device="cuda", dtype=torch.int32)
+
+    out = matmul_fused_gather_scatter(
+        X, X_gather_indx, W, out_scatter_indx,
+        BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_buffers=3
+    )
+    out_ref = torch.empty_like(out)
+    out_ref[out_scatter_indx, :] = X[X_gather_indx, :] @ W
+    torch.testing.assert_close(out, out_ref, atol=1e-3, rtol=1e-3)
+    max_error = (out.float() - out_ref.float()).abs().max().item()
+    print(f"check passed; max_abs_error={max_error:.6g}")
+
+
+if __name__ == "__main__":
+    check_fused_gather_scatter()
+```
+
+> 上面 `MMAv5` 和 scheduler 使样例能独立阅读；它保留官方教程的流水结构，并把最后一次 peeled prologue 写成显式 `has_next` 分支。这样当 persistent CTA 没有下一个 tile 时，不会再计算越界 scheduler 坐标或读取不存在的 offsets；但它仍假设 M/N/K 可被相应 block 整除、索引有效，而且 K 至少能覆盖初始的 `num_buffers-1` 级预取。若支持不整除尾块，还必须给当前 tile 的 offsets 和 MMA 有效区域增加 mask，不能把这段示例直接当成任意 shape 的完整生产 kernel。
+
+### 从代码连回线程、内存和同步
+
+| 阶段 | 谁执行 / 读写哪里 | 关键不变量与同步 | 漏掉之后的典型问题 |
+|---|---|---|---|
+| offsets 的 `gl.load` | 当前 CTA 的线程从 global 读 `BM` 个行号 | `SliceLayout` 将 gather4/scatter4 所需的 4 个 offset 放到同线程连续寄存器；一个 warp 的 lanes 持有相同索引组 | 编译拒绝，或 offsets layout conversion/指令生成不满足约束 |
+| `tma.async_gather` + `tma.async_load` | TMA 从 global 搬 X 的不规则行和 W 的规则 tile 到选中的 SMEM slot | 两个传输共用该 slot 的 mbarrier；`expect` 字节数必须等于两者总量；消费前 `wait` | barrier bytes 错会卡住或过早放行；先读会拿到旧数据/半块数据 |
+| `issue_mma` | CTA 发 tcgen05 MMA，操作数来自刚完成的两个 SMEM tile，accumulator 在 TMEM | 等对应 buffer 的 barrier phase；`wait_num_outstanding(0)` 后再发；`use_acc` 由 MMAv5 状态区分首个 K slice 与累加 | phase 错导致挂起；buffer 提前覆盖或 accumulator 初始化错会产生随机/系统性错误 |
+| `take_result` → `out_smem.store` | 等 MMA 完成，将 TMEM 结果取回寄存器，再写 SMEM | accumulator 完成后才能读取；写后必须 `fence_async_shared()`，因为下一步 TMA 走 async proxy | 没有等待时读到未完成 accumulator；没 fence 时 scatter 可能看到旧 SMEM |
+| `tma.async_scatter` | TMA 从 SMEM 将 tile 写到 `out_scatter_indx` 指定的行 | 复用单个 `out_smem` 前 `store_wait(0)`；kernel 末再 wait 一次 | 过早覆盖 source SMEM 或 kernel 返回前写未完成 |
+
+### 多缓冲流水逐拍追踪：`num_buffers=3, BLOCK_K=64`
+
+令一个输出 tile 的 `K=256`，因此有 4 个 K-slice。producer 与 consumer 是单调递增的逻辑序号，物理槽位由 `%3` 决定；barrier generation/phase 由 `floor(i/3) & 1` 决定：
+
+| 动作顺序 | producer / consumer | 物理 SMEM slot | 当前 tile 的 K slice | phase | 说明 |
+|---:|---|---:|---:|---:|---|
+| 1 | producer 0 | 0 | 0 | — | 预取 K `[0,64)` |
+| 2 | producer 1 | 1 | 1 | — | 预取 K `[64,128)` |
+| 3 | consumer 0 | 0 | 0 | 0 | barrier 0 完成后发 MMA |
+| 4 | producer 2 | 2 | 2 | — | 在 MMA 运行时预取 K `[128,192)` |
+| 5 | consumer 1 | 1 | 1 | 0 | 发第二个 K-slice MMA |
+| 6 | producer 3 | 0 | 3 | — | 槽 0 绕回；这是新一代传输 |
+| 7 | consumer 2 | 2 | 2 | 0 | 消费 slot 2 |
+| 8 | producer 4 | 1 | 下一输出 tile 的 0 | — | 外层循环边界提前预取下一 tile |
+| 9 | consumer 3 | 0 | 当前 tile 的 3 | 1 | `3 % 3=0` 仍是 slot 0，但 phase 翻成 1，避免把旧完成误认成新完成 |
+| 10 | producer 5 | 2 | 下一输出 tile 的 1 | — | 新 tile 继续填 buffer；之后取回当前 tile 的 accumulator 并 scatter |
+
+注意序号 8/9 的“交错”：next-tile 的输入加载可以和 current-tile 的最后一个 MMA/drain 重叠；这正是 persistent outer loop 不只是“把普通 for loop 放在 kernel 里”的原因。
+
+### 用真实索引走一行，再手算一个输出元素
+
+假设逻辑行 `i=0`：`X_gather_indx[0]=13`，`out_scatter_indx[0]=5`。取一段小的 K 数据演示数学语义（这是地址/数值示意，不是 Blackwell 的硬件 tile 大小）：
+
+```text
+X[13, :] = [1, 2, 0, 1]
+W[:, 2]  = [3,-1, 4, 2]
+Y[0,2]   = 1*3 + 2*(-1) + 0*4 + 1*2 = 3
+最终写入 out[5,2] = 3
+```
+
+实际 kernel 在一个 `(BM,BN)` tile 上并行算这 `BM×BN` 个逻辑输出；`out_scatter_indx` 只改变输出行地址，不改变 MMA 的逻辑矩阵坐标。
+
+### 选择这条路的条件
+
+| 数据形态 | 典型做法 | 付出的代价 |
+|---|---|---|
+| M 行连续，N/K 为规则块 | 普通 TMA `async_load/store` + GEMM | 最简单、通常首选 |
+| M 行不连续、每行 K 连续；写回也是按行置换 | TMA gather/scatter + GEMM 融合 | offset 布局、mbarrier、SMEM buffer 与尾块处理更复杂 |
+| 元素地址任意、行内也不连续或 mask 特别复杂 | `gl.load/store` / async copy | 索引灵活，但可能失去 TMA 的搬运效率 |
+
+### 容易踩的坑
+
+1. **把两个索引数组合成一个。** gather index 决定“从 X 的哪行读”，scatter index 决定“Y 的逻辑行写到 out 哪行”；它们是两个独立映射。误用会得到形状正确但行语义错位的结果。
+2. **`BLOCK_M` 和 descriptor 首维混为一谈。** X/out descriptor 分别是 `[1,BLOCK_K]`、`[1,BLOCK_N]`；一次 gather/scatter 的多行数来自 offsets 长度 `BLOCK_M`，不是 descriptor block 首维。
+3. **producer/consumer 用同一个随手取的 slot 或不翻 phase。** 多缓冲循环会重用 SMEM barrier；相同 slot 的后续一代必须区分 phase，否则可能等到上一代就误消费。
+4. **scatter 没有完成就覆盖 `out_smem`。** TMA scatter 是异步读取 SMEM 的；`fence_async_shared()` 解决 generic/async proxy 可见性，`store_wait` 解决生命周期/完成，两者不互相替代。
+5. **scatter 行索引不是排列。** 官方测试用 permutation，保证 out 的每行都被唯一写一次。重复索引会有并发写冲突；漏掉某些行则这些位置仍是未初始化值。这不是普通 scatter 自动定义的归约或填零。
+6. **把示例当成可直接处理任意 shape。** 官方测试 shape 的 M/N/K 对 block 整除且 indices 合法；加尾块时 offsets 的 `gl.load` 也必须 mask，且所有 peeled load 都要正确 predicate。BF16 的 gather/scatter 还须满足行段最小宽度及列偏移 16-byte 对齐等前置条件。
+
+### 验证命令与预期
+
+在安装了匹配版本 Triton、CUDA，并运行于 Blackwell GPU 的环境：
+
+```bash
+cd /Users/saboxu/Downloads/learning_notes/operators/code/triton/gluon/tutorials
+python fused_gather_scatter_demo.py
+```
+
+预期：reference 对比断言通过，最后打印 `check passed; max_abs_error=...`。因 BF16 舍入，最大误差是小的非负数，不应要求 bitwise 相同。仓库中完整官方 pytest（包含 gather、scatter、融合 GEMM 参数组）可用：
+
+```bash
+cd /Users/saboxu/Downloads/learning_notes
+pytest -q operators/code/triton/gluon/tutorials/09-tma-gather-scatter.py
+```
+
+本机没有 CUDA/Blackwell 和 Triton GPU runtime，不能在此验证运行时数值或性能；只能做源码静态检查。命令可在目标机器执行。
+
+### 自我检查
+
+1. **为什么 `X_gather_indx` 和 `out_scatter_indx` 不能互换？**
+   - 答：前者映射逻辑输入行到 X 的物理行，后者映射逻辑输出行到 out 的物理行；矩阵乘法在逻辑行空间进行。
+2. **`num_buffers=3` 时 consumer 序号 3 读哪个槽、等哪个 phase？**
+   - 答：`3 % 3 = 0`，读 slot 0；`(3 // 3) & 1 = 1`，等新一代 phase 1。
+3. **为什么 barrier 的 expected bytes 要把 gather 与 W load 两部分相加？**
+   - 答：同一个 slot 的 barrier 表示“这对 MMA 操作数都可用”；只等其中一个传输结束就可能让 MMA 读到另一个尚未到齐的 tile。
+4. **`fence_async_shared()` 和 `tma.store_wait(0)` 各解决什么？**
+   - 答：fence 建立 generic proxy 写 SMEM 到 async proxy 读取 SMEM 的可见性；store_wait 等待异步 scatter 完成，以便安全复用 SMEM/结束 kernel。
+
 ## `tcgen05_copy`：SMEM 到 TMEM 的异步通道
 
 ### 为什么需要它
@@ -1084,3 +1509,13 @@ pytest -q operators/code/triton/gluon/tutorials/13-conv-im2col.py
    - 答：`coord` 是 NHWC 上连续起点的坐标，`offsets` 是 `[r,s]` 形式的 filter 位移；两者相加后决定实际的 TMA 访问地址。
 6. **为什么 scale 的全局布局会影响 scaled MMA 的吞吐？**
    - 答：scale block 必须被 program 顺序、合并地读入并写入 TMEM。若原始 `[MN,K/VEC]` 的列方向步长导致分散访问，scale load 会成为主瓶颈；按 program block 聚簇后，多个 scale 元素才能连续进入一个 cache sector。
+
+## 本章学习进度
+
+- [x] TMA gather/scatter 单独搬运：offsets layout、descriptor 约束与边界行为
+- [x] 融合 gather → tcgen05 GEMM → scatter：persistent tile 与多缓冲流水
+- [ ] `tcgen05_copy`：SMEM → TMEM 的异步搬运和同步契约
+
+### 下一知识点
+
+`tcgen05_copy`。把注意力从“如何把不规则行接到 GEMM”转向“MMA accumulator/scales 所在的 TMEM 如何高效填充”，并跟当前 SMEM→TMEM 的 accumulator 结果路径区分清楚。
