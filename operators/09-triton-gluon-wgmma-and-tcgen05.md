@@ -775,6 +775,631 @@ Gluon 对 tcgen05 的隐式顺序保证包括：
 
 因此不需要在每一对 MMA 之间都插入显式 barrier。barrier 用来告诉普通线程“什么时候可以安全读取累加器或复用 operand buffer”，而不是限制 tensor pipe 自身。
 
+## 官方 06 pipeline 完整拆解：U/V 双 tile、双缓冲 TMA 与 tcgen05 commit
+
+### 本次讲解位置
+
+章节：`chapter_gluon_tensor_cores`（算子开发 / Triton Gluon）<br>
+小节：The 5th Generation TensorCore / Pipeline MMA<br>
+知识点：U/V 两个 M tile、双缓冲 TMA、load barrier 与 MMA barrier 分离、`tcgen05_commit` 驱动 buffer 复用和 epilogue<br>
+上次：非流水 tcgen05 blocked matmul 的 K-loop<br>
+下次：persistent kernel 与 warp specialization<br>
+PTX：`tcgen05.mma`、`tcgen05.commit`、`cp.async.bulk.tensor`、`mbarrier.try_wait.parity`<br>
+完整代码：[官方归档脚本](code/triton/gluon/tutorials/06-tcgen05.py)
+
+### 为什么现在讲这个
+
+前一节的非流水 tcgen05 K-loop 已经能算对，但它的节奏是：
+
+```text
+load(k) -> wait load -> MMA(k) -> wait MMA -> load(k+1)
+```
+
+每次等 MMA 完成才发下一次 load，tensor core 和 TMA 仍然有大量时间互相等待。官方流水版本要解决两个具体问题：
+
+1. 一个 CTA 只算一个 `128 x 128` 输出 tile 时，K-loop 中每轮只有一次 MMA，单次操作的等待粒度太粗。
+2. 如果为了提前加载而直接覆盖 U、V 或 B buffer，TMA 可能覆盖 tensor core 仍在读取的 SMEM，结果会随机错误。
+
+因此它一次计算同一 N 列上的两个 M tile，并为三块输入各准备两份 SMEM buffer。这样既能同时保住两个 accumulator 的吞吐，又能用 MMA barrier 精确判断某个 buffer 何时可以复用。
+
+### 心智模型：一个 B tile 服务两个输出 tile
+
+设 CTA 的 `off_m` 指向一对 M tile：
+
+```text
+U = A[off_m           : off_m + BLOCK_M,     k]
+V = A[off_m + BLOCK_M : off_m + 2 * BLOCK_M, k]
+B = B[k               : k + BLOCK_K,         off_n : off_n + BLOCK_N]
+```
+
+一次 K stage 产生两个独立的矩阵乘：
+
+```text
+UB_tile += U @ B
+VB_tile += V @ B
+```
+
+这两个乘法共享 B。B 是公共操作数，不应加载两次。每个 K stage 需要三次 TMA load：
+
+```text
+U tile
+V tile
+B tile
+```
+
+却可以执行两次 MMA，所以官方注释把它概括为 `3:2 ratio of loads to MMAs`。代价是同一份 B buffer 有两个消费者，复用 B 之前必须同时确认 U MMA 和 V MMA 都读完了。
+
+### 完整可运行示例：双 tile、双缓冲 tcgen05 pipeline
+
+下面的文件 `tcgen05_pipeline_demo.py` 把官方 pipelined kernel 缩成一个可直接运行的最小程序。它保留了完整 kernel、host 侧 descriptor、launch 和数值验证。
+
+```python
+from __future__ import annotations
+
+import torch
+import triton
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+from triton.experimental.gluon.language.nvidia.blackwell import (
+    TensorMemoryLayout,
+    allocate_tensor_memory,
+    fence_async_shared,
+    mbarrier,
+    tcgen05_commit,
+    tcgen05_mma,
+    tma,
+)
+
+
+def is_blackwell():
+    target = triton.runtime.driver.active.get_current_target()
+    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] == 10
+
+
+@gluon.jit
+def get_and_increment(counter):
+    return counter % 2, counter // 2 & 1, counter + 1
+
+
+@gluon.jit
+def blocked_matmul_pipelined_kernel(a_desc, b_desc, c_desc, num_warps: gl.constexpr):
+    BLOCK_M: gl.constexpr = c_desc.block_type.shape[0]
+    BLOCK_N: gl.constexpr = c_desc.block_type.shape[1]
+    BLOCK_K: gl.constexpr = a_desc.block_type.shape[1]
+    dtype: gl.constexpr = a_desc.dtype
+    K = a_desc.shape[1]
+
+    pid_m = gl.program_id(axis=0)
+    pid_n = gl.program_id(axis=1)
+    off_m = pid_m * (2 * BLOCK_M)
+    off_n = pid_n * BLOCK_N
+
+    u_bufs = gl.allocate_shared_memory(
+        dtype, [2] + a_desc.block_type.shape, a_desc.layout
+    )
+    v_bufs = gl.allocate_shared_memory(
+        dtype, [2] + a_desc.block_type.shape, a_desc.layout
+    )
+    b_bufs = gl.allocate_shared_memory(
+        dtype, [2] + b_desc.block_type.shape, b_desc.layout
+    )
+
+    tmem_layout: gl.constexpr = TensorMemoryLayout([BLOCK_M, BLOCK_N], col_stride=1)
+    ub_tmem = allocate_tensor_memory(gl.float32, [BLOCK_M, BLOCK_N], tmem_layout)
+    vb_tmem = allocate_tensor_memory(gl.float32, [BLOCK_M, BLOCK_N], tmem_layout)
+
+    mma_ub_bars = gl.allocate_shared_memory(
+        gl.int64, [2, 1], mbarrier.MBarrierLayout()
+    )
+    mma_vb_bars = gl.allocate_shared_memory(
+        gl.int64, [2, 1], mbarrier.MBarrierLayout()
+    )
+    load_ub_bars = gl.allocate_shared_memory(
+        gl.int64, [2, 1], mbarrier.MBarrierLayout()
+    )
+    load_v_bars = gl.allocate_shared_memory(
+        gl.int64, [2, 1], mbarrier.MBarrierLayout()
+    )
+    for i in gl.static_range(2):
+        mbarrier.init(mma_ub_bars.index(i), count=1)
+        mbarrier.init(mma_vb_bars.index(i), count=1)
+        mbarrier.init(load_ub_bars.index(i), count=1)
+        mbarrier.init(load_v_bars.index(i), count=1)
+
+    load_counter = 0
+    mma_counter = 0
+    k = 0
+    ub_acc = False
+    vb_acc = False
+
+    load_index, load_phase, load_counter = get_and_increment(load_counter)
+    load_ub_bar = load_ub_bars.index(load_index)
+    mbarrier.expect(
+        load_ub_bar,
+        a_desc.block_type.nbytes + b_desc.block_type.nbytes,
+    )
+    tma.async_load(a_desc, [off_m, k], load_ub_bar, u_bufs.index(load_index))
+    tma.async_load(b_desc, [k, off_n], load_ub_bar, b_bufs.index(load_index))
+
+    load_v_bar = load_v_bars.index(load_index)
+    mbarrier.expect(load_v_bar, a_desc.block_type.nbytes)
+    tma.async_load(
+        a_desc,
+        [off_m + BLOCK_M, k],
+        load_v_bar,
+        v_bufs.index(load_index),
+    )
+    k += BLOCK_K
+
+    load_index, load_phase, load_counter = get_and_increment(load_counter)
+    load_ub_bar = load_ub_bars.index(load_index)
+    mbarrier.expect(
+        load_ub_bar,
+        a_desc.block_type.nbytes + b_desc.block_type.nbytes,
+    )
+    tma.async_load(a_desc, [off_m, k], load_ub_bar, u_bufs.index(load_index))
+    tma.async_load(b_desc, [k, off_n], load_ub_bar, b_bufs.index(load_index))
+
+    load_v_bar = load_v_bars.index(load_index)
+    mbarrier.expect(load_v_bar, a_desc.block_type.nbytes)
+    tma.async_load(
+        a_desc,
+        [off_m + BLOCK_M, k],
+        load_v_bar,
+        v_bufs.index(load_index),
+    )
+    k += BLOCK_K
+
+    for _ in range(gl.cdiv(K, BLOCK_K) - 2):
+        mma_index, mma_phase, mma_counter = get_and_increment(mma_counter)
+
+        mbarrier.wait(load_ub_bars.index(mma_index), mma_phase)
+        tcgen05_mma(
+            u_bufs.index(mma_index),
+            b_bufs.index(mma_index),
+            ub_tmem,
+            use_acc=ub_acc,
+        )
+        tcgen05_commit(mma_ub_bars.index(mma_index))
+        ub_acc = True
+
+        mbarrier.wait(load_v_bars.index(mma_index), mma_phase)
+        tcgen05_mma(
+            v_bufs.index(mma_index),
+            b_bufs.index(mma_index),
+            vb_tmem,
+            use_acc=vb_acc,
+        )
+        tcgen05_commit(mma_vb_bars.index(mma_index))
+        vb_acc = True
+
+        load_index, load_phase, load_counter = get_and_increment(load_counter)
+        mbarrier.wait(mma_ub_bars.index(mma_index), mma_phase)
+        load_ub_bar = load_ub_bars.index(load_index)
+        mbarrier.expect(
+            load_ub_bar,
+            a_desc.block_type.nbytes + b_desc.block_type.nbytes,
+        )
+        tma.async_load(
+            a_desc,
+            [off_m, k],
+            load_ub_bar,
+            u_bufs.index(load_index),
+        )
+
+        mbarrier.wait(mma_vb_bars.index(mma_index), mma_phase)
+        tma.async_load(
+            b_desc,
+            [k, off_n],
+            load_ub_bar,
+            b_bufs.index(load_index),
+        )
+        load_v_bar = load_v_bars.index(load_index)
+        mbarrier.expect(load_v_bar, a_desc.block_type.nbytes)
+        tma.async_load(
+            a_desc,
+            [off_m + BLOCK_M, k],
+            load_v_bar,
+            v_bufs.index(load_index),
+        )
+        k += BLOCK_K
+
+    mma_index, mma_phase, mma_counter = get_and_increment(mma_counter)
+    ub_bar = mma_ub_bars.index(mma_index)
+    vb_bar = mma_vb_bars.index(mma_index)
+    epilogue_phase = mma_phase
+
+    mbarrier.wait(load_ub_bars.index(mma_index), mma_phase)
+    tcgen05_mma(
+        u_bufs.index(mma_index),
+        b_bufs.index(mma_index),
+        ub_tmem,
+        use_acc=True,
+    )
+
+    mbarrier.wait(load_v_bars.index(mma_index), mma_phase)
+    tcgen05_mma(
+        v_bufs.index(mma_index),
+        b_bufs.index(mma_index),
+        vb_tmem,
+        use_acc=True,
+    )
+
+    mma_index, mma_phase, mma_counter = get_and_increment(mma_counter)
+    mbarrier.wait(load_ub_bars.index(mma_index), mma_phase)
+    tcgen05_mma(
+        u_bufs.index(mma_index),
+        b_bufs.index(mma_index),
+        ub_tmem,
+        use_acc=True,
+    )
+    tcgen05_commit(ub_bar)
+
+    mbarrier.wait(load_v_bars.index(mma_index), mma_phase)
+    tcgen05_mma(
+        v_bufs.index(mma_index),
+        b_bufs.index(mma_index),
+        vb_tmem,
+        use_acc=True,
+    )
+    tcgen05_commit(vb_bar)
+
+    mbarrier.wait(ub_bar, epilogue_phase)
+    c_smem = gl.allocate_shared_memory(
+        dtype, c_desc.block_type.shape, c_desc.layout
+    )
+    ub = ub_tmem.load()
+    c_smem.store(ub.to(dtype))
+    fence_async_shared()
+    tma.async_store(c_desc, [off_m, off_n], c_smem)
+
+    mbarrier.wait(vb_bar, epilogue_phase)
+    vb = vb_tmem.load()
+    tma.store_wait(pendings=0)
+    c_smem.store(vb.to(dtype))
+    fence_async_shared()
+    tma.async_store(c_desc, [off_m + BLOCK_M, off_n], c_smem)
+    tma.store_wait(pendings=0)
+
+
+def blocked_matmul_pipelined(A, B, C, BLOCK_M, BLOCK_N, BLOCK_K, num_warps):
+    M, N = C.shape
+    a_layout = gl.NVMMASharedLayout.get_default_for(
+        [BLOCK_M, BLOCK_K], gl.float16
+    )
+    b_layout = gl.NVMMASharedLayout.get_default_for(
+        [BLOCK_K, BLOCK_N], gl.float16
+    )
+    c_layout = gl.NVMMASharedLayout.get_default_for(
+        [BLOCK_M, BLOCK_N], gl.float16
+    )
+    a_desc = TensorDescriptor.from_tensor(A, [BLOCK_M, BLOCK_K], a_layout)
+    b_desc = TensorDescriptor.from_tensor(B, [BLOCK_K, BLOCK_N], b_layout)
+    c_desc = TensorDescriptor.from_tensor(C, [BLOCK_M, BLOCK_N], c_layout)
+
+    grid = (triton.cdiv(M, 2 * BLOCK_M), triton.cdiv(N, BLOCK_N))
+    blocked_matmul_pipelined_kernel[grid](
+        a_desc,
+        b_desc,
+        c_desc,
+        num_warps=num_warps,
+    )
+
+
+def main():
+    if not is_blackwell():
+        raise RuntimeError("This example requires a Blackwell NVIDIA GPU")
+
+    torch.manual_seed(0)
+    M, N, K = 256, 256, 256
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    C = torch.empty(M, N, device="cuda", dtype=torch.float16)
+
+    blocked_matmul_pipelined(
+        A,
+        B,
+        C,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        num_warps=8,
+    )
+    torch.testing.assert_close(A @ B, C, rtol=1e-3, atol=1e-1)
+    print("tcgen05 pipelined matmul ok")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行：
+
+```bash
+python tcgen05_pipeline_demo.py
+```
+
+在符合条件的 Blackwell GPU 上，数值检查通过后输出：
+
+```text
+tcgen05 pipelined matmul ok
+```
+
+### 为什么一个 CTA 处理两个 M tile
+
+grid 是：
+
+```python
+grid = (triton.cdiv(M, 2 * BLOCK_M), triton.cdiv(N, BLOCK_N))
+```
+
+若 `M=N=256`、`BLOCK_M=BLOCK_N=128`，则：
+
+```text
+grid = (ceil(256 / 256), ceil(256 / 128))
+     = (1, 2)
+```
+
+第二个 CTA 的 `off_n=128`。该 CTA 同时计算：
+
+```text
+C[0:128,   128:256] = A[0:128,   :] @ B[:, 128:256]
+C[128:256, 128:256] = A[128:256, :] @ B[:, 128:256]
+```
+
+这两个输出 tile 使用完全相同的 B。一次 load B，两次 MMA，是这套 schedule 的第一个收益来源。它也解释为什么要有两个 TMEM accumulator：
+
+```text
+ub_tmem: C[off_m           : off_m + BLOCK_M,     off_n : off_n + BLOCK_N]
+vb_tmem: C[off_m + BLOCK_M : off_m + 2 * BLOCK_M, off_n : off_n + BLOCK_N]
+```
+
+### 双缓冲的对象到底有哪些
+
+源码中有三组输入 buffer：
+
+```python
+u_bufs: [2, BLOCK_M, BLOCK_K]
+v_bufs: [2, BLOCK_M, BLOCK_K]
+b_bufs: [2, BLOCK_K, BLOCK_N]
+```
+
+每个 slot 的生命周期分成两个问题：
+
+| 问题 | 需要等待 | 原因 |
+|---|---|---|
+| TMA 是否已经写完 slot？ | 对应的 `load_*_bars[slot]` | MMA 不能读半块数据 |
+| MMA 是否已经读完 slot？ | 对应的 `mma_*_bars[slot]` | TMA 不能覆盖仍在读的 SMEM |
+
+因此一个 slot 的完整生命周期是：
+
+```text
+empty
+  -> expect + TMA load
+  -> load barrier 完成
+  -> MMA 读取
+  -> commit
+  -> MMA barrier 完成
+  -> 可以重新 TMA load
+```
+
+`load` barrier 和 `mma` barrier 不能合并。前者回答“数据到了吗”，后者回答“消费者走了吗”；它们是相反方向的所有权。即便都使用 `count=1` 的 mbarrier，也必须分别初始化和分别翻转 phase。
+
+### `get_and_increment`：slot 与 phase 的唯一分配器
+
+```python
+@gluon.jit
+def get_and_increment(counter):
+    return counter % 2, counter // 2 & 1, counter + 1
+```
+
+返回值的顺序是：
+
+```text
+counter % 2        -> slot index: 0, 1, 0, 1, ...
+counter // 2 & 1   -> phase: 0, 0, 1, 1, 0, 0, ...
+counter + 1        -> 下一次的 counter
+```
+
+具体轨迹：
+
+| counter | slot | phase | next | 对应 K tile |
+|---:|---:|---:|---:|---|
+| 0 | 0 | 0 | 1 | K1 |
+| 1 | 1 | 0 | 2 | K2 |
+| 2 | 0 | 1 | 3 | K3 |
+| 3 | 1 | 1 | 4 | K4 |
+| 4 | 0 | 0 | 5 | K5 |
+| 5 | 1 | 0 | 6 | K6 |
+| 6 | 0 | 1 | 7 | K7 |
+
+同一个 slot 每被复用一次，phase 就翻转一次。slot 0 的 phase 序列是 `0, 1, 0, 1, ...`；slot 1 也是同样规律，只是第一次使用从 phase 0 开始。
+
+prologue 中返回的 `load_phase` 没有参与 wait，因为 prologue 的职责只是发起前两次 load。主循环中的 `mma_phase` 同时用于等待同名 slot 的 load barrier。这里能这样写，是因为 `load_counter` 和 `mma_counter` 在这个固定 schedule 中同步推进，index 与 phase 一一对齐；换成更复杂的 producer/consumer 结构后，两个 counter 应分别维护。
+
+### Prologue：先把两个 slot 都填满
+
+第一段加载 K1：
+
+```text
+slot 0: U1, B1, V1
+```
+
+`load_ub_bars[0]` 由 U1 和 B1 共同完成，因此 `expect` 的字节数是：
+
+```text
+U tile bytes + B tile bytes
+```
+
+`load_v_bars[0]` 只跟踪 V1，因此只 expect V tile bytes。
+
+第二段加载 K2：
+
+```text
+slot 1: U2, B2, V2
+```
+
+此时两个 slot 都有可消费的数据。主循环每轮先消费已经加载的 tile，再为两轮之前的 slot 发起新 load。
+
+### 主循环：每轮同时推进 MMA 和下一轮 load
+
+主循环可以压缩成下面的顺序：
+
+```text
+wait load_ub[slot]
+issue U MMA
+commit mma_ub[slot]
+
+wait load_v[slot]
+issue V MMA
+commit mma_vb[slot]
+
+wait mma_ub[slot]
+load U(next), but do not overwrite B yet
+
+wait mma_vb[slot]
+load B(next), V(next)
+```
+
+前两步是消费者路径，后两步是生产者路径。它们在同一轮里交错出现，因此没有独立的 producer warpgroup，也没有额外的 block-level barrier。
+
+这里最容易看漏的是 B 的共享关系：
+
+```text
+slot s 的 B
+  -> U MMA 读取
+  -> V MMA 读取
+```
+
+所以 `wait(mma_ub[slot])` 之后只能覆盖 `u_bufs[slot]`，不能立刻覆盖 `b_bufs[slot]`。必须等 `wait(mma_vb[slot])` 之后，才能安全写 B，同时写 V。代码正是按这个顺序拆开两次 wait 的。
+
+### K_TILES=4 的完整时间线
+
+取 `K=256`、`BLOCK_K=64`，于是 `K_TILES=4`：
+
+```text
+prologue:
+  load K1 -> slot 0
+  load K2 -> slot 1
+
+main iteration 0:
+  slot 0, phase 0
+  MMA U1 and V1
+  commit 到 mma_ub[0], mma_vb[0]
+  wait mma_ub[0] and mma_vb[0]
+  load K3 -> slot 0
+
+main iteration 1:
+  slot 1, phase 0
+  MMA U2 and V2
+  commit 到 mma_ub[1], mma_vb[1]
+  wait mma_ub[1] and mma_vb[1]
+  load K4 -> slot 1
+
+final tile K3:
+  slot 0, phase 1
+  wait load[0] phase 1
+  MMA U3 and V3, use_acc=True
+
+final tile K4:
+  slot 1, phase 1
+  wait load[1] phase 1
+  MMA U4 and V4, use_acc=True
+  commit 到最终 ub_bar = mma_ub[0]
+  commit 到最终 vb_bar = mma_vb[0]
+  wait 最终 barrier, phase 1
+  TMEM -> register -> SMEM -> TMA store
+```
+
+最后两次 commit 的 barrier 使用的是前面保存的 `ub_bar`、`vb_bar`。它们对应 slot 0，但 commit 完成事件覆盖此前的 U/V MMA 序列，因此最后等待 `ub_bar` 和 `vb_bar` 时，最终累加器已经可以读取。这里不能只等 K4 那一次 MMA，因为 K3 的结果也必须在 epilogue 读取前完成。
+
+教程中的这个 schedule 默认 `K_TILES >= 3`，并且只对 `BLOCK_M = BLOCK_N = 128` 做专门优化。若要推广到任意 K tile 数，必须把 final 阶段的 `use_acc` 和最后一个未提交 MMA 的处理重新设计，不能只改循环上界。
+
+### Epilogue：为什么 TMEM 不能直接被 TMA store
+
+最后一段路径是：
+
+```text
+ub_tmem / vb_tmem
+    -> TMEM load 到 register
+    -> cast 到 fp16
+    -> store 到 SMEM c_smem
+    -> fence_async_shared()
+    -> TMA store 到 GMEM
+```
+
+TMA store 读取的是 SMEM，不是 TMEM，所以不能直接把 TMEM descriptor 交给 TMA。TMEM 的结果必须先经 `tcgen05.ld` 进入 register，再由普通 store 写进 SMEM。写完 SMEM 后需要 `fence_async_shared()`，让后续 async proxy 的 TMA store 看见这笔普通写入。
+
+第一次 TMA store 与第二个 TMEM load 的等待顺序也值得注意：
+
+```text
+load UB -> store UB 到 c_smem -> launch TMA store UB
+wait VB MMA -> load VB -> tma.store_wait(0) -> store VB 到 c_smem -> launch TMA store VB
+```
+
+`tma.store_wait(pendings=0)` 在复用同一块 `c_smem` 之前等待前一个 TMA store 读完它。少了这一步，第二个输出 tile 的 SMEM 写入可能覆盖第一个 store 仍在读取的数据。
+
+### Barrier 所有权表
+
+| Barrier | 谁让它完成 | 谁等待它 | 等待后能做什么 |
+|---|---|---|---|
+| `load_ub_bars[s]` | U、B 两次 TMA 的 transaction bytes | MMA 前 | 读取 U 和 B |
+| `load_v_bars[s]` | V 的 TMA transaction bytes | MMA 前 | 读取 V |
+| `mma_ub_bars[s]` | `tcgen05_commit` 对应的 U MMA | 下一轮 TMA 前 | 覆盖 `u_bufs[s]` |
+| `mma_vb_bars[s]` | `tcgen05_commit` 对应的 V MMA | 下一轮 TMA 前 | 覆盖 `b_bufs[s]` 和 `v_bufs[s]` |
+
+`mbarrier.init(..., count=1)` 只定义“多少个 arrival 完成当前 phase”。它不表示 barrier 只能使用一次。每次 phase 完成后，下一次 arrival 进入新 phase，所以同一个 slot 可以反复复用，但等待方必须使用与本次使用对应的 parity。
+
+### 常见错误与可观察症状
+
+| 错误 | 典型症状 | 根因与修复 |
+|---|---|---|
+| B 只等 U MMA 完成就覆盖 | 结果随机错误，单独跑小矩阵有时能过 | B 还被 V MMA 读取；先等 `mma_vb` 再覆盖 B |
+| 复用 load 和 MMA 的同一个 barrier | 首次可能正常，后续永久卡住或随机乱序 | 两类完成的 phase 不同；分开 barrier 并分别 init |
+| 忘记翻转 slot phase | 第二个 K tile 永远等不到，或提前通过 | `get_and_increment` 必须同时推进 index 和 phase |
+| 主循环只 load 下一块，不等待旧 buffer 的 MMA | 数据竞争，结果随运行次数波动 | `mma_*_bars` 是 buffer 可复用的许可证 |
+| Epilogue 在 commit 后不 wait | 读到旧 accumulator，最终结果偶尔少一项 | `tcgen05_commit` 是异步完成信号，不是同步点 |
+| TMA store 前少 `fence_async_shared()` | 输出旧 SMEM 或部分新数据 | 普通 store 到 async proxy 之间需要 fence |
+| 第二个输出覆盖 `c_smem` 前不 `store_wait(0)` | 第一个输出 tile 随机损坏 | TMA store 仍在读 SMEM |
+
+### 自测
+
+1. **为什么每个 K stage 是 3 次 TMA load、2 次 MMA？**
+   - 答：需要加载 U、V、B 三块输入；U 和 V 分别与同一个 B 做 MMA，因此产生 UB 和 VB 两个输出 tile。
+2. **`counter=2` 时 `get_and_increment` 返回什么？**
+   - 答：返回 `slot=0, phase=1, next_counter=3`。slot 0 第二次被使用，所以 phase 从 0 翻到 1。
+3. **为什么等待 `mma_ub` 后不能马上覆盖 B？**
+   - 答：B 还被 V MMA 读取。必须先等待 `mma_vb`，才能安全覆盖 B。
+4. **为什么 load barrier 和 MMA barrier 不能复用？**
+   - 答：一个表示 TMA 已把数据写进 SMEM，另一个表示 tensor core 已读完 SMEM。完成来源、phase 推进和消费者都不同，混用会让后续 wait 的 parity 失去意义。
+5. **Epilogue 为什么必须经过 register 和 SMEM？**
+   - 答：TMA store 的源是 SMEM，不能直接读 TMEM；最终 accumulator 需要先由 `tcgen05.ld` 从 TMEM 取到 register，再存入 SMEM 交给 TMA。
+
+### 验证与运行边界
+
+静态检查：
+
+```bash
+python3 -m py_compile operators/code/triton/gluon/tutorials/06-tcgen05.py
+git diff --check
+```
+
+运行检查要求 Blackwell 计算能力 10.x 和同等版本的 Triton Gluon：
+
+```bash
+python tcgen05_pipeline_demo.py
+```
+
+预期输出：
+
+```text
+tcgen05 pipelined matmul ok
+```
+
+当前文档环境只做静态验证。非 Blackwell GPU 会在 `is_blackwell()` 处失败，这表示硬件边界不符合教程要求，不是 kernel 的数值结果。
+
 ## 官方性能轨迹
 
 | 版本 | Hopper WGMMA | Blackwell tcgen05 |
