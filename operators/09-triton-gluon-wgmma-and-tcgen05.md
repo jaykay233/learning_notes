@@ -818,6 +818,525 @@ Gluon 对 tcgen05 的隐式顺序保证包括：
 5. **为什么 tcgen05 与 WGMMA 都需要“异步完成等待”，但等待对象不同？**
    - 答：两者都异步访问 operand 并写 accumulator；WGMMA 用 commit group 跟踪 register accumulator，tcgen05 用 mbarrier 跟踪 TMEM accumulator 和 tensor-pipe 完成。
 
+## 官方 05 blocked matmul：一个 CTA 如何完成一个二维输出 tile
+
+### 本次讲解位置
+
+章节：`chapter_gluon_tensor_cores`（算子开发 / Triton Gluon）<br>
+小节：Official Tutorial 05 / Blocked Matmul<br>
+知识点：从二维 grid、K-loop、TMA 尾块、mbarrier parity 到 WGMMA store 的完整 baseline<br>
+上次：单个输出 tile 上的 WGMMA、instruction shape 与 `warpgroup_mma_wait`<br>
+下次：为 A/B 增加多阶段 buffer，让下一轮 TMA load 与当前 WGMMA overlap<br>
+PTX：`cp.async.bulk.tensor.*`、`mbarrier.arrive.expect_tx`、`wgmma.mma_async`<br>
+官方源码：[`05-wgmma.py`](code/triton/gluon/tutorials/05-wgmma.py)<br>
+官方教程：[Warp-Group MMA](https://triton-lang.org/main/getting-started/tutorials/gluon/wgmma.html)
+
+### 为什么现在讲这个
+
+上一节能在固定的一块 `BLOCK_M x BLOCK_N` 上发出 WGMMA，但真实 GEMM 的 C 是二维矩阵。一个 CTA 只负责其中一个输出 tile，因此必须先回答三个具体问题：
+
+```text
+1. 当前 CTA 应该处理 C 的哪一块？
+2. 这一块需要沿 K 方向读取哪些 A/B slice？
+3. 当 M、N 或 K 不能被 block size 整除时，多出来的尾块由谁清零或裁剪？
+```
+
+如果 grid、坐标或 phase 任意一项写错，症状不是简单的“结果差一点”，而是多个 CTA 写错位置、第二个 K iteration 提前读取、或者最后一次 load 永久等不到 completion。本节把官方 baseline 当作一条完整生产路径来走，并为下一节的双缓冲流水线建立坐标系。
+
+### 心智模型：CTA 是二维 tile worker
+
+把 C 想成由 `BLOCK_M x BLOCK_N` 小方格组成的大棋盘：
+
+```text
+grid = (ceil(M / BLOCK_M), ceil(N / BLOCK_N))
+
+pid_m = gl.program_id(axis=0)  -> 输出 tile 在 M 方向的编号
+pid_n = gl.program_id(axis=1)  -> 输出 tile 在 N 方向的编号
+
+off_m = pid_m * BLOCK_M
+off_n = pid_n * BLOCK_N
+```
+
+一个 CTA 的主循环不是“把整个 K 乘完才产生中间结果”，而是：
+
+```text
+for k in range(0, K, BLOCK_K):
+    加载 A[off_m : off_m + BLOCK_M, k : k + BLOCK_K]
+    加载 B 的对应 tile
+    等 TMA 完成
+    acc += A_tile @ B_tile
+
+把 fp32 acc 转成输出 dtype
+通过 TMA 将 C[off_m, off_n] tile 写回
+```
+
+这里的 `acc` 一直是寄存器中的 `BLOCK_M x BLOCK_N` 累加器。K 方向被切成若干段，但 CTA 始终只负责同一个 C tile。
+
+### 完整可运行代码
+
+下面是可以单独保存为 `blocked_matmul_wgmma_demo.py` 的完整版本，包含 imports、helper、kernel、host 启动和数值校验。它需要 Hopper GPU。
+
+```python
+from __future__ import annotations
+
+import torch
+import triton
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+from triton.experimental.gluon.language.nvidia.hopper import (
+    fence_async_shared,
+    mbarrier,
+    tma,
+    warpgroup_mma,
+    warpgroup_mma_wait,
+)
+
+
+def is_hopper() -> bool:
+    target = triton.runtime.driver.active.get_current_target()
+    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] == 9
+
+
+@gluon.constexpr_function
+def get_warps_per_cta(BLOCK_M, BLOCK_N, num_warps):
+    warps_per_cta = [4, 1]
+    m = 16
+    while warps_per_cta[0] * warps_per_cta[1] != num_warps:
+        if BLOCK_M > m * warps_per_cta[0]:
+            warps_per_cta[0] *= 2
+        else:
+            warps_per_cta[1] *= 2
+    return warps_per_cta
+
+
+@gluon.constexpr_function
+def get_instr_shape_n(BLOCK_M, BLOCK_N, num_warps):
+    m = 16
+    m_reps = triton.cdiv(BLOCK_M, m)
+    n_reps = triton.cdiv(num_warps, m_reps)
+    max_n = max(BLOCK_N // n_reps, 8)
+    n = 256
+    while n > max_n or BLOCK_N % n != 0:
+        n -= 8
+    assert n >= 8, "expected to find a valid n"
+    return n
+
+
+@gluon.constexpr_function
+def pick_wgmma_layout(dtype, BLOCK_M, BLOCK_N, num_warps):
+    m = 16
+    k = 256 // dtype.primitive_bitwidth
+    n = get_instr_shape_n(BLOCK_M, BLOCK_N, num_warps)
+    warps_per_cta = get_warps_per_cta(BLOCK_M, BLOCK_N, num_warps)
+    return gl.NVMMADistributedLayout(
+        version=[3, 0],
+        warps_per_cta=warps_per_cta,
+        instr_shape=[m, n, k],
+    )
+
+
+@gluon.jit
+def blocked_matmul_kernel(
+    a_desc,
+    b_desc,
+    c_desc,
+    TRANSPOSE_B: gl.constexpr,
+    num_warps: gl.constexpr,
+):
+    BLOCK_M: gl.constexpr = c_desc.block_type.shape[0]
+    BLOCK_N: gl.constexpr = c_desc.block_type.shape[1]
+    BLOCK_K: gl.constexpr = a_desc.block_type.shape[1]
+    dtype: gl.constexpr = a_desc.dtype
+    K = a_desc.shape[1]
+
+    a_smem = gl.allocate_shared_memory(dtype, a_desc.block_type.shape, a_desc.layout)
+    b_smem = gl.allocate_shared_memory(dtype, b_desc.block_type.shape, b_desc.layout)
+
+    pid_m = gl.program_id(axis=0)
+    pid_n = gl.program_id(axis=1)
+    off_m = pid_m * BLOCK_M
+    off_n = pid_n * BLOCK_N
+
+    mma_layout: gl.constexpr = pick_wgmma_layout(
+        dtype, BLOCK_M, BLOCK_N, num_warps
+    )
+    acc = gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=mma_layout)
+
+    bar = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
+    mbarrier.init(bar, count=1)
+    phase = 0
+
+    for k in range(0, K, BLOCK_K):
+        mbarrier.expect(
+            bar,
+            a_desc.block_type.nbytes + b_desc.block_type.nbytes,
+        )
+        tma.async_load(a_desc, [off_m, k], bar, a_smem)
+        if TRANSPOSE_B:
+            tma.async_load(b_desc, [off_n, k], bar, b_smem)
+        else:
+            tma.async_load(b_desc, [k, off_n], bar, b_smem)
+
+        mbarrier.wait(bar, phase=phase)
+        phase ^= 1
+
+        if TRANSPOSE_B:
+            b = b_smem.permute((1, 0))
+        else:
+            b = b_smem
+
+        acc = warpgroup_mma(a_smem, b, acc, is_async=True)
+        acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
+
+    mbarrier.invalidate(bar)
+
+    c_smem = gl.allocate_shared_memory(dtype, c_desc.block_type.shape, c_desc.layout)
+    c_smem.store(acc.to(dtype))
+    fence_async_shared()
+    tma.async_store(c_desc, [off_m, off_n], c_smem)
+    tma.store_wait(pendings=0)
+
+
+def blocked_matmul(
+    A,
+    B,
+    C,
+    BLOCK_M,
+    BLOCK_N,
+    BLOCK_K,
+    TRANSPOSE_B,
+    num_warps,
+):
+    M, N = C.shape
+
+    a_layout = gl.NVMMASharedLayout.get_default_for(
+        [BLOCK_M, BLOCK_K], gl.float16
+    )
+    a_desc = TensorDescriptor.from_tensor(A, [BLOCK_M, BLOCK_K], a_layout)
+
+    b_block_shape = [BLOCK_N, BLOCK_K] if TRANSPOSE_B else [BLOCK_K, BLOCK_N]
+    b_layout = gl.NVMMASharedLayout.get_default_for(b_block_shape, gl.float16)
+    b_desc = TensorDescriptor.from_tensor(B, b_block_shape, b_layout)
+
+    c_layout = gl.NVMMASharedLayout.get_default_for(
+        [BLOCK_M, BLOCK_N], gl.float16
+    )
+    c_desc = TensorDescriptor.from_tensor(C, [BLOCK_M, BLOCK_N], c_layout)
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    blocked_matmul_kernel[grid](
+        a_desc,
+        b_desc,
+        c_desc,
+        TRANSPOSE_B,
+        num_warps=num_warps,
+    )
+
+
+if __name__ == "__main__":
+    if not is_hopper():
+        raise RuntimeError("This demo requires a Hopper NVIDIA GPU")
+
+    M, N, K = 208, 416, 304
+    BLOCK_M, BLOCK_N, BLOCK_K = 128, 128, 64
+    torch.manual_seed(0)
+
+    for transpose_b in (False, True):
+        A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+        B = torch.randn(
+            (N, K) if transpose_b else (K, N),
+            device="cuda",
+            dtype=torch.float16,
+        )
+        C = torch.empty(M, N, device="cuda", dtype=torch.float16)
+
+        blocked_matmul(
+            A,
+            B,
+            C,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            transpose_b,
+            num_warps=4,
+        )
+
+        C_ref = A @ (B.T if transpose_b else B)
+        torch.testing.assert_close(C_ref, C, rtol=1e-3, atol=1e-1)
+        print(f"TRANSPOSE_B={transpose_b} ok, sum={C.sum().item()}")
+```
+
+预期输出形如：
+
+```text
+TRANSPOSE_B=False ok, sum=...
+TRANSPOSE_B=True ok, sum=...
+```
+
+### 三个 constexpr helper 在选什么
+
+这三个 helper 都发生在编译期。它们不是“调优建议”，而是在构造一个合法的 `NVMMADistributedLayout`。
+
+#### `get_warps_per_cta`
+
+WGMMA 的最小 warp 切分 atom 是：
+
+```text
+[4, 1]
+```
+
+也就是至少 4 个 warp 沿 M 方向覆盖 `m=16` 的 instruction row。以 `BLOCK_M=64, BLOCK_N=64, num_warps=8` 为例：
+
+```text
+初始 [4, 1]
+BLOCK_M > 16 * 4 ? 64 > 64 -> False
+因此第二次沿 N 翻倍，得到 [4, 2]
+```
+
+如果 `BLOCK_M=128`，则第一步得到 `[8, 1]`。代码只在 M 方向还能容纳新的 warp 分区时增加 M；否则增加 N，避免让两个 warp 覆盖同一组 M 数据而产生广播式冗余工作。
+
+#### `get_instr_shape_n`
+
+FP16 的 `k` 固定为：
+
+```text
+256 / 16 = 16
+```
+
+但每个 `wgmma.mma_async` 的 `n` 不能随便取。`get_instr_shape_n` 用两个边界缩小它：
+
+```text
+m_reps = ceil(BLOCK_M / 16)
+n_reps = ceil(num_warps / m_reps)
+max_n  = max(BLOCK_N / n_reps, 8)
+```
+
+然后从 256 开始每次减 8，直到同时满足：
+
+```text
+n <= max_n
+BLOCK_N % n == 0
+```
+
+例如 `BLOCK_M=128, BLOCK_N=128, num_warps=4`：
+
+```text
+m_reps = ceil(128 / 16) = 8
+n_reps = ceil(4 / 8) = 1
+max_n  = max(128 / 1, 8) = 128
+n      从 256 递减到 128
+```
+
+最终得到 `instr_shape=[16, 128, 16]`。如果选择 `n=256`，它大于 `BLOCK_N`，一个 instruction 就会越过 tile 边界。
+
+#### `pick_wgmma_layout`
+
+最后把三个量放进 accumulator layout：
+
+```python
+gl.NVMMADistributedLayout(
+    version=[3, 0],
+    warps_per_cta=[4, 1],
+    instr_shape=[16, 128, 16],
+)
+```
+
+`acc` 是 `[128, 128]` 的 fp32 tensor，但物理上分散在 warp group 的寄存器里。`mma_layout` 规定的正是哪一条 instruction 结果由哪些 lane 持有。
+
+### 从 host descriptor 到 CTA grid
+
+host 侧构造三个 descriptor：
+
+| Descriptor | block shape | 全局 tensor |
+|---|---|---|
+| A | `[BLOCK_M, BLOCK_K]` | `[M, K]` |
+| B，非转置 | `[BLOCK_K, BLOCK_N]` | `[K, N]` |
+| B，转置 | `[BLOCK_N, BLOCK_K]` | `[N, K]` |
+| C | `[BLOCK_M, BLOCK_N]` | `[M, N]` |
+
+grid 是：
+
+```python
+grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+```
+
+`program_id(axis=0)` 对应 M 方向，`program_id(axis=1)` 对应 N 方向。这里不能把两个 axis 交换后仍然使用原来的 `off_m/off_n`，否则 CTA 会从错误的 A/B 区域取数，甚至把不同计算结果写到相同 C tile。
+
+### TMA load 如何制造 barrier completion
+
+每次 K iteration 做四步：
+
+```text
+1. mbarrier.expect(bar, A_bytes + B_bytes)
+2. tma.async_load(A slice, bar, a_smem)
+3. tma.async_load(B slice, bar, b_smem)
+4. mbarrier.wait(bar, phase)
+```
+
+`mbarrier.expect` 同时完成两件事：先为当前 phase 记下一笔预期传输字节数，并消耗 barrier 初始 count 的一次 arrival；之后每次 TMA byte completion 都递减这笔 tx count。A、B 都传完后，phase 才能完成。
+
+若 expect 的字节数小于实际传输量，barrier 可能过早完成，WGMMA 读到尚未写完的 SMEM；若大于实际传输量，最后一次 wait 会长期等待。这里的正确总量是：
+
+```text
+A bytes = BLOCK_M * BLOCK_K * 2
+B bytes = BLOCK_N * BLOCK_K * 2
+```
+
+### phase 为什么要每次翻转
+
+`mbarrier` 不是一次性锁。它会沿 phase parity `0 -> 1 -> 0 -> ...` 循环复用。`wait` 时要传入“我正在等待的那个 phase 的 parity”。
+
+以 `K=304, BLOCK_K=64` 为例，循环有 5 次：
+
+| iteration | `k` | wait phase | 完成后 `phase` |
+|---:|---:|---:|---:|
+| 0 | 0 | 0 | 1 |
+| 1 | 64 | 1 | 0 |
+| 2 | 128 | 0 | 1 |
+| 3 | 192 | 1 | 0 |
+| 4 | 256 | 0 | 1 |
+
+如果循环里永远写 `phase=0`，第一次会等待正确的 phase；从第二次开始，可能会命中已经完成的旧 phase 而立即返回。这正是“偶发读旧数据”的根源之一。
+
+### 具体执行轨迹：M=208, N=416, K=304
+
+使用：
+
+```text
+BLOCK_M = 128
+BLOCK_N = 128
+BLOCK_K = 64
+num_warps = 4
+```
+
+得到：
+
+```text
+grid_m = ceil(208 / 128) = 2
+grid_n = ceil(416 / 128) = 4
+grid   = (2, 4)
+K iterations = ceil(304 / 64) = 5
+```
+
+取 `pid_m=1, pid_n=3`：
+
+```text
+off_m = 1 * 128 = 128
+off_n = 3 * 128 = 384
+```
+
+这个 CTA 的职责是：
+
+```text
+C tile: rows 128..255, cols 384..511 理论上
+实际有效区域: rows 128..207, cols 384..415
+```
+
+每个 K iteration 的 A slice 是：
+
+```text
+A[128:256, k:k+64]
+```
+
+当 `k=256` 时，全局 K 只剩 48 个有效元素；`k=304..319` 越界。TMA 根据 descriptor 中保存的全局 shape 将越界读填零，因此 WGMMA 仍可计算完整的 `128 x 128 x 64` block，只是多乘了零。
+
+`TRANSPOSE_B=False` 时：
+
+```text
+B global shape = [K, N]
+B tile         = B[k:k+64, 384:512]
+逻辑 MMA B    = [64, 128]
+```
+
+`TRANSPOSE_B=True` 时：
+
+```text
+B global shape = [N, K]
+B tile         = B[384:512, k:k+64]
+permute view   = [64, 128]
+```
+
+写回时 TMA store 同样根据 `c_desc.shape=[M, N]` 裁剪边界，所以完整 tile 中越界的 rows 208..255 和 cols 416..511 不会写到 C 之外，真正的有效写回大小是 `80 x 32`。
+
+### `TRANSPOSE_B` 为什么不需要复制数据
+
+TMA 只负责把一块数据按描述符搬进 SMEM，它不会自动替 WGMMA 做矩阵转置。代码通过两步把语义补齐：
+
+```python
+if TRANSPOSE_B:
+    tma.async_load(b_desc, [off_n, k], bar, b_smem)
+    b = b_smem.permute((1, 0))
+else:
+    tma.async_load(b_desc, [k, off_n], bar, b_smem)
+    b = b_smem
+```
+
+非转置路径的 SMEM layout 是 `[BLOCK_K, BLOCK_N]`；转置路径装入的是 `[BLOCK_N, BLOCK_K]`，`permute((1, 0))` 只创建一个逻辑转置 view，不搬运元素。WGMMA 接收这个 view 时，会使用相应的 SMEM descriptor 读取成 `[BLOCK_K, BLOCK_N]`。
+
+因此 `TRANSPOSE_B` 改变的是三个地方，必须同时一致：
+
+```text
+host descriptor block shape
+TMA load 坐标
+WGMMA 之前是否 permute
+```
+
+只改其中一处通常不会产生“稍微不对”的结果，而是直接读错矩阵，数值测试会大面积失败。
+
+### 这个 baseline 与下一节 pipeline 的差别
+
+| 项目 | 本节 blocked baseline | 下一节 double-buffered pipeline |
+|---|---|---|
+| A/B SMEM buffer | 各 1 份 | 各 2 份，轮流使用 |
+| 下一轮 TMA load | 必须等当前 WGMMA 完成后覆盖同一 buffer | 可写另一 buffer，与当前 WGMMA overlap |
+| WGMMA 发起位置 | TMA wait 后立即发起并等待 | 构造长 dependency chain，延后统一 wait |
+| 额外状态 | `phase` | `phase`、buffer index、MMA dependency |
+| 结果正确性核心 | TMA 完成、MMA 完成后才能覆盖 | 前一轮 MMA 完成才能覆盖对应 buffer |
+
+baseline 不是“错误版本”，它更容易验证坐标、layout 和尾块是否正确。确认 baseline 后再加入双缓冲，才能把正确性问题和调度性能问题分开定位。
+
+### 常见错误与可观察症状
+
+| 错误 | 可观察症状 | 根本原因 |
+|---|---|---|
+| grid axes 与 `off_m/off_n` 交换 | 大面积 wrong answer，某些 tile 随机覆盖 | CTA 取错 A/B 区域或写错 C tile |
+| `phase` 不翻转 | 从第二个 K iteration 开始偶发读到旧 SMEM | `wait` 命中了旧的已 complete phase |
+| `mbarrier.expect` 字节数算错 | 偶尔提前完成或永久 hang | tx count 与实际 TMA bytes 不匹配 |
+| TMA 后不 `mbarrier.wait` | 数值不稳定、首次运行就可能错 | WGMMA 读到未完成的 SMEM tile |
+| `warpgroup_mma_wait` 前就开始下一轮 TMA | 偶发 race、尤其大 K 时明显 | 单 buffer 被仍在读的 WGMMA 覆盖 |
+| `TRANSPOSE_B` 只改 descriptor 没改坐标 | 编译通过但结果错误 | TMA 读取区域方向不一致 |
+| `c_smem.store` 后缺少 `fence_async_shared` | C 偶尔是旧值或部分值 | generic proxy 写入尚未对 TMA async proxy 可见 |
+| TMA store 后缺少 `store_wait` | kernel 提前结束或后续读 C 不稳定 | TMA store 尚未完成全局写回 |
+
+### 自我检查
+
+1. **`M=208, N=416, BLOCK_M=BLOCK_N=128` 的 grid 是什么？**
+   - 答：`(ceil(208 / 128), ceil(416 / 128)) = (2, 4)`，共 8 个 CTA，每个 CTA 负责一个 C tile。
+2. **`pid_m=1, pid_n=3` 处理 C 的哪个区域？**
+   - 答：逻辑 tile 从 `(128, 384)` 开始，范围是 `[128:256, 384:512]`；因为全局 C 只有 `[208, 416]`，实际有效写回是 `[128:208, 384:416]`。
+3. **为什么同一个 mbarrier 在每次 K iteration 都要翻转 `phase`？**
+   - 答：barrier 的 completion parity 每完成一个 phase 就翻转。复用 barrier 时，下一次 wait 必须等待新的 parity，否则会命中旧的完成状态。
+4. **`TRANSPOSE_B=True` 时，为什么 `b_smem.permute((1, 0))` 不增加数据搬运？**
+   - 答：它只改变 SMEM tensor 的逻辑 view 和 layout，让 WGMMA 按转置后的索引读取，不生成新的 SMEM buffer。
+5. **为什么这个 single-buffer baseline 必须在每轮 `warpgroup_mma` 后立即 `warpgroup_mma_wait`？**
+   - 答：因为 A/B 只有一份 SMEM buffer；只有确认 WGMMA 已完成读取，下一轮 TMA 才能安全覆盖它。
+
+### 验证边界
+
+本机没有 Hopper runtime，因此只能做静态归档校验。实际运行需要 Hopper GPU 和对应版本的 Triton Gluon：
+
+```bash
+python blocked_matmul_wgmma_demo.py
+```
+
+静态检查命令：
+
+```bash
+python3 -m py_compile operators/code/triton/gluon/tutorials/05-wgmma.py
+git diff --check
+```
+
 ## 官方 05 完整拆解：WGMMA asynchronous pipeline
 
 ### 本次讲解位置
@@ -825,7 +1344,7 @@ Gluon 对 tcgen05 的隐式顺序保证包括：
 章节：`chapter_gluon_tensor_cores`（算子开发 / Triton Gluon）<br>
 小节：Warp-Group MMA / WGMMA asynchronous pipeline<br>
 知识点：`warpgroup_mma_init`、`warpgroup_mma`、`warpgroup_mma_wait`、`deps`、双缓冲 operand、WGMMA 与 TMA overlap<br>
-上次：WGMMA 的 A/B/C 位置约束、instruction shape 与一次同步 MMA<br>
+上次：官方 blocked matmul 的二维 tile grid、K-loop、TMA 尾块与 mbarrier phase<br>
 下次：在 WGMMA 流水中同时异步化 TMA 的多阶段加载，并进一步做 warp specialization<br>
 PTX：`wgmma.mma_async`、commit-group wait<br>
 官方源码：[`05-wgmma.py`](code/triton/gluon/tutorials/05-wgmma.py)<br>
