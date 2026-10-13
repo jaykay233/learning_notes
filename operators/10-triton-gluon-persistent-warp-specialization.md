@@ -882,6 +882,401 @@ Persistent 调度、buffer 轮转和 epilogue 拆分都不得改变这个结果�
 5. **哪些情况下 persistent 版本可能更慢？**
    答：静态 tile 分配负载不均、Grouped 顺序降低局部性、tile 数太少、SMEM/TMEM 或寄存器占用压低利用率，以及 epilogue/load overlap 不足以抵消调度成本时。
 
+---
+
+## Blackwell GEMM 的三角色 Warp Specialization：TMA → tcgen05 → TMEM epilogue
+
+### 本次讲解位置
+
+章节：`chapter_gluon_scheduling`（算子开发 / Triton Gluon）<br>
+小节：官方 `warp-specialization.py` 的 Blackwell persistent matmul<br>
+知识点：load / MMA / epilogue 三分区协作；K 操作数环形缓冲；双 accumulator；N 方向四分片写回<br>
+上次：persistent scheduler 把输出 tile 派给 CTA；elementwise warp specialization 把 load、compute、store 分工<br>
+下次：Blackwell CLC 如何把静态 persistent 派工改为硬件动态领活；再进入 TMA gather/scatter 与 multi-CTA GEMM<br>
+PTX：教程未规定 PTX 小节编号；本段对应 Blackwell TMA、mbarrier、tcgen05 MMA 与 TMEM
+
+官方页面：[Warp Specialization](https://triton-lang.org/main/getting-started/tutorials/gluon/warp-specialization.html)。归档代码：[08-warp-specialization.py](code/triton/gluon/tutorials/08-warp-specialization.py)，来源 revision 见 [PROVENANCE.md](code/triton/gluon/PROVENANCE.md)。
+
+### 为什么现在讲这个
+
+前面我们把 warp specialization 学成“一个 warp 组搬数据，另一个 warp 组计算，再由第三组写回”。elementwise add 的中间结果很小，两个 shared-memory 队列就足以理解 producer/consumer。GEMM 则同时有 **K 维 TMA 操作数流、异步 tcgen05 累加、跨输出 tile 的 TMEM accumulator 交接、异步 TMA 写回**。只会背角色名仍然回答不了：什么时候能复用 A/B buffer？什么时候能复用 accumulator？写回尚未完成时能否覆盖 shared-memory source？
+
+本节用官方 Blackwell GEMM 把这三种不同生命周期拆开。它防止的不是抽象的“同步错误”，而是三类具体 race：TMA 覆盖 MMA 尚在读取的 operand、MMA 覆盖 epilogue 尚未读走的 accumulator、以及 epilogue 在前一次 TMA store 尚未读完时覆盖 store source。
+
+### 心智模型：不是一个循环，而是三位各自推进的工人
+
+每个 CTA 里有三个分区，它们各自按同一个 tile scheduler 推进，但不会在每个阶段全 CTA 同步：
+
+```text
+load worker:    global A/B --TMA--> SMEM operand ring (num_buffers 个槽)
+                                      |
+                                      | load_ready / load_empty mbarrier
+                                      v
+MMA worker:      tcgen05 MMA --> 双缓冲 TMEM accumulator (2 个槽)
+                                      |
+                                      | acc_ready / acc_empty mbarrier
+                                      v
+epilogue default: TMEM load -> fp16 downcast -> 小块 SMEM -> TMA store -> global C
+```
+
+因此，时间线上可以出现：load 正在搬 tile `t+1` 的 K-slice，MMA 正在消费 tile `t` 的 operand，epilogue 正在把 tile `t-1` 写回。这里的“并行”是 warp/硬件异步队列上的重叠机会，不承诺任意时刻三个阶段都满速，也不保证比 cuBLAS 快。
+
+### 先认清四块存储与两对协议
+
+以教程的参数 `BLOCK_M=128, BLOCK_N=256, BLOCK_K=64, num_buffers=4, SUBTILE_FACTOR=4` 为例：
+
+| 资源 | 形状 / 位置 | 谁写、谁读 | 释放/就绪协议 |
+|---|---|---|---|
+| A operand ring | `[num_buffers, 128, 64]`，SMEM | load 的 TMA 写；MMA 读 | `load_ready_bars` 通知可读；tcgen05 完成后 `load_empty_bars` 通知可复用 |
+| B operand ring | `[num_buffers, 64, 256]`，SMEM | load 的 TMA 写；MMA 读 | 与 A 使用同一槽位、同一 ready/empty barrier；ready 的 expected bytes 是 A+B 两块总字节数 |
+| accumulator ring | `[2, 128, 256]`，TMEM，fp32 | MMA 累加写；epilogue load | `acc_ready_bars` 表示整块 K 累加可读；`acc_empty_bars` 表示相应 TMEM 槽可再次使用 |
+| epilogue staging | `[128, 64]`，SMEM，fp16 | epilogue 写；TMA store 读 | `tma.store_wait(0)` 才允许覆盖这个共享的 store source |
+
+`num_buffers` 是 **A/B 的 K 流水深度**；TMEM accumulator 数量在这个实现中固定为 2。不要把“4 个 operand buffer”误读成“4 个 accumulator”。
+
+两对 mbarrier 方向不同：
+
+| barrier | producer 发出 | consumer 等待 | 证明什么 |
+|---|---|---|---|
+| load ready | TMA `expect` + 两次 `async_load` 完成 | MMA `wait` | A、B 两块都搬完，可以开始 tcgen05 |
+| load empty | tcgen05 work 经 `tcgen05_commit` 完成 | load worker `wait` | MMA 不再读该 operand 槽，可以让 TMA 覆盖它 |
+| acc ready | 对整段 K 的 tcgen05 累加 `commit` 完成 | epilogue `wait` | TMEM 中的完整输出 tile 可读取 |
+| acc empty | epilogue 读出 TMEM tile 后 `arrive` | MMA `wait` | 该 TMEM 槽可以在后续 generation 中复用 |
+
+特别注意：`tcgen05_mma(...)` 是异步工作。紧跟着发出指令，不等于 operand 已经不再被硬件读取；empty 必须和 `tcgen05_commit` 绑定，不能在“发起 MMA”后立刻普通 `arrive`。
+
+### Counter 与 phase：环形索引绕回时，generation 也必须翻转
+
+源码里的 `Counter` 只有三个字段：`index` 选 barrier/buffer 槽，`phase` 选该槽的哪一代，`num_barriers` 是槽数。`next()` 每前进一步就增加 index；只有 index 绕回 0 时，phase 才用 XOR 1 翻转。mbarrier 初始化后初始 phase 1 已完成，因此 producer 可以先等 phase 1 开始填第一轮；consumer 对“第一笔真正的数据”从 phase 0 等起。
+
+用 `K=304, BLOCK_K=64, num_buffers=3` 看同一输出 tile 的 operand ring：
+
+| K-slice `j` | K 起点 | 本片有效 K | 槽 `j % 3` | load worker 等 empty phase | MMA 等 ready phase |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0 | 64 | 0 | 1（初始化时可首次填充） | 0（第一代 TMA 完成） |
+| 1 | 64 | 64 | 1 | 1 | 0 |
+| 2 | 128 | 64 | 2 | 1 | 0 |
+| 3 | 192 | 64 | 0 | 0（复用槽 0 的下一代） | 1（槽 0 的下一代数据） |
+| 4 | 256 | 48 | 1 | 0 | 1 |
+
+最后一片从 256 到 303 只有 48 个逻辑 K 值；descriptor 负责边界处理。表里 phase 是 **每个参与者自己的 Counter 状态**，不是让 load 与 MMA 用同一个 phase 数值。消费者完成一片后，MMA commit 对应的 empty；producer 绕回旧槽前必须等到那次完成。这就是“环形 buffer 不覆盖在途数据”的可检查不变量。
+
+`mbarrier.expect(ready, bytes_A + bytes_B)` 先声明这一代 ready barrier 要等多少字节，再发两条 TMA load；只有两块异步传输合计满足期望，ready 才能唤醒 MMA。每条 A/B load 的坐标分别是 `[off_m, k]` 和 `[k, off_n]`。
+
+### 三个 partition 在代码里各自做什么
+
+1. **`matmul_load_partition`**：初始化 phase=1 的 operand Counter；按 scheduler 遍历输出 tile，再按 K 遍历。等 operand 槽 empty，设置 ready 的字节期望，同时向 A/B 目标槽发 TMA。发起后就继续排后续传输，直到环形槽需要等待消费者释放。
+2. **`matmul_mma_partition`**：load consumer Counter 从 phase=0 开始。每个输出 tile 先拿到一个 accumulator 槽；每个 K-slice 等 ready，调用 `tcgen05_mma`。第一片 `use_acc=False` 初始化累加器，后续片 `True` 累加；每次 `tcgen05_commit(load_empty)` 把 operand 的释放和异步 MMA 完成联系起来。整个 K loop 结束后，再 commit 一次 `acc_ready`，公布完整 accumulator tile。
+3. **`matmul_epilogue_partition`**（default partition）：等 accumulator ready，从 TMEM load 整个 fp32 tile，按输出 dtype 转换并拆成 N 方向子 tile。单个 `[128,64]` SMEM staging tile 依次交给 TMA 写回。因为这个 SMEM 暂存区只有一个，覆盖前必须 `tma.store_wait(pendings=0)`；这和 acc mbarrier 是不同资源的生命周期。
+
+三个分区都用同一个 `SchedulerImpl.initialize(C.shape[0], C.shape[1], BLOCK_M, BLOCK_N)`。它们必须以相同 tile 次序、相同 tile 数协作；否则 producer 可能永远等不到某块 tile，或消费者把别的 tile 当成当前 tile。grid 是 `(min(num_sms, num_output_tiles),)`，因此 CTA 是 persistent tile worker。
+
+### 为什么把 N 切成四片：用额外 store 换回共享内存空间
+
+完整输出 tile 是 `128 × 256` 个 fp16。若一次性 staging 到 SMEM，需要：
+
+```text
+128 × 256 × 2 bytes = 65,536 bytes = 64 KiB
+```
+
+factor=4 后，`SPLIT_N = 256 / 4 = 64`，每次 staging：
+
+```text
+128 × 64 × 2 bytes = 16,384 bytes = 16 KiB
+```
+
+所以 epilogue 暂存 footprint 降为四分之一（省 48 KiB/CTA），代价是每个输出 tile 发 4 个 TMA store，而非 1 个。`_split_n` 用 reshape/permute/split 保持 N 上连续的元素仍由合适线程持有；官方注释明确限定它适用于 `BLOCK_M=128, num_warps=4` 这个 layout 假设，不是任意形状的通用 split 工具。
+
+`acc_smem.store(...)` 后的 `fence_async_shared()` 把 generic shared-memory store 与异步 TMA store 的 proxy 顺序接起来。第一次 subtile store 发出后，源码在后续 stores 期间让 `acc_empty` 提前释放已从 TMEM 读出的 accumulator 槽；而复用唯一的 `acc_smem` 前仍然要等 TMA store 完成。**TMEM 可复用** 和 **SMEM store source 可覆盖** 是两件事，所以要两种独立同步。
+
+### Host wrapper 与可观察正确性
+
+完整可运行实现已归档在仓库文件 `operators/code/triton/gluon/tutorials/08-warp-specialization.py`。它包含本节的 partition / kernel、host wrapper 和 pytest。wrapper 建 A/B 的 Hopper/Blackwell shared layouts 与 TMA descriptors；C descriptor 的 block 宽度用 `BLOCK_N // SUBTILE_FACTOR`，但 scheduler 仍以完整的 `BLOCK_N` 分配逻辑输出 tile。测试用 `A @ B` 对比 C，容差 `rtol=1e-3, atol=1e-1`。
+
+下面是学习本节的完整代码路径（为便于离线复现，将核心实现完整列出；`07-persistence.py` 提供可参数化的 scheduler 类，文件也在同一归档目录）：
+
+```python
+import importlib
+import pytest
+import torch
+import triton
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+from triton.experimental.gluon.language.nvidia.hopper import tma, mbarrier
+from triton.experimental.gluon.language.nvidia.blackwell import (
+    TensorMemoryLayout,
+    tensor_memory_descriptor,
+    allocate_tensor_memory,
+    tcgen05_mma,
+    tcgen05_commit,
+)
+
+t7 = importlib.import_module("07-persistence")
+
+
+def is_blackwell():
+    target = triton.runtime.driver.active.get_current_target()
+    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] == 10
+
+
+
+# Helper class for passing arguments around partitions.
+@gluon.aggregate
+class PartitionArgs:
+    a_desc: tma.tensor_descriptor
+    b_desc: tma.tensor_descriptor
+    c_desc: tma.tensor_descriptor
+    a_bufs: gl.shared_memory_descriptor
+    b_bufs: gl.shared_memory_descriptor
+    load_empty_bars: gl.shared_memory_descriptor
+    load_ready_bars: gl.shared_memory_descriptor
+    acc_bufs: tensor_memory_descriptor
+    acc_empty_bars: gl.shared_memory_descriptor
+    acc_ready_bars: gl.shared_memory_descriptor
+    SUBTILE_FACTOR: gl.constexpr
+    num_warps: gl.constexpr
+
+
+# Counter abstraction for tracking barrier index and phase.
+@gluon.aggregate
+class Counter:
+    index: gl.tensor
+    phase: gl.tensor
+    num_barriers: gl.constexpr
+
+    @gluon.jit
+    def create(phase, num_barriers: gl.constexpr):
+        return Counter(gl.to_tensor(0), gl.to_tensor(phase), num_barriers)
+
+    @gluon.must_use_result
+    @gluon.jit
+    def next(self, pred=True):
+        incr = self.index + gl.where(pred, 1, 0)
+        rollover = incr == self.num_barriers
+        index = gl.where(rollover, 0, incr)
+        phase = gl.where(rollover, self.phase ^ 1, self.phase)
+        return Counter(index, phase, self.num_barriers)
+
+
+@gluon.jit
+def matmul_load_partition(p, SchedulerImpl: gl.constexpr):
+    BLOCK_M: gl.constexpr = p.a_desc.block_type.shape[0]
+    BLOCK_N: gl.constexpr = p.b_desc.block_type.shape[1]
+    BLOCK_K: gl.constexpr = p.a_desc.block_type.shape[1]
+    K = p.a_desc.shape[1]
+
+    empty_bars = p.load_empty_bars
+    ready_bars = p.load_ready_bars
+    state = Counter.create(1, empty_bars.shape[0])
+
+    # Just loop over all tiles and issue loads.
+    scheduler = SchedulerImpl.initialize(p.c_desc.shape[0], p.c_desc.shape[1], BLOCK_M, BLOCK_N)
+    for idx in range(scheduler.get_num_tiles()):
+        pid_m, pid_n = scheduler.get_tile(idx)
+        off_m = pid_m * BLOCK_M
+        off_n = pid_n * BLOCK_N
+        for k in range(0, K, BLOCK_K):
+            # Acquire buffers, issue loads, and complete them asynchronously.
+            bar = ready_bars.index(state.index)
+            mbarrier.wait(empty_bars.index(state.index), state.phase)
+            mbarrier.expect(bar, p.a_desc.block_type.nbytes + p.b_desc.block_type.nbytes)
+            tma.async_load(p.a_desc, [off_m, k], bar, p.a_bufs.index(state.index))
+            tma.async_load(p.b_desc, [k, off_n], bar, p.b_bufs.index(state.index))
+            state = state.next()
+
+
+@gluon.jit
+def matmul_mma_partition(p, SchedulerImpl: gl.constexpr):
+    BLOCK_M: gl.constexpr = p.a_desc.block_type.shape[0]
+    BLOCK_N: gl.constexpr = p.b_desc.block_type.shape[1]
+    BLOCK_K: gl.constexpr = p.a_desc.block_type.shape[1]
+    K = p.a_desc.shape[1]
+
+    load_empty_bars = p.load_empty_bars
+    load_ready_bars = p.load_ready_bars
+    load_state = Counter.create(0, load_empty_bars.shape[0])
+
+    acc_empty_bars = p.acc_empty_bars
+    acc_ready_bars = p.acc_ready_bars
+    acc_state = Counter.create(1, p.acc_empty_bars.shape[0])
+
+    scheduler = SchedulerImpl.initialize(p.c_desc.shape[0], p.c_desc.shape[1], BLOCK_M, BLOCK_N)
+    for _ in range(scheduler.get_num_tiles()):
+        # Acquire the accumulator for the entire inner loop.
+        mbarrier.wait(acc_empty_bars.index(acc_state.index), acc_state.phase)
+        acc_buf = p.acc_bufs.index(acc_state.index)
+        use_acc = False
+        for k in range(0, K, BLOCK_K):
+            # Acquire operands, issue MMA, and complete asynchronously.
+            mbarrier.wait(load_ready_bars.index(load_state.index), load_state.phase)
+            tcgen05_mma(p.a_bufs.index(load_state.index), p.b_bufs.index(load_state.index), acc_buf, use_acc=use_acc)
+            tcgen05_commit(load_empty_bars.index(load_state.index))
+            load_state = load_state.next()
+            use_acc = True
+        # Complete the accumulator asynchronously.
+        tcgen05_commit(acc_ready_bars.index(acc_state.index))
+        acc_state = acc_state.next()
+
+
+# Helper for splitting a tensor along N. For our kernel, this only works for
+# BLOCK_M=128 and num_warps=4, where all BLOCK_N elements are contiguously
+# mapped to the same thread.
+@gluon.jit
+def _split_n(x, SUBTILE_FACTOR: gl.constexpr):
+    split_count: gl.constexpr = SUBTILE_FACTOR.bit_length() - 1  # log2
+    xs = (x, )
+    for _ in gl.static_range(split_count):
+        next_xs = ()
+        for j in gl.static_range(len(xs)):
+            x = xs[j]
+            # Reshape to (M, 2, N//2) then permute so that tensor elements
+            # remain contiguous along N.
+            next_xs += x.reshape(x.shape[0], 2, x.shape[1] // 2).permute(0, 2, 1).split()
+        xs = next_xs
+    return xs
+
+
+@gluon.jit
+def matmul_epilogue_partition(p, SchedulerImpl: gl.constexpr):
+    BLOCK_M: gl.constexpr = p.a_desc.block_type.shape[0]
+    BLOCK_N: gl.constexpr = p.b_desc.block_type.shape[1]
+    dtype: gl.constexpr = p.c_desc.dtype
+
+    acc_empty_bars = p.acc_empty_bars
+    acc_ready_bars = p.acc_ready_bars
+    acc_state = Counter.create(0, p.acc_empty_bars.shape[0])
+    SPLIT_N: gl.constexpr = BLOCK_N // p.SUBTILE_FACTOR
+    acc_smem = gl.allocate_shared_memory(dtype, [BLOCK_M, SPLIT_N], p.c_desc.layout)
+
+    scheduler = SchedulerImpl.initialize(p.c_desc.shape[0], p.c_desc.shape[1], BLOCK_M, BLOCK_N)
+    for idx in range(scheduler.get_num_tiles()):
+        pid_m, pid_n = scheduler.get_tile(idx)
+        off_m = pid_m * BLOCK_M
+        off_n = pid_n * BLOCK_N
+
+        # Wait for the accumulator. Since BLOCK_N=256, we need to interleave
+        # the TMEM loads with the SMEM stores to avoid spilling.
+        mbarrier.wait(acc_ready_bars.index(acc_state.index), acc_state.phase)
+        acc = p.acc_bufs.index(acc_state.index).load()
+        acc_state = acc_state.next()
+
+        accs = _split_n(acc, p.SUBTILE_FACTOR)
+        for i in gl.static_range(len(accs)):
+            acc = accs[i].to(dtype)
+            tma.store_wait(pendings=0)  # overlap with downcast
+            acc_smem.store(acc.to(dtype))
+            # Arrive after the first SMEM store and rely on ptxas to interleave.
+            if i == 0:
+                mbarrier.arrive(acc_empty_bars.index(acc_state.index), count=1)
+            fence_async_shared()
+            tma.async_store(p.c_desc, [off_m, off_n + SPLIT_N * i], acc_smem)
+    # Overlap the last store with the wait, then wait for the last store here.
+    tma.store_wait(pendings=0)
+
+
+@gluon.jit
+def matmul_warp_specialized_kernel(a_desc, b_desc, c_desc, SchedulerImpl: gl.constexpr, num_buffers: gl.constexpr,
+                                   SUBTILE_FACTOR: gl.constexpr, num_warps: gl.constexpr):
+    BLOCK_M: gl.constexpr = a_desc.block_type.shape[0]
+    BLOCK_N: gl.constexpr = b_desc.block_type.shape[1]
+    dtype: gl.constexpr = a_desc.dtype
+
+    a_bufs = gl.allocate_shared_memory(dtype, [num_buffers] + a_desc.block_type.shape, a_desc.layout)
+    b_bufs = gl.allocate_shared_memory(dtype, [num_buffers] + b_desc.block_type.shape, b_desc.layout)
+    load_empty_bars = gl.allocate_shared_memory(gl.int64, [num_buffers, 1], mbarrier.MBarrierLayout())
+    load_ready_bars = gl.allocate_shared_memory(gl.int64, [num_buffers, 1], mbarrier.MBarrierLayout())
+    for i in gl.static_range(num_buffers):
+        mbarrier.init(load_empty_bars.index(i), count=1)
+        mbarrier.init(load_ready_bars.index(i), count=1)
+
+    tmem_layout: gl.constexpr = TensorMemoryLayout([BLOCK_M, BLOCK_N], col_stride=1)
+    acc_bufs = allocate_tensor_memory(gl.float32, [2, BLOCK_M, BLOCK_N], tmem_layout)
+    acc_empty_bars = gl.allocate_shared_memory(gl.int64, [2, 1], mbarrier.MBarrierLayout())
+    acc_ready_bars = gl.allocate_shared_memory(gl.int64, [2, 1], mbarrier.MBarrierLayout())
+    for i in gl.static_range(2):
+        mbarrier.init(acc_empty_bars.index(i), count=1)
+        mbarrier.init(acc_ready_bars.index(i), count=1)
+
+    p = PartitionArgs(a_desc, b_desc, c_desc, a_bufs, b_bufs, load_empty_bars, load_ready_bars, acc_bufs,
+                      acc_empty_bars, acc_ready_bars, SUBTILE_FACTOR, num_warps)
+    gl.warp_specialize([
+        (matmul_epilogue_partition, (p, SchedulerImpl)),
+        (matmul_load_partition, (p, SchedulerImpl)),
+        (matmul_mma_partition, (p, SchedulerImpl)),
+    ], [1, 1], [24, 24])
+
+
+def matmul_warp_specialized(A, B, C, BLOCK_M, BLOCK_N, BLOCK_K, num_buffers, SUBTILE_FACTOR, num_warps, SchedulerImpl):
+    M, N = C.shape
+
+    a_layout = gl.NVMMASharedLayout.get_default_for([BLOCK_M, BLOCK_K], gl.float16)
+    b_layout = gl.NVMMASharedLayout.get_default_for([BLOCK_K, BLOCK_N], gl.float16)
+    c_layout = gl.NVMMASharedLayout.get_default_for([BLOCK_M, BLOCK_N], gl.float16)
+
+    a_desc = TensorDescriptor.from_tensor(A, [BLOCK_M, BLOCK_K], a_layout)
+    b_desc = TensorDescriptor.from_tensor(B, [BLOCK_K, BLOCK_N], b_layout)
+    # Reduce the block size of the C tensor descriptor to account for the subtiled epilogue.
+    c_desc = TensorDescriptor.from_tensor(C, [BLOCK_M, BLOCK_N // SUBTILE_FACTOR], c_layout)
+
+    num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+    num_pid = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    grid = (min(num_sms, num_pid), )
+    matmul_warp_specialized_kernel[grid](a_desc, b_desc, c_desc, SchedulerImpl, num_buffers, SUBTILE_FACTOR,
+                                         num_warps=num_warps)
+
+
+@pytest.mark.parametrize("M, N, K", [(208, 416, 304), (2000, 1000, 2000)])
+@pytest.mark.parametrize("BLOCK_M, BLOCK_N, BLOCK_K", [(128, 256, 64)])
+@pytest.mark.parametrize("num_buffers", [2, 3, 4])
+@pytest.mark.parametrize("SUBTILE_FACTOR", [4])
+@pytest.mark.parametrize("num_warps", [4])
+@pytest.mark.parametrize("SchedulerImpl", t7.schedulers)
+@pytest.mark.skipif(not is_blackwell(), reason="Requires Blackwell")
+def test_matmul_warp_specialized(M, N, K, BLOCK_M, BLOCK_N, BLOCK_K, num_buffers, SUBTILE_FACTOR, num_warps,
+                                 SchedulerImpl):
+    torch.manual_seed(0)
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    C = torch.empty(M, N, device="cuda", dtype=torch.float16)
+    matmul_warp_specialized(A, B, C, BLOCK_M, BLOCK_N, BLOCK_K, num_buffers, SUBTILE_FACTOR, num_warps, SchedulerImpl)
+    torch.testing.assert_close(A @ B, C, rtol=1e-3, atol=1e-1)
+```
+
+在仓库根目录运行：
+
+```bash
+pytest -q operators/code/triton/gluon/tutorials/08-warp-specialization.py -k test_matmul_warp_specialized
+```
+
+Blackwell 上预期 18 个参数组合通过：2 个矩阵形状 × 3 种 `num_buffers` × 3 种 scheduler。Hopper 上这些 Blackwell-only GEMM cases 会被 skip。该命令需要 CUDA、PyTorch、Triton；无 GPU 的环境无法验证 tcgen05、mbarrier phase race 或性能。
+
+### 常见错误：症状能告诉你坏的是哪条生命线
+
+| 错误 | 常见症状 | 原因 |
+|---|---|---|
+| 用 `k % num_buffers` 选槽但绕回不翻 phase | 第 4 个 K-slice 起 hang，或旧数据被误认为新 ready | 同一 barrier 地址被多代复用，index 不足以区分 generation |
+| MMA 发出后马上释放 load buffer | 偶发结果错误、TMA/MMA 竞态 | tcgen05 异步；empty 必须在其完成协议之后 |
+| 把 load-ready 和 load-empty 方向弄反 | producer/consumer 一直等，或覆盖未消费数据 | ready=consumer 可读；empty=producer 可写 |
+| `use_acc=True` 用在首个 K-slice | 累加初值未定义，输出错；正确首片应初始化 | TMEM accumulator 首次写入不是对旧值累加 |
+| 忘了 `tma.store_wait(0)` 就覆盖 `acc_smem` | store 输出随机损坏或只在高负载时失败 | TMA 可能仍在读上一片 SMEM source |
+| 把 `num_buffers` 当成 accumulator 数量 | 不匹配的 barrier/TMEM 索引或资源浪费 | operand ring 深度和 accumulator ping-pong 数是两套参数 |
+| 任意改变 `_split_n` 的布局或 tile 形状 | 编译错误、layout convert 开销或写回次序错 | helper 的线程连续性假设仅对教程指定配置成立 |
+| 期待 `num_buffers=4` 对任何 K 都更快 | 小 K 反而变慢 | pipeline 级数有资源和同步成本；工作量短时无法摊薄 |
+
+### 自我检查（附答案）
+
+1. **为什么有了 `load_ready` 还需要 `load_empty`？**
+   - 答：ready 只说明本代 operand 已搬好；empty 才证明 MMA 不再读旧槽，TMA 可以安全覆盖下一代。
+2. **`K=304, BLOCK_K=64, num_buffers=3` 的第 4 片落在哪？**
+   - 答：slice 3，起点 192，槽 0；producer 等 empty phase 0，consumer 等 ready phase 1；最后一片才是起点 256、长度 48 的 slice 4。
+3. **为什么 accumulator 有 2 个 buffer，而 operand 有 3 或 4 个？**
+   - 答：K 操作数流需要更深环形队列隐藏 TMA/MMA 延迟；输出累加器只需 ping-pong，让 epilogue 处理一个时 MMA 填另一个。
+4. **四分 N 后，减少了什么，增加了什么？**
+   - 答：单次 epilogue SMEM 从 64 KiB 降到 16 KiB；每 tile TMA store 从 1 次变为 4 次，腾出预算换更深 operand buffering/overlap。
+5. **为什么 `acc_empty` 不能代替 `tma.store_wait(0)`？**
+   - 答：前者释放 TMEM accumulator；后者确保 TMA 不再读取共享内存中的 store source。它们保护不同内存资源。
+
 ### 本节进度
 
 - [x] 一个 CTA 处理多个输出 tile 的 persistent grid 与静态 scheduler。
@@ -890,5 +1285,6 @@ Persistent 调度、buffer 轮转和 epilogue 拆分都不得改变这个结果�
 - [x] persistent accumulator/barrier 生命周期，以及 `take_result()` 的跨 tile 重置。
 - [x] 用额外 B-buffer 承接 epilogue TMA store，并在 buffer 复用前等待 store 完成。
 - [x] 性能数据的适用边界：persistent/pipeline 并非对所有 shape 单调变快。
+- [x] Blackwell 三角色 GEMM：TMA operand ring、tcgen05/TMEM 双 accumulator、分片 TMA epilogue。
 
 下一知识点：Blackwell Cluster Launch Control 如何在 persistent 静态派工与硬件动态领活之间折中；随后学习 TMA gather/scatter 与 multi-CTA GEMM。
