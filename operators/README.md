@@ -60,7 +60,7 @@ operators/
 | [05-triton-broadcasting-and-chained-comparisons.md](05-triton-broadcasting-and-chained-comparisons.md) | Triton broadcasting：左补一、维度相等或为 1、虚拟扩展成本边界；chained comparisons：逐对比较、elementwise AND、操作数只求值一次与 runtime 不短路 |
 | [06-triton-differences-from-numpy.md](06-triton-differences-from-numpy.md) | Triton 与 NumPy/Python 的差异：runtime 整数除法/取模向零截断、`tl.constexpr` 的 Python 取整、越界 float-to-int cast 与变量作用域 |
 | [07-triton-gluon-programming-model-and-layouts.md](07-triton-gluon-programming-model-and-layouts.md) | Gluon 编程模型与 layouts：`BlockedLayout`、`SliceLayout`、`NVMMASharedLayout`、distributed layout 与显式 layout 控制 |
-| [08-triton-gluon-async-tma-and-pipelining.md](08-triton-gluon-async-tma-and-pipelining.md) | Gluon async copy、TMA 与软件流水：`cp.async`、commit group、`mbarrier`、tensor descriptor、代理 fence 与多缓冲 |
+| [08-triton-gluon-async-tma-and-pipelining.md](08-triton-gluon-async-tma-and-pipelining.md) | Gluon async copy、TMA 与软件流水：`cp.async`、commit group、`mbarrier`、tensor descriptor、代理 fence、TMA store 两个完成点与三缓冲 elementwise add |
 | [09-triton-gluon-wgmma-and-tcgen05.md](09-triton-gluon-wgmma-and-tcgen05.md) | Hopper WGMMA 与 Blackwell tcgen05：warpgroup MMA、异步等待、Tensor Memory、TMEM layout 与 K-loop |
 | [10-triton-gluon-persistent-warp-specialization.md](10-triton-gluon-persistent-warp-specialization.md) | Persistent kernel 与 `gl.warp_specialize`：grouped scheduler、`@gluon.aggregate`、producer/MMA/epilogue 分工与 barrier phase |
 | [11-triton-gluon-blackwell-dataflow-and-convolution.md](11-triton-gluon-blackwell-dataflow-and-convolution.md) | Blackwell 数据流与卷积：TMA gather/scatter、`tcgen05_copy`、block-scaled MMA、CLC、TMA im2col 与 implicit GEMM |

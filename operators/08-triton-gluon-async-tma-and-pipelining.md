@@ -581,3 +581,544 @@ TMA read/write -> 等待完成 -> generic proxy 复用 buffer
    - 答：`[4,8]` 的内层偏移是 16 bytes，合法；`[8,4]` 只有 8 bytes，不满足最内层 16-byte 对齐。
 5. **为什么 TMA 与普通 shared store 之间可能需要 fence？**
    - 答：TMA 属于 async proxy，普通 shared store 属于 generic proxy；跨代理访问 shared memory 需要建立顺序和可见性。
+
+## 官方教程完整拆解：descriptor、read/store 完成点与三缓冲流水线
+
+### 本次讲解位置
+
+章节：`chapter_gluon_async_dataflow`（算子开发 / Triton Gluon）<br>
+小节：官方 `TMA in Gluon` 的 pipelined elementwise add<br>
+知识点：`TensorDescriptor`、每个 buffer 一个 mbarrier、TMA store 的两个完成点、三缓冲流水线<br>
+上次：`cp.async` 的 commit group，以及 1D TMA memcpy 的 read/store 基本路径<br>
+下次：WGMMA / `tcgen05` 如何消费已经落到 shared memory 的 tile<br>
+PTX：TMA async proxy、`mbarrier` phase/byte completion、async-store commit group、generic/async proxy fence
+
+### 为什么现在讲这个
+
+前一节的 1D TMA 例程虽然把数据搬对了，但它仍是一条串行路径：
+
+```text
+TMA 读 A/B -> 等 TMA -> 计算 -> 写 C -> 等 store -> 下一轮
+```
+
+这样 TMA 的异步能力没有真正发挥出来。要形成流水线，必须同时维护两件事：让后续 tile 的 TMA read 提前发出，并且判断当前 buffer 什么时候可以被计算或覆盖。只加多缓冲但不维护 barrier phase，会出现“等待永远不返回”或“结果偶尔用到旧 tile”；只提前发 store 但不等待 store 读完 `c_smem`，又会覆盖正在被 TMA 读取的数据。
+
+这一节用一个完整的 `a + b -> c` 例子说明三件事：
+
+| 问题 | 本节机制 |
+|---|---|
+| 谁负责把 global tile 搬到 shared memory | `TensorDescriptor` + `tma.async_load` |
+| 消费者怎么知道 read 已完成 | 每个 buffer 一个 `mbarrier`，按 byte 数完成 |
+| 何时能复用 store staging buffer | `tma.store_wait(pendings=0)` 等待 TMA 已读完 shared memory |
+
+### 心智模型：descriptor 是“搬运合同”，不是数据本身
+
+普通 global load 需要 lane 自己计算地址和 mask：
+
+```text
+lane -> 计算 64-bit 地址 -> 计算越界 mask -> LDG -> register
+```
+
+TMA 把地址生成从 kernel 移到 descriptor：
+
+```text
+TensorDescriptor:
+  base pointer
+  global shape / strides
+  dtype
+  block_shape
+  shared-memory layout
+
+kernel:
+  只给 block 的起始坐标
+  TMA 硬件按 block_shape 搬运
+```
+
+例如 descriptor 的 global shape 是 `[xnumel, ynumel]`，`block_shape=[32, 64]`。当请求坐标是 `[xoff, yoff]` 时，TMA 搬的是：
+
+```text
+global[xoff : xoff + 32, yoff : yoff + 64]
+```
+
+坐标是元素坐标，不是 byte offset。descriptor 的 shape 会自动处理边界：越界 read 不会把非法地址变成访问，越界 write 也不会写出 tensor 外。这样 kernel 不需要为每个元素生成 mask。
+
+TMA 的代价是地址灵活性下降。它要求 global tensor 的 base/stride、block shape 和 shared-memory layout 满足硬件约束；如果 descriptor 的布局条件不满足，就不能把普通 load 机械替换成 TMA。
+
+### 完整可运行代码：三缓冲 elementwise add
+
+下面的代码是官方 04 示例中与 TMA 流水线有关部分的完整版本，移到单个文件即可运行。它不依赖前一节 03 的辅助函数；末尾使用确定性的输入做正确性检查。
+
+```python
+from __future__ import annotations
+
+import torch
+import triton
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+from triton.experimental.gluon.language.nvidia.hopper import (
+    fence_async_shared,
+    mbarrier,
+    tma,
+)
+
+
+@gluon.jit
+def issue_loads(
+    copy_index,
+    a_desc,
+    b_desc,
+    a_smem,
+    b_smem,
+    bars,
+    xoff,
+    YBLOCK: gl.constexpr,
+    num_buffers: gl.constexpr,
+):
+    yoff = copy_index * YBLOCK
+    bar = bars.index(copy_index % num_buffers)
+
+    # 两次 TMA read 共用同一个 barrier，所以 expect 的是两块 tile 的总字节数。
+    mbarrier.expect(
+        bar,
+        a_desc.block_type.nbytes + b_desc.block_type.nbytes,
+    )
+    tma.async_load(
+        a_desc,
+        [xoff, yoff],
+        bar,
+        a_smem.index(copy_index % num_buffers),
+    )
+    tma.async_load(
+        b_desc,
+        [xoff, yoff],
+        bar,
+        b_smem.index(copy_index % num_buffers),
+    )
+    return copy_index + 1
+
+
+@gluon.jit
+def perform_add(
+    read_index,
+    bars,
+    a_smem,
+    b_smem,
+    c_smem,
+    c_desc,
+    xoff,
+    layout: gl.constexpr,
+    YBLOCK: gl.constexpr,
+    num_buffers: gl.constexpr,
+):
+    # 同一个 barrier slot 每被环形复用一次，phase 翻转一次。
+    read_phase = read_index // num_buffers & 1
+    mbarrier.wait(
+        bars.index(read_index % num_buffers),
+        read_phase,
+    )
+
+    a_val = a_smem.index(read_index % num_buffers).load(layout)
+    b_val = b_smem.index(read_index % num_buffers).load(layout)
+    c_val = a_val + b_val
+
+    yoff = read_index * YBLOCK
+
+    # 保证上一笔 TMA store 已经读完 c_smem，才允许覆盖它。
+    tma.store_wait(pendings=0)
+    c_smem.store(c_val)
+
+    # generic proxy 的 shared store 必须先对 async proxy 可见，
+    # TMA store 才能安全地从 c_smem 读取。
+    fence_async_shared()
+    tma.async_store(c_desc, [xoff, yoff], c_smem)
+    return read_index + 1
+
+
+@gluon.jit
+def elementwise_add_tma_kernel(
+    a_desc,
+    b_desc,
+    c_desc,
+    xnumel,
+    ynumel,
+    XBLOCK: gl.constexpr,
+    YBLOCK: gl.constexpr,
+    num_buffers: gl.constexpr,
+):
+    pid = gl.program_id(0)
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, 1], [1, 32], [1, 4], [1, 0]
+    )
+    xoff = pid * XBLOCK
+
+    dtype: gl.constexpr = a_desc.type.block_type.element_ty
+    a_smem = gl.allocate_shared_memory(
+        dtype,
+        [num_buffers, XBLOCK, YBLOCK],
+        a_desc.layout,
+    )
+    b_smem = gl.allocate_shared_memory(
+        dtype,
+        [num_buffers, XBLOCK, YBLOCK],
+        b_desc.layout,
+    )
+    c_smem = gl.allocate_shared_memory(
+        dtype,
+        [XBLOCK, YBLOCK],
+        c_desc.layout,
+    )
+
+    bars = gl.allocate_shared_memory(
+        gl.int64,
+        [num_buffers, 1],
+        mbarrier.MBarrierLayout(),
+    )
+    for i in gl.static_range(num_buffers):
+        mbarrier.init(bars.index(i), count=1)
+
+    copy_index = 0
+    read_index = 0
+
+    # Prologue：先发 num_buffers - 1 个 read，不等它们完成。
+    for _ in gl.static_range(num_buffers - 1):
+        copy_index = issue_loads(
+            copy_index,
+            a_desc,
+            b_desc,
+            a_smem,
+            b_smem,
+            bars,
+            xoff,
+            YBLOCK,
+            num_buffers,
+        )
+
+    # Steady state：发出一块新的 read，同时消费最早发出去的那一块。
+    for _ in range(
+        gl.cdiv(ynumel, YBLOCK) - (num_buffers - 1)
+    ):
+        copy_index = issue_loads(
+            copy_index,
+            a_desc,
+            b_desc,
+            a_smem,
+            b_smem,
+            bars,
+            xoff,
+            YBLOCK,
+            num_buffers,
+        )
+        read_index = perform_add(
+            read_index,
+            bars,
+            a_smem,
+            b_smem,
+            c_smem,
+            c_desc,
+            xoff,
+            layout,
+            YBLOCK,
+            num_buffers,
+        )
+
+    # Drain：清空仍在流水线里的最后 num_buffers - 1 个 tile。
+    for _ in gl.static_range(num_buffers - 1):
+        read_index = perform_add(
+            read_index,
+            bars,
+            a_smem,
+            b_smem,
+            c_smem,
+            c_desc,
+            xoff,
+            layout,
+            YBLOCK,
+            num_buffers,
+        )
+
+    for i in gl.static_range(num_buffers):
+        mbarrier.invalidate(bars.index(i))
+
+    # 等待最后一个 TMA store 读完 c_smem，之后 kernel 才能安全退出。
+    tma.store_wait(pendings=0)
+
+
+def elementwise_add_tma(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    XBLOCK: int = 32,
+    YBLOCK: int = 64,
+    num_buffers: int = 3,
+) -> None:
+    assert a.shape == b.shape == c.shape
+    xnumel, ynumel = a.shape
+    grid = (triton.cdiv(xnumel, XBLOCK),)
+
+    block_shape = [XBLOCK, YBLOCK]
+    layout = gl.NVMMASharedLayout.get_default_for(
+        block_shape,
+        gl.float32,
+    )
+
+    a_desc = TensorDescriptor.from_tensor(a, block_shape, layout)
+    b_desc = TensorDescriptor.from_tensor(b, block_shape, layout)
+    c_desc = TensorDescriptor.from_tensor(c, block_shape, layout)
+
+    elementwise_add_tma_kernel[grid](
+        a_desc,
+        b_desc,
+        c_desc,
+        xnumel,
+        ynumel,
+        XBLOCK,
+        YBLOCK,
+        num_buffers,
+    )
+
+
+if __name__ == "__main__":
+    if not torch.cuda.is_available():
+        raise RuntimeError("this example requires CUDA")
+    if torch.cuda.get_device_capability()[0] < 9:
+        raise RuntimeError("TMA requires Hopper or newer")
+
+    xnumel, ynumel = 256, 128
+    a = torch.arange(xnumel * ynumel, dtype=torch.float32, device="cuda")
+    a = a.reshape(xnumel, ynumel)
+    b = torch.ones_like(a)
+    c = torch.empty_like(a)
+
+    elementwise_add_tma(a, b, c, XBLOCK=32, YBLOCK=64, num_buffers=3)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(c, a + b, atol=0, rtol=0)
+    print("tma_add_ok:", tuple(c.shape), c[0, :4].tolist())
+```
+
+预期输出：
+
+```text
+tma_add_ok: (256, 128) [1.0, 2.0, 3.0, 4.0]
+```
+
+当前工作机如果没有 Hopper 或更新 GPU，只能做源码静态检查；不能声称已经完成 TMA runtime 验证。
+
+### 每个 buffer 为什么需要一个 mbarrier
+
+假设 `num_buffers=3`：
+
+```text
+a_smem shape = [3, 32, 64]
+b_smem shape = [3, 32, 64]
+bars shape   = [3, 1]
+```
+
+第 `n` 次 read 使用 slot：
+
+```text
+slot = n % 3
+```
+
+如果三个 slot 共用一个 barrier，就无法区分“slot 0 已到达”和“slot 2 已到达”。TMA read 完成顺序也不保证严格等于 issue 顺序，所以必须让 buffer 与完成事件一一对应。
+
+每个 barrier 的初始化计数是 `1`，但 TMA read 并不是简单调用一次 `arrive`。`mbarrier.expect(bar, bytes)` 先登记本次 transaction 一共会完成多少字节；TMA 完成一个 transaction 就减少对应 outstanding bytes。总字节数归零后，barrier 才完成当前 phase。
+
+在 `issue_loads` 中，A 和 B 共用本次 slot 的 barrier：
+
+```text
+expect_bytes = bytes(A tile) + bytes(B tile)
+```
+
+如果只写 A 的字节数，B 可能还没到齐就完成 phase；如果字节数写多了，消费者会永远等不到完成。
+
+### phase 公式怎么推出来
+
+代码中的公式是：
+
+```python
+read_phase = read_index // num_buffers & 1
+```
+
+拆成两个动作：
+
+```text
+slot      = read_index % num_buffers
+generation = read_index // num_buffers
+phase      = generation & 1
+```
+
+`slot` 决定操作哪块 shared memory；`generation` 表示同一个物理 slot 第几次被复用。mbarrier 的 phase 只保存 0/1 parity，所以每复用一次翻转一次。
+
+以 `num_buffers=3` 为例：
+
+| `read_index` | slot | generation | 等待 phase |
+|---:|---:|---:|---:|
+| 0 | 0 | 0 | 0 |
+| 1 | 1 | 0 | 0 |
+| 2 | 2 | 0 | 0 |
+| 3 | 0 | 1 | 1 |
+| 4 | 1 | 1 | 1 |
+| 5 | 2 | 1 | 1 |
+| 6 | 0 | 2 | 0 |
+| 7 | 1 | 2 | 0 |
+
+这不是“phase 0 和 phase 1 交替代表两个不同 buffer”。phase 是同一个 barrier 的代际 parity；buffer 由 `read_index % num_buffers` 决定，二者是两个维度。
+
+### 三缓冲的完整执行轨迹
+
+假设 CTA 负责 `ynumel / YBLOCK = 8` 个 tile，`num_buffers=3`：
+
+```text
+copy_index = 0
+read_index = 0
+```
+
+先做 prologue，发出 `3 - 1 = 2` 次 read：
+
+```text
+issue copy 0
+issue copy 1
+```
+
+之后 6 轮 steady state：
+
+| 轮次 | 新发 read | 同时消费 | 消费 buffer | 等待 phase |
+|---:|---:|---:|---:|---:|
+| 0 | copy 2 | read 0 | slot 0 | 0 |
+| 1 | copy 3 | read 1 | slot 1 | 0 |
+| 2 | copy 4 | read 2 | slot 2 | 0 |
+| 3 | copy 5 | read 3 | slot 0 | 1 |
+| 4 | copy 6 | read 4 | slot 1 | 1 |
+| 5 | copy 7 | read 5 | slot 2 | 1 |
+
+最后 drain 两次：
+
+```text
+consume read 6，等待 slot 0 phase 0
+consume read 7，等待 slot 1 phase 0
+```
+
+所以三缓冲的含义不是“同时计算三个 tile”，而是“最多提前发出 `num_buffers - 1 = 2` 个尚未消费的 read”。这样当前 tile 做 load 到 register、add、store 时，后面的 TMA read 已经可以在硬件 async proxy 上并行进行。
+
+### TMA store 的两个完成点
+
+TMA store 和 TMA read 的等待方式不同。TMA read 通过 mbarrier 告诉消费者“数据已经写进 shared memory”；TMA store 通过隐式 async-store commit group 跟踪自己。
+
+默认：
+
+```python
+tma.store_wait(pendings=0)
+```
+
+只保证 TMA 已经把源数据从 shared memory 读完，因此可以安全复用这块 `c_smem`。它不保证 tile 已经写到 global memory 并被其他 CTA 观察到。
+
+如果生产者 CTA 要通过 global memory 通知消费者 CTA，语义需要升级为：
+
+```python
+tma.store_wait(pendings=0, read_only=False)
+```
+
+两者差别是：
+
+```text
+默认 store_wait:
+  TMA 已读完 shared memory
+  -> 可以覆盖 c_smem
+  -> 不能据此宣称 global write 对其他 CTA 可见
+
+read_only=False:
+  再等待 global write 完成
+  -> 可以跨 CTA 用 global memory 传递数据
+```
+
+官方 message-passing 例程之所以在 `atomic_xchg(..., sem="release")` 前使用 `read_only=False`，就是因为接收 CTA 之后要通过 TMA 从 global memory 读回消息。如果生产 CTA 只等默认完成点就发布 ready 标志，接收 CTA 可能与尚未落盘的 TMA store 竞争。
+
+### 为什么 `c_smem` 复用前要先 `store_wait`
+
+`perform_add` 中是这个顺序：
+
+```text
+tma.store_wait(pendings=0)   # 上一笔 TMA store 已读完 c_smem
+c_smem.store(c_val)          # generic proxy 覆盖 shared memory
+fence_async_shared()         # 让 async proxy 看见 generic store
+tma.async_store(...)         # 发出新的 TMA store
+```
+
+如果去掉第一个 `store_wait`，一轮新的 `c_smem.store` 可能覆盖上一轮 TMA 还没读走的数据。症状不是稳定报错，而是某些输出 tile 混入后一轮内容。
+
+如果去掉 `fence_async_shared()`，顺序会反过来：CPU 视角看到 shared store 已经执行，但 TMA async proxy 没有顺序保证，可能读到的仍是旧数据。这里不能用 TMA read 的 mbarrier 代替，因为没有等待这笔 generic store 的 mbarrier。
+
+### shared memory 容量计算
+
+官方教程给出的上限是每个 SM 约 `228 KB` shared memory。对 `64 x 128` 的 `float32` tile：
+
+```text
+单块 A tile = 64 * 128 * 4 = 32768 bytes = 32 KiB
+单块 B tile = 32 KiB
+A + B 一个 stage = 64 KiB
+3 个 stage 的 A/B = 3 * 64 = 192 KiB
+C staging tile = 64 * 128 * 4 = 32 KiB
+合计 = 192 + 32 = 224 KiB
+```
+
+224 KiB 已经接近 228 KiB，因此这组配置能容纳三缓冲，但剩余余量很小。若改成 `128 x 128`，A+B 一个 stage 就是：
+
+```text
+2 * (128 * 128 * 4) = 128 KiB
+```
+
+双缓冲两个 stage 就要 256 KiB，还没算 C staging，已经超过 shared-memory 上限。所以 block size 不能只看 register pressure；TMA pipeline 往往先把 shared memory 吃满。
+
+### descriptor 与坐标的硬约束
+
+TMA descriptor 不是任意 strided tensor 都能接受，教程明确列出：
+
+1. global tensor 的 stride 需要 16-byte aligned。
+2. TMA 最内层坐标必须 16-byte aligned。
+3. 如果 shared layout 是 `fp4_padded`，最内层坐标必须 128-byte aligned。
+
+`float16` 下检查坐标 `[8, 4]`：
+
+```text
+最内层坐标 = 4
+byte offset = 4 * 2 = 8 bytes
+8 % 16 != 0
+-> 非法
+```
+
+坐标 `[4, 8]`：
+
+```text
+最内层坐标 = 8
+byte offset = 8 * 2 = 16 bytes
+16 % 16 == 0
+-> 合法
+```
+
+这里的“对齐”检查的是 descriptor 指令实际访问的地址，不是“最好能向量化”的性能建议。错误配置可能在构造 descriptor、编译或硬件执行时失败。
+
+### 常见错误与可观察症状
+
+| 错误 | 症状 | 修复 |
+|---|---|---|
+| `expect` 字节数少写 | 消费者提前通过 barrier，读到尚未完成的 tile | 对齐 `desc.block_type.nbytes` 与 TMA transaction 总字节 |
+| `expect` 字节数多写 | `mbarrier.wait` 永久不返回 | 确保所有 TMA 都到达同一 barrier，且字节数精确 |
+| phase 不按 slot generation 翻转 | 旧 tile 数据、随机数值错误或 kernel 挂起 | 使用 `read_index // num_buffers & 1` |
+| 覆盖 `c_smem` 前不 `store_wait` | 输出 tile 混有相邻轮次内容 | 在覆盖 staging buffer 前等待上一笔 TMA store 读完 |
+| generic shared store 后不加 fence | TMA 读到旧值，结果稳定或随机错误 | 调用 `fence_async_shared()` 后再发起 TMA store |
+| 把默认 `store_wait` 当作 global 可见 | 跨 CTA 消费时偶发读到未落盘数据 | 使用 `read_only=False`，再发布 release 标志 |
+| 盲目增加 buffer | 编译失败、occupancy 下降或性能没有提升 | 先算 shared memory 与 latency hiding 需求 |
+
+### 自我检查
+
+1. **为什么每个 pipeline buffer 要各自有一个 mbarrier？**
+   - 答：TMA read 完成顺序不保证等于 issue 顺序；buffer slot 与完成事件必须一一对应，否则消费者可能等到错误 slot 的完成状态，或覆盖仍在传输的 buffer。
+2. **`read_phase = read_index // num_buffers & 1` 为什么等价于“按 slot 的代际翻转”？**
+   - 答：`read_index % num_buffers` 是 slot，`read_index // num_buffers` 是这个 slot 第几次被复用；mbarrier 只有 0/1 parity，所以对 generation 取最低位。
+3. **TMA store 的默认 `store_wait(pendings=0)` 和 `read_only=False` 分别代表什么完成点？**
+   - 答：默认只等到 TMA 已从 shared memory 读完源数据，可安全复用 shared buffer；`read_only=False` 还等到 global write 完成，适合跨 CTA 通过 global memory 传递数据。
+4. **`c_smem.store(c_val)` 后为什么需要 `fence_async_shared()`？**
+   - 答：普通 shared store 走 generic proxy，TMA store 从 async proxy 读取 shared memory；跨 proxy 没有隐式顺序，必须先 fence，否则 TMA 可能读到旧值。
+5. **`XBLOCK=64, YBLOCK=128, float32, num_buffers=3` 为什么几乎吃满 228 KB shared memory？**
+   - 答：A/B 每 stage 各 32 KiB，合计 64 KiB；三 stage 是 192 KiB；再加 32 KiB 的 C staging，共 224 KiB。
