@@ -258,6 +258,308 @@ if __name__ == "__main__":
 
 运行要求 Hopper。官方文件的完整参数矩阵和 benchmark harness 位于 [`05-wgmma.py`](code/triton/gluon/tutorials/05-wgmma.py)。
 
+## WGMMA 操作数、累加与 epilogue 逐行解释
+
+### 本次讲解位置
+
+章节：`chapter_gluon_tensor_cores`（算子开发 / Triton Gluon）<br>
+小节：Warp-Group MMA / operand layout、accumulator 与 epilogue<br>
+知识点：`DotOperandLayout`、`NVMMASharedLayout`、`LHS_IN_REG`、`use_acc`、`is_async`、register accumulator 到 TMA store<br>
+上次：`NVMMADistributedLayout` 如何描述 accumulator 的 warp/register 分布<br>
+下次：在 K-loop 中复用 accumulator，并区分首轮清零、后续累加和 WGMMA pipeline 等待<br>
+PTX：`wgmma.mma_async`、`fence.proxy.async.shared::cta`、TMA store commit group<br>
+完整代码：见上文 [WGMMA 完整可运行例程](#wgmma-完整可运行例程)
+
+### 为什么现在讲这个
+
+前一段已经知道 `c_layout` 决定 accumulator 在 4 个 warp 之间怎样分布，但只有 accumulator layout 还不能调用 WGMMA。A 还有两条完全不同的数据路径：
+
+```text
+LHS_IN_REG=False: A 留在 SMEM，WGMMA 直接读 SMEM
+LHS_IN_REG=True:  A 先按 DotOperandLayout 装进 register，WGMMA 从 register 读
+```
+
+这两条路径不是语法糖。选择错误会多走一次 SMEM-to-register 搬运，或者根本无法构造出合法的 WGMMA operand。本节还要解决另一个容易混淆的问题：accumulator 异步完成后，怎样从 register 安全地放进 SMEM，再交给 TMA 写回 GMEM。
+
+### 心智模型：A、B、C 各自遵守不同的位置契约
+
+一次 `warpgroup_mma` 可以写成：
+
+```text
+D = A @ B + C
+```
+
+但这里的 A、B、C 不是三个普通 PyTorch tensor，它们分别处在不同存储和 layout 契约下：
+
+| 对象 | 允许位置 | Gluon 中的表示 |
+|---|---|---|
+| A / LHS | SMEM 或 register | `a_smem` 或 `a_smem.load(a_reg_layout)` |
+| B / RHS | 只能是 SMEM | `b_smem` |
+| C / accumulator 输入 | register | `c_smem.load(c_layout)` |
+| D / accumulator 输出 | register | `warpgroup_mma` 返回的异步依赖 |
+
+因此这段代码首先不是在“读参数”，而是在把三块数据转换到 WGMMA 唯一接受的位置和 layout。
+
+### `DotOperandLayout`：A 从 SMEM 搬到 register 时的分布契约
+
+```python
+a_reg_layout: gl.constexpr = gl.DotOperandLayout(
+    operand_index=0,
+    parent=c_layout,
+    k_width=32 // a_desc.dtype.primitive_bitwidth,
+)
+```
+
+三个参数的含义是：
+
+```text
+operand_index=0
+    这是矩阵乘的第 0 个操作数，也就是 A / LHS
+
+parent=c_layout
+    A 的 register 分布必须和 accumulator 的 warp/instruction layout 相容
+
+k_width=32 / dtype.bitwidth
+    每个 32-bit register 在 K 方向装多少个元素
+```
+
+例如 A 是 fp16：
+
+```text
+k_width = 32 / 16 = 2
+```
+
+所以一个 32-bit register 可以装两个相邻的 fp16 元素：
+
+```text
+register r0: A[i, 0], A[i, 1]
+register r1: A[i, 2], A[i, 3]
+register r2: A[i, 4], A[i, 5]
+```
+
+如果 A 是 fp8：
+
+```text
+k_width = 32 / 8 = 4
+register r0: A[i, 0], A[i, 1], A[i, 2], A[i, 3]
+```
+
+`DotOperandLayout` 不只是决定每行怎样打包，还决定这个行块属于哪个 warp、哪个 lane 的哪些 register。因此它必须由 `parent=c_layout` 派生，不能随便写成一个普通 `BlockedLayout`。
+
+### `LHS_IN_REG`：两种写法的真实差别
+
+```python
+if LHS_IN_REG:
+    a = a_smem.load(a_reg_layout)
+else:
+    a = a_smem
+```
+
+当 `LHS_IN_REG=True` 时，执行：
+
+```text
+SMEM A --load(a_reg_layout)--> register A --WGMMA--> register D
+```
+
+当 `LHS_IN_REG=False` 时，执行：
+
+```text
+SMEM A --WGMMA 直接读取----------------------> register D
+```
+
+什么时候选寄存器路径？
+
+- A 本来就在 register，或者需要在 register 中做变换、缩放或复用：寄存器路径避免再绕回 SMEM。
+- A 刚由 TMA 搬进 SMEM，且没有 register 侧计算：直接读 SMEM 通常更便宜，因为省掉一次 load。
+
+WGMMA 的 B 没有这个选择，因为 RHS 必须是 SMEM。代码把 `b_smem` 直接传给 `warpgroup_mma`，而 A 根据 `LHS_IN_REG` 选择实际传入对象。
+
+### `static_assert`：为什么 SMEM operand 必须是 `NVMMASharedLayout`
+
+```python
+gl.static_assert(isinstance(a_smem.type.layout, gl.NVMMASharedLayout))
+gl.static_assert(isinstance(b_smem.type.layout, gl.NVMMASharedLayout))
+```
+
+这两个判断在编译期执行，不产生运行时分支。它们检查 A/B 的 SMEM 物理布局是否满足两个要求：
+
+1. TMA 能把 tile 正确写入该 SMEM。
+2. WGMMA 能按特定 stride、swizzle 和 bank 访问模式读取该 SMEM。
+
+如果用了普通 row-major SMEM layout，即使数学上元素都正确，WGMMA 也可能无法形成合法的 operand view。把问题尽早变成编译错误，比运行到一半才得到错误结果更安全。
+
+### `c_smem.load(c_layout)`：C 从 SMEM 进入 register accumulator
+
+```python
+c = c_smem.load(c_layout)
+```
+
+C 的物理 tile 在 SMEM 中，但 WGMMA 的 accumulator 加法发生在 register 中。`load(c_layout)` 的作用是：
+
+```text
+SMEM 中的 C tile
+    --按 c_layout 分布--> 每个 warp/lane 的 register
+```
+
+这里的 `c_layout` 必须和后面的 accumulator layout 一致。否则 Gluon 需要插入 `convert_layout`，轻则增加 shuffle，重则因为 WGMMA 不接受该 operand layout 而编译失败。
+
+### `use_acc`：首轮清零与后续累加的关键开关
+
+```python
+d = warpgroup_mma(a, b_smem, c, is_async=True, use_acc=True)
+```
+
+`use_acc` 决定 C/旧 accumulator 是否参与计算：
+
+| `use_acc` | 数学语义 | 典型场景 |
+|---|---|---|
+| `True` | `D = A @ B + C` | C 已经有值，或需要继续累加 |
+| `False` | 忽略 C，效果相当于 `D = A @ B + 0` | K-loop 第一轮，省掉显式清空 accumulator |
+
+这里传 `True`，因为 host 端准备了一个真实的 C tile，测试验证的是 `A @ B + C`。如果改成 K-loop，通常写成：
+
+```python
+use_acc=(k != 0)
+```
+
+第一轮忽略旧 accumulator，后续轮次才继续累加。要注意：`use_acc=False` 不会把 C 的 SMEM 或 register 内容物理清零，它只是让 WGMMA 不读取旧值，语义上相当于从零开始累加。
+
+### `is_async`：同步语义和异步依赖的区别
+
+```python
+d = warpgroup_mma(a, b_smem, c, is_async=True, use_acc=True)
+```
+
+`is_async=True` 表示 WGMMA 发起后立即返回一个“尚未完成”的 accumulator 依赖。代码不能在这个点读取 `d` 的数值，因为 tensor core 可能还在写它。
+
+如果使用默认的：
+
+```python
+d = warpgroup_mma(a, b_smem, c, use_acc=True)
+```
+
+语义上等价于马上等待 0 个 outstanding WGMMA，也就是“发起后立即等完”。它不是另一种同步硬件指令，而是把 WGMMA 的异步机制包成了同步调用。需要与 TMA 或其他 MMA overlap 时，必须使用 `is_async=True`，并在真正读取结果前显式 wait。
+
+### `warpgroup_mma_wait`：结果依赖必须穿过 wait
+
+```python
+d = warpgroup_mma_wait(num_outstanding=0, deps=(d,))
+```
+
+这里同时做了两件事：
+
+```text
+deps=(d,)                告诉编译器：代码依赖的是这次 WGMMA 产生的 d
+num_outstanding=0        等到在途 WGMMA 不大于 0，也就是全部完成
+返回的 d                 现在才可以当作完成的 register accumulator
+```
+
+如果只写：
+
+```python
+warpgroup_mma_wait(num_outstanding=0, deps=(d,))
+d_smem.store(d)
+```
+
+没有把返回值重新赋给 `d`，编译器看到的 `d` 仍然可能是旧依赖。更安全的写法始终是：
+
+```python
+d = warpgroup_mma(..., is_async=True)
+d = warpgroup_mma_wait(num_outstanding=0, deps=(d,))
+d_smem.store(d)
+```
+
+### Epilogue：register accumulator 到 GMEM 的完整路径
+
+WGMMA 完成后，代码先把 D 放进 SMEM：
+
+```python
+d_smem = gl.allocate_shared_memory(
+    d_desc.dtype,
+    d_desc.block_type.shape,
+    d_desc.layout,
+)
+d_smem.store(d)
+fence_async_shared()
+tma.async_store(d_desc, [0, 0], d_smem)
+tma.store_wait(pendings=0)
+```
+
+逐步看数据通路：
+
+```text
+WGMMA accumulator D
+    |
+    | generic register -> SMEM store
+    v
+d_smem
+    |
+    | fence_async_shared
+    | 让 generic store 对 async proxy 可见
+    v
+TMA async_store
+    |
+    | store_wait(pendings=0)
+    v
+global memory
+```
+
+为什么这里必须有 `fence_async_shared()`？
+
+```text
+d_smem.store(d)      走 generic proxy
+tma.async_store(...) 走 async proxy，从 SMEM 读数据
+```
+
+`fence_async_shared()` 建立两个 proxy 之间的可见性顺序。少了它，TMA 可能在 `d_smem.store` 尚未对 async proxy 可见时就开始读取，看到旧值或部分写入的 tile。
+
+`tma.store_wait(pendings=0)` 等待在途 TMA store 降到 0。它保证内核结束前，SMEM 已经完成向 GMEM 的提交，不能因为 kernel 退出而让尚未完成的 TMA store 丢失。
+
+### 一个具体执行轨迹
+
+以 fp16、`M=N=64`、`K=32`、`LHS_IN_REG=True` 为例：
+
+```text
+1. TMA: GMEM A/B/C -> a_smem/b_smem/c_smem
+2. a = a_smem.load(a_reg_layout)
+3. c = c_smem.load(c_layout)
+4. d = warpgroup_mma(a, b_smem, c, is_async=True, use_acc=True)
+5. d = warpgroup_mma_wait(0, deps=(d,))
+6. d_smem.store(d)
+7. fence_async_shared()
+8. tma.async_store(d_desc, [0, 0], d_smem)
+9. tma.store_wait(0)
+10. 回到 host，验证 D == A @ B + C
+```
+
+如果 `LHS_IN_REG=False`，只删除第 2 步，并把第 4 步的 A operand 改成 `a_smem`；这就是同一段代码性能参数化的来源。
+
+### 常见错误与症状
+
+| 错误 | 症状 | 原因 |
+|---|---|---|
+| A 放 register 但不用 `DotOperandLayout` | layout 校验失败，或自动插入昂贵转换 | WGMMA 要求 operand 分布与 accumulator 相容 |
+| B 从 register 传入 | 编译失败 | WGMMA 的 B/RHS 必须来自 SMEM |
+| A/B 用普通 SMEM layout | `static_assert` 失败 | TMA 与 WGMMA operand 需要 `NVMMASharedLayout` |
+| 首轮使用 `use_acc=True` 且没有初始化 accumulator | 结果包含旧值或未定义值 | 旧 accumulator 被纳入加法 |
+| 异步 WGMMA 后直接读 `d` | 读到旧值或竞态 | 没有经过 `warpgroup_mma_wait` |
+| wait 后不接收返回值 | 依赖链可能仍然指向旧 accumulator | 没有把完成依赖重新绑定给 `d` |
+| `d_smem.store` 后直接 TMA store | SMEM 结果偶发错误 | 缺少 generic-to-async proxy fence |
+| 不执行 `tma.store_wait` | kernel 结束时可能存在未完成 store | TMA store 未等待完成 |
+
+### 自我检查
+
+1. **`DotOperandLayout` 为什么需要 `parent=c_layout`？**
+   - 答：A 的 register 分布必须与 accumulator 的 warp tiling 和 WGMMA instruction shape 相容，不能独立选择。
+2. **`k_width=32 // primitive_bitwidth` 的物理含义是什么？**
+   - 答：每个 32-bit register 在 K 方向能装几个 A 元素。fp16 是 2 个，fp8 是 4 个。
+3. **`use_acc=False` 与先把 C 手动清零有什么不同？**
+   - 答：`use_acc=False` 让 WGMMA 忽略旧 accumulator，语义上从零开始，不要求先把 C 的存储物理清零。
+4. **为什么 TMA 写完 A/B 后直接接 WGMMA 不需要 fence，而 `d_smem.store` 后接 TMA store 需要 fence？**
+   - 答：前者的生产者和消费者都在 async proxy；后者是 generic proxy store 到 async proxy read，需要显式建立可见性顺序。
+5. **`tma.store_wait(pendings=0)` 为什么不能省？**
+   - 答：TMA store 是异步的，必须等待在途 store 完成，才能安全结束内核并保证 SMEM tile 已提交到 GMEM。
+
 ## 用数值轨迹理解 K-loop
 
 设 accumulator 的某个元素是 `c[i, j]`，说明：
