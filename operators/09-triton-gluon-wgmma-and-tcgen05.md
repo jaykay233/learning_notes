@@ -515,3 +515,436 @@ Gluon 对 tcgen05 的隐式顺序保证包括：
    - 答：此前发出的 tcgen05 操作全部完成后，让指定 mbarrier 发生一次 arrival。
 5. **为什么 tcgen05 与 WGMMA 都需要“异步完成等待”，但等待对象不同？**
    - 答：两者都异步访问 operand 并写 accumulator；WGMMA 用 commit group 跟踪 register accumulator，tcgen05 用 mbarrier 跟踪 TMEM accumulator 和 tensor-pipe 完成。
+
+## 官方 05 完整拆解：WGMMA asynchronous pipeline
+
+### 本次讲解位置
+
+章节：`chapter_gluon_tensor_cores`（算子开发 / Triton Gluon）<br>
+小节：Warp-Group MMA / WGMMA asynchronous pipeline<br>
+知识点：`warpgroup_mma_init`、`warpgroup_mma`、`warpgroup_mma_wait`、`deps`、双缓冲 operand、WGMMA 与 TMA overlap<br>
+上次：WGMMA 的 A/B/C 位置约束、instruction shape 与一次同步 MMA<br>
+下次：在 WGMMA 流水中同时异步化 TMA 的多阶段加载，并进一步做 warp specialization<br>
+PTX：`wgmma.mma_async`、commit-group wait<br>
+官方源码：[`05-wgmma.py`](code/triton/gluon/tutorials/05-wgmma.py)<br>
+官方教程：[Warp-Group MMA](https://triton-lang.org/main/getting-started/tutorials/gluon/wgmma.html)
+
+### 为什么现在讲这个
+
+上一节已经知道一次 WGMMA 计算 `D = A @ B + C`，也知道 A 可以在 register 或 SMEM、B 必须在 SMEM、accumulator 在 register。但只知道“发出一次 WGMMA 再等它结束”还不够，因为这样 tensor core 会在等待 operand 时空转：
+
+```text
+TMA(k) -> WGMMA(k) -> TMA(k+1) -> WGMMA(k+1)
+```
+
+这一节要解决的是一个新的具体问题：MMA 已经把第 `k` 块 A/B 放进 tensor pipe 后，能不能立刻用另一块 SMEM buffer 接收第 `k+1` 块数据？答案可以，但前提是分清两个不同的完成事件：
+
+```text
+TMA 完成  -> 可以开始 WGMMA 读这块 SMEM
+WGMMA 完成 -> 可以覆盖这块 SMEM，也可以读取 accumulator
+```
+
+如果不理解这两个事件的区别，就会出现典型的随机错误：TMA 尚未来得及写完，WGMMA 已经读到旧数据；或者上一轮 WGMMA 还在读 buffer，下一轮 TMA 已经把它覆盖。
+
+### 心智模型：WGMMA 是“异步块运算”，不是立即得到结果的函数
+
+把 `warpgroup_mma` 看成向 tensor pipe 投递一个任务，而不是普通 Python 函数调用更接近硬件：
+
+```text
+acc 是一个异步依赖
+    |
+    | warpgroup_mma(..., is_async=True)
+    v
+tensor core 正在计算
+    |
+    | warpgroup_mma_wait(..., deps=(acc,))
+    v
+acc 变成“结果已可安全读取”的依赖
+```
+
+`warpgroup_mma_wait(num_outstanding=0)` 的含义是：等到在途 WGMMA 不超过 0 个，也就是这一条依赖链上的 WGMMA 全部完成。它不是 mbarrier，也不是 CTA 同步；它只约束 WGMMA commit group 以及依赖它的 register/SMEM 使用。
+
+`deps=(acc,)` 是数据依赖，不是可选提示。编译器要靠它知道“后面读取的 acc 属于哪一组异步写”。因此必须写成：
+
+```python
+acc = warpgroup_mma(a, b_smem, acc, is_async=True)
+acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
+```
+
+不能再写：
+
+```python
+warpgroup_mma(a, b_smem, acc, is_async=True)
+warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
+```
+
+第二种写法里 `acc` 仍然指旧依赖，后续读取没有正确挂到本次 MMA 上。结果可能偶尔正确、偶尔读到旧值，属于最隐蔽的 race。
+
+### 完整可运行示例：双缓冲 WGMMA pipeline
+
+下面是一个完整 Hopper 示例。它用两个 SMEM buffer 轮流接收 TMA 数据；每一轮先等待上一轮 WGMMA 完成，再发出当前 WGMMA。TMA 下一轮加载和当前 tensor pipe 中的 WGMMA 因此可以重叠。
+
+文件可以保存为 `wgmma_pipeline_demo.py`：
+
+```python
+from __future__ import annotations
+
+import torch
+import triton
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
+from triton.experimental.gluon.language.nvidia.hopper import (
+    fence_async_shared,
+    mbarrier,
+    tma,
+    warpgroup_mma,
+    warpgroup_mma_init,
+    warpgroup_mma_wait,
+)
+
+
+def is_hopper() -> bool:
+    target = triton.runtime.driver.active.get_current_target()
+    return target.backend == "cuda" and torch.cuda.get_device_capability()[0] == 9
+
+
+@gluon.constexpr_function
+def get_warps_per_cta(BLOCK_M, BLOCK_N, num_warps):
+    warps_per_cta = [4, 1]
+    m = 16
+    while warps_per_cta[0] * warps_per_cta[1] != num_warps:
+        if BLOCK_M > m * warps_per_cta[0]:
+            warps_per_cta[0] *= 2
+        else:
+            warps_per_cta[1] *= 2
+    return warps_per_cta
+
+
+@gluon.constexpr_function
+def get_instr_shape_n(BLOCK_M, BLOCK_N, num_warps):
+    m = 16
+    m_reps = triton.cdiv(BLOCK_M, m)
+    n_reps = triton.cdiv(num_warps, m_reps)
+    max_n = max(BLOCK_N // n_reps, 8)
+    n = 256
+    while n > max_n or BLOCK_N % n != 0:
+        n -= 8
+    assert n >= 8, "expected to find a valid n"
+    return n
+
+
+@gluon.constexpr_function
+def pick_wgmma_layout(dtype, BLOCK_M, BLOCK_N, num_warps):
+    m = 16
+    k = 256 // dtype.primitive_bitwidth
+    n = get_instr_shape_n(BLOCK_M, BLOCK_N, num_warps)
+    warps_per_cta = get_warps_per_cta(BLOCK_M, BLOCK_N, num_warps)
+    return gl.NVMMADistributedLayout(
+        version=[3, 0],
+        warps_per_cta=warps_per_cta,
+        instr_shape=[m, n, k],
+    )
+
+
+@gluon.jit
+def wgmma_pipeline_kernel(a_desc, b_desc, c_desc, num_warps: gl.constexpr):
+    BLOCK_M: gl.constexpr = c_desc.block_type.shape[0]
+    BLOCK_N: gl.constexpr = c_desc.block_type.shape[1]
+    BLOCK_K: gl.constexpr = a_desc.block_type.shape[1]
+    dtype: gl.constexpr = a_desc.dtype
+    K = a_desc.shape[1]
+
+    # 每块 operand 有 2 份，TMA 写下一份时 WGMMA 可以读另一份。
+    a_smem = gl.allocate_shared_memory(
+        dtype, [2] + a_desc.block_type.shape, a_desc.layout
+    )
+    b_smem = gl.allocate_shared_memory(
+        dtype, [2] + b_desc.block_type.shape, b_desc.layout
+    )
+    index = 0
+
+    pid_m = gl.program_id(axis=0)
+    pid_n = gl.program_id(axis=1)
+    off_m = pid_m * BLOCK_M
+    off_n = pid_n * BLOCK_N
+
+    mma_layout: gl.constexpr = pick_wgmma_layout(
+        dtype, BLOCK_M, BLOCK_N, num_warps
+    )
+    acc = warpgroup_mma_init(
+        gl.zeros((BLOCK_M, BLOCK_N), dtype=gl.float32, layout=mma_layout)
+    )
+
+    bar = gl.allocate_shared_memory(gl.int64, [1], mbarrier.MBarrierLayout())
+    mbarrier.init(bar, count=1)
+    phase = 0
+
+    for k in range(0, K, BLOCK_K):
+        a = a_smem.index(index)
+        b = b_smem.index(index)
+
+        mbarrier.expect(
+            bar,
+            a_desc.block_type.nbytes + b_desc.block_type.nbytes,
+        )
+        tma.async_load(a_desc, [off_m, k], bar, a)
+        tma.async_load(b_desc, [k, off_n], bar, b)
+        mbarrier.wait(bar, phase=phase)
+        phase ^= 1
+
+        # 没有在途 WGMMA 时，第一次 wait 是 no-op；之后它等待上一轮 MMA。
+        acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
+        acc = warpgroup_mma(a, b, acc, is_async=True)
+
+        # 下一轮 TMA 写另一份 buffer；当前 WGMMA 仍在读这一份。
+        index ^= 1
+
+    # 最后一轮没有下一次循环来替它 wait，因此必须显式等待。
+    acc = warpgroup_mma_wait(num_outstanding=0, deps=(acc,))
+    mbarrier.invalidate(bar)
+
+    c_smem = gl.allocate_shared_memory(
+        dtype, c_desc.block_type.shape, c_desc.layout
+    )
+    c_smem.store(acc.to(dtype))
+    fence_async_shared()
+    tma.async_store(c_desc, [off_m, off_n], c_smem)
+    tma.store_wait(pendings=0)
+
+
+def wgmma_pipeline(A, B, C, BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=4):
+    M, N = C.shape
+
+    a_layout = gl.NVMMASharedLayout.get_default_for(
+        [BLOCK_M, BLOCK_K], gl.float16
+    )
+    b_layout = gl.NVMMASharedLayout.get_default_for(
+        [BLOCK_K, BLOCK_N], gl.float16
+    )
+    c_layout = gl.NVMMASharedLayout.get_default_for(
+        [BLOCK_M, BLOCK_N], gl.float16
+    )
+
+    a_desc = TensorDescriptor.from_tensor(A, [BLOCK_M, BLOCK_K], a_layout)
+    b_desc = TensorDescriptor.from_tensor(B, [BLOCK_K, BLOCK_N], b_layout)
+    c_desc = TensorDescriptor.from_tensor(C, [BLOCK_M, BLOCK_N], c_layout)
+
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+    wgmma_pipeline_kernel[grid](a_desc, b_desc, c_desc, num_warps=num_warps)
+
+
+if __name__ == "__main__":
+    if not is_hopper():
+        raise RuntimeError("This tutorial requires a Hopper NVIDIA GPU")
+
+    M, N, K = 512, 512, 512
+    torch.manual_seed(0)
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, N, device="cuda", dtype=torch.float16)
+    C = torch.empty(M, N, device="cuda", dtype=torch.float16)
+
+    wgmma_pipeline(A, B, C)
+    torch.testing.assert_close(A @ B, C, rtol=1e-3, atol=1e-1)
+    print("wgmma pipeline ok", C.sum().item())
+```
+
+预期输出形如：
+
+```text
+wgmma pipeline ok <一个有限的 float32/float16 标量和>
+```
+
+本例最后写回的是 fp16，因此会对 `A @ B` 的 fp32 结果做舍入；`rtol=1e-3, atol=1e-1` 与官方测试一致。
+
+### `warpgroup_mma_init` 到底做了什么
+
+它不是一次矩阵计算，也不是 `wgmma.mma_async`。它的作用是给循环建立一个可沿着流水线继续传递的 accumulator 依赖起点：
+
+```text
+gl.zeros(...)                 -> 一块普通 register tensor
+warpgroup_mma_init(...)       -> 可以被 WGMMA 依赖链携带的 accumulator
+```
+
+为什么不能直接让第一个 `warpgroup_mma_wait` 等一个普通 tensor？因为循环必须先执行“wait 上一轮”再执行“issue 当前轮”，而第一轮还没有上一轮 WGMMA。`warpgroup_mma_init` 让这个统一循环有合法的初始依赖；此时没有在途 WGMMA，所以第一次 `wait` 是 no-op。
+
+### 双缓冲时间线：为什么 buffer 不会被覆盖
+
+以 `BLOCK_K=64, K=256` 为例，循环有四轮。`index` 的轨迹是：
+
+```text
+k=0: load buf0 -> wait TMA -> wait old MMA(no-op) -> issue MMA0(buf0) -> index=1
+k=64: load buf1 -> wait TMA -> wait MMA0       -> issue MMA1(buf1) -> index=0
+k=128: load buf0 -> wait TMA -> wait MMA1       -> issue MMA2(buf0) -> index=1
+k=192: load buf1 -> wait TMA -> wait MMA2       -> issue MMA3(buf1) -> index=0
+```
+
+关键点不是“有两个 buffer 就自动安全”，而是每个 buffer 在被复用前都经历了一次 WGMMA wait：
+
+```text
+k=64 时 wait MMA0
+    -> 确认 MMA0 已读完 buf0
+    -> k=128 的 TMA 才可以覆盖 buf0
+```
+
+所以正确顺序必须保持为：
+
+```text
+wait TMA(current buffer)
+wait previous WGMMA
+issue current WGMMA
+```
+
+如果为了“更激进的 overlap”删掉 `wait previous WGMMA`，可能会出现 TMA 已经覆盖 SMEM，而上一轮 tensor core 还在读它。其症状不是稳定地算错，而是结果随运行时机波动。
+
+### `num_outstanding` 的准确含义
+
+WGMMA 的异步完成由 commit group 跟踪，类似 TMA store：
+
+```text
+issue WGMMA0 -> group 0
+issue WGMMA1 -> group 1
+wait(num_outstanding=0) -> 这两组都完成
+wait(num_outstanding=1) -> 允许 1 组在途，只保证更早的组已完成
+```
+
+本教程用 `num_outstanding=0`，因为它要同时保证两件事：
+
+1. 后续可以读取 accumulator 的最终值。
+2. 后续可以复用 WGMMA 刚刚读取的 SMEM buffer。
+
+若以后做成更深的 tensor-core pipeline，可以允许更多 outstanding 组，但必须用额外 buffer 隔离仍在读取的 SMEM。否则“等待更少”带来的不是重叠，而是数据竞争。
+
+### fence：什么时候需要 `fence_async_shared`
+
+WGMMA 和 TMA 都属于 async proxy，因此 TMA 写完 SMEM 后直接发起 WGMMA 不需要额外 fence：
+
+```python
+tma.async_load(a_desc, [off_m, k], bar, a)
+mbarrier.wait(bar, phase=phase)
+acc = warpgroup_mma(a, b, acc, is_async=True)
+```
+
+但普通 generic store 写 SMEM 时，WGMMA 看不到一个自动跨 proxy 的可见顺序：
+
+```python
+b_smem.store(b)
+fence_async_shared()
+warpgroup_mma(a, b_smem, acc, is_async=True)
+```
+
+这里少了 `fence_async_shared()`，编译器可能把普通写入和异步读取排成错误顺序，表现为 WGMMA 读到旧数据或部分旧数据。TMA store 之前也要在处理 `d_smem.store(d)` 后插入 fence，因为 TMA store 通过 async proxy 读取 SMEM。
+
+### 转置 B 为什么不用复制数据
+
+官方 blocked matmul 额外展示了 `TRANSPOSE_B`。如果 B 以 `[N, K]` 形式存入 SMEM，则不需要手工交换元素，直接创建一个转置 view：
+
+```python
+if TRANSPOSE_B:
+    b = b_smem.permute((1, 0))
+else:
+    b = b_smem
+
+acc = warpgroup_mma(a_smem, b, acc, is_async=True)
+```
+
+`permute` 改变的是 WGMMA 看到 B 的逻辑索引顺序，并把转置要求传递给 MMA 逻辑。这样仍然遵循“B 必须来自 SMEM”的约束，不需要先把 B 复制到一块新的 `[K, N]` buffer。
+
+### instruction shape 与 block shape 不是同一件事
+
+例如一个 tile 是：
+
+```text
+BLOCK_M = 128
+BLOCK_N = 128
+num_warps = 4
+dtype = fp16
+```
+
+有：
+
+```text
+m = 16
+k = 256 / 16 = 16
+mReps = ceil(128 / 16) = 8
+nReps = ceil(4 / 8) = 1
+maxN = max(128 / 1, 8) = 128
+```
+
+因此 `get_instr_shape_n` 从 256 向下找到 128，得到：
+
+```text
+instr_shape = [16, 128, 16]
+```
+
+一个 block tile `128 x 128 x 64` 会由多组较小的 `wgmma.mma_async` 覆盖。`warps_per_cta` 也不是 `num_warps` 的同义词：4 warps 的基础 atom 是 `[4, 1]`；8 warps 可能选 `[4, 2]` 或 `[8, 1]`，后者改变 M/N 方向上的切分和后续 reduction 成本。
+
+### 官方参数搜索为什么不是随便 hardcode
+
+官方 `find_configs` 先用资源约束缩小候选，再按 instruction shape 和 tile 面积筛选。核心约束可以直接算：
+
+```text
+SMEM per CTA ~= 228 KB / occupancy - 1 KB
+register per CTA ~= 64K registers / occupancy - baseline
+A/B SMEM = (BLOCK_M * BLOCK_K + BLOCK_N * BLOCK_K) * dtype_bytes * num_buffers
+acc registers = BLOCK_M * BLOCK_N
+```
+
+在双缓冲变体中，A/B 需要两份；C 的 SMEM 与 A/B 生命周期不重叠。筛选逻辑优先保留最大的 `instr_shape_n`，再在同样 instruction shape 下保留最大的 `BLOCK_M * BLOCK_K`。这只是减少搜索空间的启发式，不是硬件保证，最终仍要在目标 GPU 上 benchmark。
+
+### 官方性能结果
+
+单次小 WGMMA 的参数实验结果：
+
+| A 路径 | instr_shape_n=16 | 32 | 64 | 128 |
+|---|---:|---:|---:|---:|
+| SMEM | 9.47 us | 8.48 us | 8.32 us | 8.32 us |
+| register | 9.32 us | 8.60 us | 8.37 us | 8.36 us |
+
+更大的 `n` 减少了指令数量，所以通常更快。register 路径没有自动胜出：如果 A 原本就在 SMEM，先 load 到 register 反而增加了搬运成本；如果 A 已经在 register，它的价值就不同。
+
+官方 blocked matmul 的展示结果：
+
+| 版本 | 最佳展示值 |
+|---|---:|
+| 非 WGMMA-pipeline | 约 466 TFLOPS（候选表中最佳约 474.03） |
+| WGMMA-pipeline | 495.31 TFLOPS |
+
+这些是教程在 Hopper 上的数字，不是本机实测。关键是 pipeline 只带来约 5% 的提升，但最佳 block 配置发生了变化：非流水候选的最佳 `BLOCK_N=256` 在流水版本里不再最好，最佳变为 `BLOCK_M=128, BLOCK_N=128, BLOCK_K=64, num_warps=4, instr_shape_n=128`。因此“流水化”和“重新调参”必须一起做。
+
+### 常见错误与可观察症状
+
+| 错误写法 | 症状 | 原因 |
+|---|---|---|
+| 丢掉 `warpgroup_mma_wait` 的返回值 | 偶发旧 accumulator、race | `deps` 没有连到真正要等待的 MMA |
+| 只保留两个 buffer，却删除循环内的 previous-MMA wait | 偶发错误或数值不稳定 | TMA 覆盖了 WGMMA 仍在读的 SMEM |
+| 循环结束后不补最后一次 wait | 最终 tile 偶发错误 | 最后一个 MMA 仍在途就被读取 |
+| 用 generic `store` 后直接 WGMMA | 读到旧 B | 缺少 `fence_async_shared()` |
+| B 放在 register | 编译或 layout 校验失败 | WGMMA 的 B 必须来自 SMEM |
+| `instr_shape_n` 大于 `maxN` | 编译期失败或非法布局 | 指令 shape 与 warp 切分不匹配 |
+| 把 `num_warps` 直接当成 `warps_per_cta` | 布局/WGMMA atom 错误 | 8 warps 需要合法的 `[4,2]` 或 `[8,1]` 切分 |
+| 把 `num_outstanding` 调大却没有更多 buffer | 随机错误 | 允许更多 in-flight MMA，却提前复用了 SMEM |
+
+### 自我检查
+
+1. **为什么 `warpgroup_mma_wait` 必须在第一轮也可以调用？**
+   - 答：因为循环采用统一顺序 `wait previous -> issue current`。`warpgroup_mma_init` 建立了初始依赖；没有在途 WGMMA 时，wait 是 no-op。
+2. **`BLOCK_K=64` 的双缓冲循环为什么不会在 `k=128` 覆盖 `buf0`？**
+   - 答：`k=64` 的迭代在发出 MMA1 前先 wait 了 MMA0；MMA0 已完成读取 buf0，所以 `k=128` 的 TMA 可以安全写入 buf0。
+3. **`num_outstanding=0` 保证哪两件事？**
+   - 答：在途 WGMMA 全部完成，因此 accumulator 可安全读，且 WGMMA 所读的 SMEM 可以安全覆盖。
+4. **TMA 写入 SMEM 后接 WGMMA，为什么通常不需要 `fence_async_shared`？**
+   - 答：TMA 和 WGMMA 都走 async proxy；但普通 generic SMEM store 接 WGMMA 时仍需要 fence。
+5. **为什么官方说流水化之后还需要重新调参？**
+   - 答：WGMMA 流水改变了 buffer、register、occupancy 和延迟隐藏方式；非流水时最优的 block/instruction shape 不一定是流水后的最优配置。
+
+### 验证边界
+
+静态检查命令：
+
+```bash
+python3 -m py_compile operators/code/triton/gluon/tutorials/05-wgmma.py
+git diff --check
+```
+
+运行时要求 Hopper GPU 和对应版本的 Triton Gluon。本机没有 Hopper runtime，因此上面的 benchmark 数值来自官方教程，不是本机实测；真实验证应在 Hopper 机器上运行完整归档脚本，或把本节的 `wgmma_pipeline_demo.py` 保存后执行。
