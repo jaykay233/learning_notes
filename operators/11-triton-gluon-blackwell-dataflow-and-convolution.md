@@ -824,6 +824,242 @@ tcgen05_mma(A_smem, B_smem, acc_tmem, use_acc=True)
 
 本教程还给出了更通用的 scales 路径：先 TMA 把 scale block 加载到 SMEM，再用 `tcgen05_copy` 搬到 `TensorMemoryScalesLayout` 的 TMEM，最后直接喂给 `tcgen05_mma_scaled`。
 
+### 本次讲解位置
+
+章节：`Triton Gluon 09–13：Blackwell 数据流与卷积`<br>
+小节：TCGen05 Copy Instruction → `D = A @ B + C` 的 TMEM accumulator 初始化<br>
+知识点：先将 C tile 用 `tcgen05_copy` 放进 TMEM，再用 `tcgen05_mma(use_acc=True)` 累加乘积<br>
+上次：融合 gather → tcgen05 GEMM → scatter：persistent tile 与多缓冲流水<br>
+下次：Block-scaled MMA：把低精度块的 scale 搬进 TMEM 并融合计算<br>
+PTX：`tcgen05.copy`、`tcgen05.mma`、`tcgen05.commit`
+
+### 为什么现在讲这个
+
+上一课解决的是“矩阵行不连续时，如何把 gather/GEMM/scatter 接成流水”。但即使 A、B 已经进入 SMEM，`D=A@B+C` 仍有一个关键选择：C 是不是先被搬进 tensor core 的 TMEM accumulator？若让 MMA 从零开始，最后再做一次加法，就多出一次 accumulator 读写和独立加法；若把 C tile 预置到 TMEM，MMA 可直接在它上面累加。这个选择也决定 `use_acc`、TMEM 可见时机以及 C 的 SMEM 何时能复用，能避免“结果少了 C”或“异步 copy 尚未结束就覆盖 C buffer”的隐蔽错误。
+
+### 心智模型：三个异步角色，不是一条普通 Python 顺序
+
+```text
+普通线程 / generic proxy：准备 SMEM 数据、最后读回 TMEM
+                         │ fence_async_shared()
+                         ▼
+SM async proxy：TMA 或 tensor-core 指令访问 SMEM
+                         │ mbarrier 告知完成 / buffer 可复用
+                         ▼
+tensor pipe：tcgen05.copy(C_smem → acc_tmem)
+             tcgen05.mma(A_smem, B_smem, acc_tmem, use_acc=True)
+```
+
+把它拆成三个不同问题，就不会把同步 API 混为一谈：
+
+| 问题 | 机制 | 它保证什么 | 它不保证什么 |
+|---|---|---|---|
+| generic 线程写进 SMEM，tensor pipe 能否看见？ | `fence_async_shared()` | generic proxy 的 SMEM 写对 async proxy 可见 | 不等 copy/MMA 完成，也不允许覆盖仍在使用的 buffer |
+| copy 和 MMA 谁先执行？ | tensor pipe 上的发射顺序 | 前面的 `tcgen05_copy` 完成后，后面的 MMA 才消费其 TMEM 结果 | 普通线程不能因此立刻安全读取 TMEM |
+| 何时可让普通线程读取结果或复用 SMEM？ | `tcgen05_commit(bar)` + `mbarrier.wait` | 对应 tensor-core 工作完成，并通过 barrier 建立跨线程/代理的完成点 | 不能修复错误的布局、shape 或错误的 barrier phase |
+
+**关键结论：** copy 与紧随其后的 MMA 之间通常不用插入一个“等 copy 完成”的 barrier；但在普通线程读 accumulator、或生产者重写异步操作正在读取的 SMEM 前，必须经过正确的完成/所有权同步。
+
+### 术语与不变量
+
+以 `A[M,K]`、`B[K,N]`、`C[M,N]` 为例：
+
+- `A`、`B`：本例为 FP16，供 tensor core 做乘法；TMA/共享内存 layout 要符合 `tcgen05_mma` 的要求。
+- `C`、累加器和 `D`：本例为 FP32。`C` 的每个输出 tile 经 `tcgen05_copy` 进入 TMEM 中的 accumulator tile。
+- `BLOCK_M=128, BLOCK_N=128`：一个 accumulator tile 的二维形状。当前教程中的 `NVMMASharedLayout → TensorMemoryLayout` copy 路径是 **2D、32-bit、swizzled、非转置**，并要求 TMEM 的 `blockM=128`；这是这条 copy 路径的限制，不应泛化成所有 TMEM 操作的规则。
+- `use_acc=True`：这次 MMA 要读取 accumulator 中原有的值，再加上 `A_tile @ B_tile`。C 已经是初值，所以第一次就必须为真；后续 K tile 也继续累加。
+- barrier phase：同一个 barrier 被循环复用时用 phase 区分第几代事件。phase 跟着 producer/consumer 的协议翻转，不能只因循环回到某个 buffer index 就固定写 `0`。
+
+### 完整最小示例：一个 tile 计算 `D=A@B+C`
+
+这是可单独保存运行的教学代码，对应仓库文件 [`10-tcgen05-copy-accumulate-demo.py`](code/triton/gluon/tutorials/10-tcgen05-copy-accumulate-demo.py)。为聚焦 tensor-pipe 依赖，它用普通 `gl.load` 读取一个完整 tile，再写 SMEM；**这不是性能实现**。官方教程的生产型版本把 global→SMEM 改成 TMA，并用 warp specialization 重叠 load、compute、epilogue。
+
+```python
+"""Minimal Blackwell demo: D = A @ B + C using tcgen05.copy.
+
+This pedagogical single-CTA kernel keeps one 128x128 output tile and one K tile.
+It deliberately uses ordinary global loads and is not a performance kernel.
+"""
+
+import torch
+import triton.experimental.gluon as gluon
+import triton.experimental.gluon.language as gl
+from triton.experimental.gluon.language.nvidia.blackwell import (
+    TensorMemoryLayout,
+    allocate_tensor_memory,
+    fence_async_shared,
+    mbarrier,
+    tcgen05_commit,
+    tcgen05_copy,
+    tcgen05_mma,
+)
+
+
+@gluon.jit
+def accumulate_one_tile_kernel(a_ptr, b_ptr, c_ptr, d_ptr):
+    BM: gl.constexpr = 128
+    BN: gl.constexpr = 128
+    BK: gl.constexpr = 64
+
+    # 4 contiguous values/thread, a 4x8 lane tile, and four warps over M.
+    reg_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 4], [4, 8], [4, 1], [1, 0]
+    )
+    rm = gl.arange(0, BM, gl.SliceLayout(1, reg_layout))
+    rn = gl.arange(0, BN, gl.SliceLayout(0, reg_layout))
+    rk_a = gl.arange(0, BK, gl.SliceLayout(0, reg_layout))
+    rk_b = gl.arange(0, BK, gl.SliceLayout(1, reg_layout))
+
+    a = gl.load(a_ptr + rm[:, None] * BK + rk_a[None, :])
+    b = gl.load(b_ptr + rk_b[:, None] * BN + rn[None, :])
+    c = gl.load(c_ptr + rm[:, None] * BN + rn[None, :])
+
+    a_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for(
+        [BM, BK], gl.float16
+    )
+    b_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for(
+        [BK, BN], gl.float16
+    )
+    c_layout: gl.constexpr = gl.NVMMASharedLayout.get_default_for(
+        [BM, BN], gl.float32
+    )
+    a_smem = gl.allocate_shared_memory(gl.float16, [BM, BK], a_layout)
+    b_smem = gl.allocate_shared_memory(gl.float16, [BK, BN], b_layout)
+    c_smem = gl.allocate_shared_memory(gl.float32, [BM, BN], c_layout)
+    acc_tmem = allocate_tensor_memory(
+        gl.float32, [BM, BN], TensorMemoryLayout([BM, BN], col_stride=1)
+    )
+
+    done = gl.allocate_shared_memory(
+        gl.int64, [1], gl.constexpr(mbarrier.MBarrierLayout())
+    )
+    mbarrier.init(done, count=1)
+
+    # Generic-proxy SMEM stores become visible to the async tensor pipe.
+    a_smem.store(a)
+    b_smem.store(b)
+    c_smem.store(c)
+    fence_async_shared()
+
+    # One ordered tensor-pipe sequence: seed accumulator with C, then add A@B.
+    tcgen05_copy(c_smem, acc_tmem)
+    tcgen05_mma(a_smem, b_smem, acc_tmem, use_acc=True)
+    tcgen05_commit(done)
+    mbarrier.wait(done, phase=0)
+    mbarrier.invalidate(done)
+
+    # Only after the wait may ordinary threads read the completed accumulator.
+    out = acc_tmem.load()
+    out = gl.convert_layout(out, reg_layout)
+    gl.store(d_ptr + rm[:, None] * BN + rn[None, :], out)
+
+
+def main():
+    if not torch.cuda.is_available():
+        raise RuntimeError("This demo requires a CUDA GPU with Blackwell support")
+    if torch.cuda.get_device_capability()[0] < 10:
+        raise RuntimeError("This demo requires NVIDIA compute capability 10.x or newer")
+
+    torch.manual_seed(0)
+    a = torch.randn((128, 64), device="cuda", dtype=torch.float16)
+    b = torch.randn((64, 128), device="cuda", dtype=torch.float16)
+    c = torch.randn((128, 128), device="cuda", dtype=torch.float32)
+    d = torch.empty_like(c)
+
+    accumulate_one_tile_kernel[(1,)](a, b, c, d, num_warps=4)
+    reference = a.float() @ b.float() + c
+    torch.testing.assert_close(d, reference, atol=5e-3, rtol=1e-2)
+    max_abs_error = (d - reference).abs().max().item()
+    print(f"D = A @ B + C: check passed; max_abs_error={max_abs_error:.6g}")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+保存/运行与可观察结果：
+
+```bash
+cd /Users/saboxu/Downloads/learning_notes
+python3 -m py_compile operators/code/triton/gluon/tutorials/10-tcgen05-copy-accumulate-demo.py
+python3 operators/code/triton/gluon/tutorials/10-tcgen05-copy-accumulate-demo.py
+```
+
+第一条只检查 Python 语法；第二条要求 NVIDIA Blackwell（compute capability 10.x）及匹配版本的 Triton。成功时输出类似：
+
+```text
+D = A @ B + C: check passed; max_abs_error=<一个小的非负数>
+```
+
+### 逐段读代码：谁执行、触碰什么、由谁同步
+
+1. **构造坐标与读 A/B/C。** 这个教学 kernel 的一个 CTA 负责整个 `128×128` 输出 tile；CTA 中的线程根据 `BlockedLayout` 分摊元素，普通 `gl.load` 把 global 数据读到寄存器。真实教程的 load partition 则由 TMA producer 搬 tile 到 SMEM。
+2. **分配 SMEM 与 TMEM。** `a_smem`、`b_smem` 是 tcgen MMA 操作数；`c_smem` 是待复制的初始 accumulator；`acc_tmem` 是 `128×128` FP32 TMEM。C 的 shared layout 必须与 copy atom 匹配，不能拿任意普通 shared layout 代替。
+3. **写 SMEM 后 fence。** `.store()` 由普通线程通过 generic proxy 写共享内存；`fence_async_shared()` 使之后 tensor pipe 通过 async proxy 发出的 copy/MMA 看见这些值。若数据来自 TMA，则 TMA completion barrier 的 wait 已是 producer-consumer 边界，不能机械地在每次 TMA 后照抄 generic-store fence。
+4. **发出 copy，再发出 MMA。** 两条 `tcgen05_*` 指令排入同一 tensor pipe。MMA 消费这个 accumulator 时，硬件保证先前 copy 已完成；`use_acc=True` 保留 C 并向其加上乘积。
+5. **commit/wait 后读 TMEM。** `tcgen05_commit(done)` 将已发出的 tensor-core 工作关联到 barrier；普通线程 `mbarrier.wait` 成功后才 `acc_tmem.load()`。接着把 TMEM 结果转换成适合合并 global store 的线程布局，再写 D。
+
+### 官方 warp-specialized 版本如何把单 tile 扩展成流水
+
+官方 `matmul_accumulate_kernel` 把同一条依赖拆给三个 partition，而不改变数学含义：
+
+| Partition | 主要工作 | 等待/发信号 | buffer 所有权 |
+|---|---|---|---|
+| load | TMA 把 C tile 以及每个 K 片段的 A/B 放进 SMEM | 等 `c_empty` / `load_empty` 才写；TMA 完成后 `expect` 对应字节并 signal `c_ready` / `load_ready` | 只能写已经被消费者归还的 slot |
+| MMA/compute（default partition） | `copy(C_smem, acc_tmem)`，逐段发 `mma(A,B,acc,use_acc=True)` | 等 `c_ready`、`load_ready`、`acc_empty`；copy 完成后归还 C；每个 MMA 完成后归还对应 A/B；整 tile 完成后 signal `acc_ready` | C 单 buffer、A/B 环形多 buffer、accumulator 双 buffer |
+| epilogue | 等 accumulator ready，读 TMEM、转布局，用 `gl.store` 写 D | 读完并取回寄存器结果后归还 `acc_empty` | 归还后 compute 才能复用该 accumulator slot |
+
+因此源码中的 `gl.warp_specialize([...], [1, 1], [24, 24])` 是一种角色切分：compute 是 default partition；另外两个 worker partition 分别做 epilogue 和 load，各 1 个 warp、各分配 24 个寄存器。这里列表顺序很关键：第一项 epilogue 是 default partition，接收未分配给 worker 的 warps；第二项 MMA 与第三项 load 是 worker，各分配 1 个 warp、各 24 个寄存器。它不是“自动把同一段代码复制到 3 组 warp”，而是让不同 partition 执行不同函数。C 只有一个 buffer，A/B 有 `num_buffers` 个槽，accumulator 有两个槽，分别用 barrier 管理各自的生命周期。
+
+为什么 epilogue 用普通 `gl.store` 而不用 TMA store？C 本身是大块 FP32 数据。例：`BM=BN=128` 时，一个 C tile 是 `128×128×4 = 65,536` 字节，即 **64 KiB**。若另分同样大的 shared output staging buffer，会显著增加 CTA shared-memory 占用；TMA store 还会与 load 争用 TMA pipe。用 `gl.store` 省掉该 buffer/争用，代价是 TMEM→寄存器布局转换可能较贵——官方注释也指出它会用不少 shared memory，可通过 subtile epilogue 权衡。
+
+### 数字执行轨迹：`M=N=256, K=192` 的一个输出 tile
+
+取 `BM=BN=128, BK=64`，看 `(pid_m,pid_n)=(1,0)`：
+
+| 计算项 | 代入 | 结果 / 物理含义 |
+|---|---|---|
+| C/D 行起点 | `off_m = 1×128` | 行 `128..255` |
+| C/D 列起点 | `off_n = 0×128` | 列 `0..127` |
+| K tile 数 | `192/64` | 3 次 MMA：`k=0,64,128` |
+| 一个 A tile 字节数 | `128×64×2`（FP16） | 16 KiB |
+| 一个 B tile 字节数 | `64×128×2`（FP16） | 16 KiB |
+| C / accumulator tile 字节数 | `128×128×4`（FP32） | 64 KiB |
+
+数学上，这个 tile 的累加历史是：
+
+```text
+初值:   acc = C[128:256, 0:128]
+k=0:   acc = C_tile + A[128:256,   0:64] @ B[  0:64, 0:128]
+k=64:  acc = 前值  + A[128:256,  64:128] @ B[ 64:128, 0:128]
+k=128: acc = 前值  + A[128:256, 128:192] @ B[128:192, 0:128]
+输出:   D[128:256, 0:128] = acc
+```
+
+每一行的 `A_tile @ B_tile` 形状都是 `(128×64) @ (64×128) → (128×128)`。第一次乘加之前先 copy 64 KiB 的 C 到 accumulator；三个 K 片段共享这个 accumulator，因而不产生三个独立的局部和，也不需要末尾再把 C 加一次。若 A/B 的 load ring 有 3 槽，则第 4 个 K 片段（若存在）回到 slot 0，但必须等新一代 barrier phase，而不是误把旧的 ready 信号当成新数据。
+
+### 常见错误与症状
+
+1. **第一次 MMA 把 `use_acc=False`。** 这表示不要把 TMEM 里的 C 当作累加初值；结果就像 `A@B`，C 被丢掉。形状都对，数值却整体少了 C。
+2. **copy 后立刻普通线程 `acc_tmem.load()`，没有等 commit barrier。** copy 是异步的；可能随机读到旧 C 或半完成 tile。tensor pipe 内 copy→MMA 的顺序不等于普通线程已能读取。
+3. **generic `.store()` 后省略 fence。** async proxy 可能观察到旧 SMEM 内容，表现为偶发数据错误；这与 barrier phase 错误不同，增加 wait 不能代替 proxy fence。
+4. **TMA load 未完成就启动 MMA，或 MMA 未完成就覆盖 A/B slot。** 前者读到不完整 tile；后者更常是间歇性损坏，且可能只在多 buffer/高并发时出现。ready 和 empty 是 producer/consumer 的两方向信号。
+5. **把每个 barrier 都用 phase 0，或让一方独自翻 phase。** 第一次迭代正常，barrier 复用后卡住或误判上一轮完成。phase 是每个 barrier 循环世代的一部分，producer 与 consumer 必须遵守同一协议。
+6. **C copy 用错布局或 dtype。** 可能编译时报 unsupported layout/shape，也可能没有对应 copy atom。先核对 2D、FP32、swizzle、非转置和 `blockM=128`，不要把限制误套到 scales 等其它 TMEM layout。
+
+### 自我检查
+
+1. **为什么 `tcgen05_copy(C_smem, acc_tmem)` 后可以立刻发 MMA，却不能立刻用普通线程读取 `acc_tmem`？**
+   - 答：copy 与 MMA 都进入按序执行的 tensor pipe；普通线程不在这个隐式序列里，必须等 commit 对应的 mbarrier。
+2. **`D=A@B+C` 的第一次 MMA 为什么要 `use_acc=True`？**
+   - 答：TMEM 在 MMA 前已由 C 初始化，第一次 MMA 必须读取并保留它，再加上第一个 K 片段的乘积。
+3. **什么时候需要 `fence_async_shared()`？TMA 路径总要加吗？**
+   - 答：普通线程 generic proxy 写 SMEM 后、async proxy 读取前需要；TMA 写入由 TMA async proxy 完成并通过它的 barrier wait 建立可用边界，不能不分路径地机械添加。
+4. **为什么官方 accumulator 要双缓冲？**
+   - 答：epilogue 正在读取/写回上一个输出 tile 时，compute 可在另一个 TMEM accumulator 上做下一 tile；empty/ready barrier 管理两者的交接。
+5. **为什么官方 epilogue 选择 `gl.store` 而非 TMA store？**
+   - 答：避免为 64 KiB FP32 tile 另占 shared staging buffer，并降低 TMA pipe 与输入 load 的争用；代价是 TMEM→线程布局转换可能较贵。
+
 ## Block-scaled MMA：硬件内反量化
 
 ### 量化的块结构
@@ -1514,8 +1750,8 @@ pytest -q operators/code/triton/gluon/tutorials/13-conv-im2col.py
 
 - [x] TMA gather/scatter 单独搬运：offsets layout、descriptor 约束与边界行为
 - [x] 融合 gather → tcgen05 GEMM → scatter：persistent tile 与多缓冲流水
-- [ ] `tcgen05_copy`：SMEM → TMEM 的异步搬运和同步契约
+- [x] `tcgen05_copy`：SMEM → TMEM 的异步搬运、累加式 GEMM 与同步契约
 
 ### 下一知识点
 
-`tcgen05_copy`。把注意力从“如何把不规则行接到 GEMM”转向“MMA accumulator/scales 所在的 TMEM 如何高效填充”，并跟当前 SMEM→TMEM 的 accumulator 结果路径区分清楚。
+`tcgen05_mma_scaled`。在已掌握 C accumulator 的 SMEM→TMEM 初始化后，继续看低精度数据块如何通过 TMEM scales 参与 MMA，而不显式物化反量化矩阵。
