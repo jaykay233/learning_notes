@@ -1251,6 +1251,21 @@ pytest -q operators/code/triton/gluon/tutorials/08-warp-specialization.py -k tes
 
 Blackwell 上预期 18 个参数组合通过：2 个矩阵形状 × 3 种 `num_buffers` × 3 种 scheduler。Hopper 上这些 Blackwell-only GEMM cases 会被 skip。该命令需要 CUDA、PyTorch、Triton；无 GPU 的环境无法验证 tcgen05、mbarrier phase race 或性能。
 
+### 性能结果怎么读：多一条流水不等于自动更快
+
+官方教程的 GB200 benchmark 固定 `M=N=8192`，改变 K；单位是 TFLOP/s：
+
+| K | warp-specialized | cuBLAS |
+|---:|---:|---:|
+| 512 | 1004.18 | 1191.77 |
+| 1024 | 1182.61 | 1334.85 |
+| 2048 | 1313.71 | 1400.35 |
+| 4096 | 1317.58 | 1432.32 |
+| 8192 | 1291.56 | 1301.11 |
+| 16384 | 1256.74 | 1335.24 |
+
+结果说明它在这个固定形状上已经接近 cuBLAS，尤其 K=8192，但并没有逐点胜出。小 K 时 K-loop 次数少，TMA/partition/barrier 的固定成本更难摊薄；大 K 也会受到 accumulator、SMEM、寄存器和 store 流量限制。教程提到 tiny K 可能考虑 **steal B**（复用 B 的 SMEM 资源给 epilogue），这是另一个资源复用决策，不能仅凭“buffer 更多”推断性能更好。上表是官方 GB200 数据，不是本机实测，也不应外推到不同 GPU、dtype 或矩阵形状。
+
 ### 常见错误：症状能告诉你坏的是哪条生命线
 
 | 错误 | 常见症状 | 原因 |
