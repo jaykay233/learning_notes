@@ -1063,6 +1063,118 @@ layout
 
 能完整回答这四个问题，Gluon 的 layout 和同步错误就会从“玄学 hang”变成可定位的状态机问题。
 
+## 写算子的经验：先做正确基线，再逐层进入硬件数据流
+
+### 本次讲解位置
+
+章节：`chapter_gluon_multicta_capstone`（算子开发 / Triton Gluon）<br>
+小节：从正确性基线到 TMA、TMEM、CGA 的优化顺序<br>
+知识点：硬件数据流要先规划，但不应一开始就把全部硬件特性堆进第一版 kernel<br>
+上次：CGA、TMA multicast、2CTA MMA 与 capstone 的跨 CTA 数据所有权<br>
+下次：把 kernel 参数化，接入 autotune，并对真实 workload 做 profile<br>
+PTX：TMA、`wgmma.mma_async`、`tcgen05.mma`、cluster barrier
+
+### 为什么现在讲这个
+
+现在已经认识 TMA、TMEM、CGA 和各种异步 barrier，下一步最容易犯的错误是“为了用新特性而用新特性”，或把简单版本写完后不加分析地一层层打补丁。前者会过度工程化；后者常常让数据 layout、buffer 生命周期和同步协议互相冲突。更稳妥的方法是：**先用简单 kernel 建立可信基线；优化前先画目标数据流，再一次只引入一个有证据支持的复杂度。**
+
+### 我的建议：规划和实现分两层
+
+不是“先把所有硬件路径设计完再动手”，也不是“完全不想数据流，边写边叠 API”。
+
+```text
+先规划语义和基线边界
+    -> 写最简单、可验证的实现
+    -> 测量并确认瓶颈
+    -> 规划针对瓶颈的目标数据流
+    -> 单独实现优化版本，逐项验证
+```
+
+设计前要想清楚大方向：tile 谁拥有、数据会经过哪些内存层、读写是否能重叠、同步由谁发出。但 TMA 的 stage 数、warp specialization 分区、CTA cluster 布局等细节，应等 profiling 证明有必要后再定。
+
+### 一个可重复的开发流程
+
+1. **定义语义与 workload。** 记录 shape、dtype、stride、mask/边界情况、精度容忍度、输入分布，以及真正要优化的 shape 范围。先用 PyTorch/reference 实现作为数值 oracle。
+2. **写 correctness-first baseline。** 用普通 Triton/Gluon 实现必要计算，先保证 coalesced access、合理 tile 和清晰的 mask。它未必追求极限性能，但应易读、易测、可重复运行，并长期保留作回归基准。
+3. **测量而不是猜。** 固定输入和 benchmark 方法，比较 reference、baseline、目标实现；用 profiler 判断是带宽、算力、访存延迟、寄存器/SMEM 占用、launch 开销还是尾部负载不均。每次优化前写出一个可证伪的假设。
+4. **为目标版本画数据流和生命周期。** 对每个 tile 标出 producer、consumer、memory location 和“何时可以复用”。例如：TMA 写 SMEM stage；MMA 读取它；完成 barrier 释放 stage；accumulator 在 TMEM；epilogue 经 registers 写回。随后再选 layout、barrier 和 buffer 数。
+5. **一项一项加硬件特性。** 每次只改一个主因素，确保有对应实验能验证收益；如果变慢或正确性变差，可以快速定位是哪一项引入的。
+6. **优化后重新调参。** 加入 TMA、多缓冲或 warp specialization 会改变寄存器、SMEM、occupancy 和可隐藏的延迟。旧 baseline 的最佳 tile 不保证仍是新版本的最佳 tile。
+
+### 什么时候考虑哪项特性
+
+| 特性 | 先问的问题 | 有理由采用的信号 | 不要因为……就采用 |
+|---|---|---|---|
+| TMA | 数据能否组成对齐、规则的大块？搬运能否和计算重叠？ | global→SMEM 搬运明显，且有足够计算隐藏异步延迟 | “这是 Blackwell，所以每个 kernel 都该用 TMA” |
+| WGMMA / tcgen05 | 运算是不是合适的矩阵乘？tile、dtype 和 layout 是否满足硬件契约？ | 矩阵乘占主要时间，tensor core 利用率有提升空间 | 只为了把普通 elementwise kernel 也塞进 tensor core 路径 |
+| TMEM | 是否使用 tcgen05 accumulator，寄存器 accumulator 是否成为限制？epilogue 怎样读回？ | 需要 tcgen05 的大 accumulator 或硬件数据路径 | 把 TMEM 当作所有临时 tensor 的通用缓存 |
+| `warp_specialize` | load、MMA、epilogue 是否有足够长的工作可以互相重叠？ | pipeline 角色间存在可隐藏的延迟，且同步成本可接受 | 只有一个很短的 tile 或根本没有独立工作可重叠 |
+| Multi-CTA / `cga_layout` | 单 CTA 是否真的受 tile、资源或跨 CTA 规约限制？ | tile 太大、跨 CTA 规约收益明确，或 multicast 有真实复用 | 仅仅因为 `num_ctas>1` 看上去更高级 |
+| CLC | 静态 tile 分配是否因长尾或负载不均而浪费 SM？ | tile 执行时间有明显差异，动态接管可减少尾部空转 | 规则、短小、tile 数很少的工作 |
+
+### 用 GEMM 看两种版本的关系
+
+正确性 baseline 可以先走简单路径：
+
+```text
+A/B global -> 普通 tile load -> dot/MMA -> 普通 store -> C global
+```
+
+若 profiling 显示这条路径受 operand 搬运或 Tensor Core 数据通路限制，再设计 Blackwell 版本：
+
+```text
+TMA: A/B global -> SMEM stages
+  -> mbarrier 保证 operands ready
+  -> tcgen05.mma 读 SMEM、累加到 TMEM
+  -> MMA completion 保证 accumulator / SMEM 生命周期
+  -> TMEM -> registers -> SMEM -> fence -> TMA store -> C global
+```
+
+需要时再考虑把 load、MMA、epilogue 分给不同 warp group；若单 CTA 仍装不下合理 tile，再评估 CGA/2CTA。每一步都与 baseline 比较正确性、性能和资源使用。baseline 不是要最终部署的版本，而是**可信 oracle、性能下限和回退选项**。
+
+### 数字轨迹：先估一块 128×128×64 GEMM tile
+
+假设 A/B 是 FP16，采用 `BLOCK_M=128`、`BLOCK_N=128`、`BLOCK_K=64`：
+
+| 对象 | 计算 | 大小 / 意义 |
+|---|---:|---|
+| 一个 A stage | `128 * 64 * 2` | 16,384 bytes = 16 KiB |
+| 一个 B stage | `64 * 128 * 2` | 16,384 bytes = 16 KiB |
+| A+B 两个 stage | `(16 + 16) * 2` | 64 KiB SMEM（未计 padding / swizzle 等影响） |
+| FP32 accumulator | `128 * 128 * 4` | 65,536 bytes = 64 KiB TMEM 数量级 |
+
+一个 K tile 的生命周期是：
+
+```text
+TMA 把 16 KiB A + 16 KiB B 放入 stage 0
+    -> mbarrier 报告 load ready
+    -> tcgen05.mma 消费 stage 0、更新 64 KiB accumulator
+    -> MMA 完成后 stage 0 才能复用
+```
+
+如果双缓冲，SMEM 需求大约翻倍到 64 KiB；这时即便 Tensor Core 很快，也要先确认 SMEM/CTA、TMEM accumulator 和寄存器资源能否支持目标 occupancy。这样的估算能在编码前排除不合理的 tile，而不是等到复杂 kernel 编译失败或 occupancy 降低后才猜原因。
+
+### 常见开发误区
+
+| 做法 | 后果 | 更好的做法 |
+|---|---|---|
+| 第一天就写 TMA + TMEM + Multi-CTA + warp specialization | correctness、布局、pipeline、barrier 同时出错，难定位 | 先立 baseline；优化版独立实现、一次引入一个主机制 |
+| 只做简单版，完全不预想将来数据流 | 之后 tile、layout、buffer 所有权可能要大改 | 先画高层 dataflow 和 ownership，不急着定所有实现细节 |
+| 看到 kernel 变慢就直接加多缓冲 | 不知道瓶颈是否真是搬运延迟，可能增加资源占用 | 先 profile，并写出“为何增加 buffer 会隐藏此瓶颈”的假设 |
+| 优化版本通过一个 shape 就认为成功 | 边界、非连续 stride、尾块或其他 dtype 可能错 | 测代表性 shape、边界 case、dtype，并保留 reference 对照 |
+| 优化后沿用 baseline 的 launch 参数 | occupancy、stage 和指令 shape 已变化，可能退化 | 每个版本独立 autotune；保留配置与 benchmark 记录 |
+
+### 自我检查
+
+1. **第一版 kernel 应该是最终最快的版本吗？**
+   - 答：不必。它首先应是可验证、可测量、可长期作为 correctness oracle 的基线。
+2. **TMA、TMEM、CGA 应该在写任何代码前全部设计完吗？**
+   - 答：不应。先规划语义和大方向，取得性能证据后再设计对应的数据流细节。
+3. **为什么每次最好只引入一个主要硬件机制？**
+   - 答：这样能把正确性变化、性能变化和资源变化归因到具体改动，失败时更容易回退和定位。
+4. **baseline 已经正确且较慢，是不是应该删掉？**
+   - 答：不应该。它是数值 oracle、性能下限、regression 对照和必要时的 fallback。
+
 ## 自我检查
 
 1. **`cga_layout=((1,0),)` 和 `((0,0),)` 的核心区别是什么？**
