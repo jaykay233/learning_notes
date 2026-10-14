@@ -10,6 +10,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton 分块循环、blocked GEMM、seeded dropout，以及 Gluon layout / TMA / tensor core / multi-CTA 全链路 |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
 | [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、Blackwell TMEM，以及 CUDA kernel launch 机制 |
+| [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
@@ -54,6 +55,12 @@ mlc-tvm/                     # MLC / TVM 课程笔记
 ├── 01-tensor-program-abstraction.md
 ├── 02-tensorir-case-study.md
 └── 03-end-to-end-model.md
+DeepGEMM/                    # DeepGEMM / MegaMoE 概念与数据流学习
+├── README.md
+├── 01-deepgemm-project-and-kernel-model.md
+├── 02-megamoe-dispatch-pull.md
+├── 03-megamoe-x-sf-utccp-and-warp-roles.md
+└── 04-megamoe-l1-l2-epilogue.md
 modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── README.md
 ├── 01-data-layout-and-named-axes.md
