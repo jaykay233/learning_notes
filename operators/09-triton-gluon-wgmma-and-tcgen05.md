@@ -616,7 +616,16 @@ Blackwell 的 tensor core 不把 accumulator 放在普通 register file。每个
 128 rows x 512 columns x 32-bit cells
 ```
 
-它不是 shared memory 的另一块别名，而是与 register file 并列的低延迟存储区域。限制决定了 Gluon API 的形状：
+它不是 shared memory 的另一块别名，而是与 register file 并列的低延迟存储区域。按 32-bit cell 计算，最大物理容量是：
+
+```text
+128 * 512 = 65,536 个 32-bit cell
+65,536 * 4 bytes = 262,144 bytes = 256 KiB
+```
+
+这不是 `128 * 512` 个 BF16 cell；不要把两字节 BF16 当成 TMEM 的分配单位。MMA 累加器通常是 32-bit，实际可用量还受 TMEM 分配粒度、CTA 占用和其它活跃 accumulator 影响，单个 kernel 不保证独占整块容量。
+
+限制决定了 Gluon API 的形状：
 
 | 限制 | 后果 |
 |---|---|
@@ -634,6 +643,20 @@ blockN = 1 到 256 的 2 的幂
 ```
 
 当 `blockM=64` 且有多个 block 时，两行 block 可以打包到 128 行中，slicing descriptor 因此更复杂。
+
+## WMMA、WGMMA、tcgen05 的操作数驻留对照
+
+先区分“矩阵数据原先存在哪里”和“乘法指令直接接受什么位置的 operand”。例如 WMMA 的矩阵可以先在 SMEM，但必须先载入寄存器 fragment；WMMA 指令直接消费的是寄存器 fragment。
+
+| 路径 | A / LHS | B / RHS | 累加器输入 C / 结果 D |
+|---|---|---|---|
+| WMMA（warp 级 `mma`） | register fragment | register fragment | register fragment |
+| WGMMA（warp-group 级） | register **或** SMEM | SMEM | registers |
+| `tcgen05.mma`（Blackwell） | SMEM **或** TMEM | SMEM | TMEM |
+
+这是存储位置对照，不是数值 dtype 清单。每条指令能用哪些 dtype，还要看 GPU 架构、指令 kind 和具体格式。
+
+在 Gluon WGMMA 路径中，A 若从寄存器输入，需要符合 `DotOperandLayout`；B 走 `NVMMASharedLayout` 的 shared-memory operand。WGMMA 的累加结果位于寄存器，并通过 `warpgroup_mma_wait` 等异步完成。`tcgen05.mma` 则把 accumulator 放入 TMEM，并通过 mbarrier 跟踪完成。
 
 ## tcgen05 MMA 的操作数契约
 
@@ -1330,7 +1353,9 @@ ub_tmem / vb_tmem
     -> TMA store 到 GMEM
 ```
 
-TMA store 读取的是 SMEM，不是 TMEM，所以不能直接把 TMEM descriptor 交给 TMA。TMEM 的结果必须先经 `tcgen05.ld` 进入 register，再由普通 store 写进 SMEM。写完 SMEM 后需要 `fence_async_shared()`，让后续 async proxy 的 TMA store 看见这笔普通写入。
+TMA store 读取的是 SMEM，不是 TMEM，所以不能直接把 TMEM descriptor 交给 TMA。若选择 **TMA store 路径**，TMEM 结果先经 `tcgen05.ld` / `acc.load()` 进入 registers，再由普通 store 写进 SMEM；写完后需要 `fence_async_shared()`，让后续 async proxy 的 TMA store 看见这笔普通写入。
+
+这不是唯一的 global-memory 写法：若 epilogue 适合普通线程写回，也可以在 MMA 完成后执行 `acc.load()`，再从 registers 用 `gl.store` 直接写 GMEM。两条路径都不能跳过 TMEM→register；区别是 TMA store 额外要求 register→SMEM，因为 TMA 的源端是 SMEM。
 
 第一次 TMA store 与第二个 TMEM load 的等待顺序也值得注意：
 
@@ -1423,6 +1448,70 @@ tcgen05 pipelined matmul ok
 | TMEM 写完立即读 | 读到旧 accumulator | `tcgen05_commit` 后用 mbarrier 等完成 |
 | TMA 与 MMA 复用同一个 mbarrier 而不重新初始化 | undefined behavior | 分开 barrier，或 invalidate 后重新 init |
 | `use_acc` 第一轮设成 True | 结果包含未定义初值 | 第一轮用 False，后续用 True |
+
+## 回顾卡：三种 MMA 的 operand 位置与 TMEM 写回
+
+### 本次讲解位置
+
+章节：`chapter_gluon_tensor_cores`（算子开发 / Triton Gluon）<br>
+小节：WMMA、WGMMA、tcgen05 的操作数驻留与 TMEM epilogue<br>
+知识点：分清 MMA 指令直接读取的 A/B 位置、accumulator 位置，以及 TMEM 到 GMEM 的合法路径<br>
+上次：WGMMA 的 A register/SMEM 两种路径与 tcgen05 的 TMEM accumulator<br>
+下次：把这些存储契约映射到完整 blocked matmul 和异步流水<br>
+PTX：`wmma.mma`、`wgmma.mma_async`、`tcgen05.mma`、`tcgen05.ld`
+
+### 为什么现在讲这个
+
+知道 `tcgen05.mma` 把 accumulator 放在 TMEM，还不足以决定 epilogue 怎么写：普通 `gl.store` 和 TMA store 的源位置契约不同。同时，WMMA、WGMMA 和 tcgen05 的 A/B 输入位置并不相同。把它们混为一谈会导致非法 operand/layout，或多做不必要的数据搬运。
+
+### 记忆模型与数据流
+
+```text
+WMMA:      register A/B/C -> MMA -> register D
+WGMMA:     register 或 SMEM A；SMEM B；register C/D
+TCGen05:   SMEM 或 TMEM A；SMEM B；TMEM accumulator C/D
+```
+
+对 TCGen05 的结果，先等待 MMA 完成，再把 TMEM accumulator 读进 registers。之后有两条写回路径：
+
+```text
+TMEM -> registers -> gl.store --------------------------> GMEM
+TMEM -> registers -> SMEM -> fence -> TMA async_store -> GMEM
+```
+
+第二条路径中的 `fence_async_shared()` 保证普通写入 SMEM 对异步 TMA store 可见；`tma.store_wait(pendings=0)` 则保证 TMA 已经读完 SMEM 后，才可复用 buffer 或结束 kernel。**没有“TMEM descriptor 直接交给 TMA store 写 GMEM”这条路径。**
+
+### 具体容量换算
+
+硬件 TMEM 的最大矩形可按 `128 x 512` 个 32-bit cell 理解：
+
+```text
+128 * 512 = 65,536 cells
+65,536 * 4 bytes = 262,144 bytes = 256 KiB
+```
+
+因此不能把它说成 `128 x 512` 个 BF16。这里的物理 cell 是 32-bit；BF16 输入与 TMEM accumulator 的容量单位不是一回事。这个值是物理上限概念，不代表一个 CTA/kernel 总能独占全部 TMEM。
+
+### 常见误解
+
+| 误解 | 正确理解 |
+|---|---|
+| WMMA 可以直接从 SMEM 做 MMA | 数据可以先在 SMEM，但必须载入 register fragment 后才作为 WMMA operand |
+| WGMMA 的 A、B 都能任意放 register | A 可 register 或 SMEM；B 需要 SMEM；layout 和 dtype 仍受指令约束 |
+| tcgen05 的结果可以直接给 TMA store | 先 TMEM→register；TMA store 还需 register→SMEM |
+| tcgen05 结果只能经 TMA store 写回 | 可经 registers 用 `gl.store` 直接写；TMA 路径才需要 SMEM |
+| `128 x 512` 是 BF16 元素数 | 它按 32-bit cells 计算，对应原始容量 256 KiB |
+
+### 自我检查
+
+1. **WMMA 的输入矩阵若原先在 SMEM，MMA 指令直接读 SMEM 吗？**
+   - 答：不是；要先成为寄存器 fragment，再交给 WMMA。
+2. **WGMMA 的 B 和结果 D 分别在哪里？**
+   - 答：B 在 SMEM；累加器和结果在 registers。
+3. **`tcgen05.mma` 的结果能直接由 TMA store 写入 GMEM 吗？**
+   - 答：不能。先读 TMEM 到 registers；走 TMA store 时再写 SMEM 并 fence，最后才 TMA store 到 GMEM。也可选择直接 `gl.store`。
+4. **TMEM 的 `128 x 512` 对应多少原始字节？**
+   - 答：`128 * 512 * 4 = 262,144` bytes，即 256 KiB。
 
 ## 硬件与验证边界
 
