@@ -1470,6 +1470,13 @@ data-path 知识点：
 
 这 6 个主知识点已经全部完成。
 
+应用补充进度：
+
+```text
+[x] DeepGEMM MegaMoE UTCCP 4×32 SF transpose：M/token 轴的 128 行重排
+[x] producer 预变换与 UTCCP SMEM → TMEM 消费布局的衔接
+```
+
 `chapter_tensor_cores` 已覆盖：
 
 ```text
@@ -1490,10 +1497,12 @@ cta_group::2, M=256 的 CTA pair accumulator 切分
 cta_group::2, M=128 dense A 的 Layout B
 block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
 tcgen05 指令之间的 scope / layout / completion 三层契约
+DeepGEMM MegaMoE UTCCP 4×32 SF transpose 应用补充
+producer 预变换与 UTCCP SMEM → TMEM 消费布局的衔接
 chapter_tensor_cores 完成
 ```
 
-下一知识点：
+主线下一知识点（本应用补充不改变课程顺序）：
 
 ```text
 chapter_tmem -> Which TMEM Lanes Each Warp Can Access
@@ -1501,3 +1510,239 @@ chapter_tmem -> Which TMEM Lanes Each Warp Can Access
 
 `chapter_tmem -> The TMEM Allocation Lifecycle` 已记录在
 [10-tmem-allocation-lifecycle.md](10-tmem-allocation-lifecycle.md)。
+
+## 十二、应用补充：为什么 MegaMoE 把 SF 按 UTCCP 的 4×32 形状转置
+
+```text
+本次讲解位置
+章节：chapter_tensor_cores（Blackwell block-scaled MMA 的应用补充）
+小节：DeepGEMM MegaMoE 的 UTCCP 4×32 SF transpose
+知识点：把每 128 个 M/token 位置按 4×32 转置，满足 UTCCP 的 SF 布局约定
+上次：block-scaled MMA 的 SFA/SFB 跨 CTA pair 放置
+下次：chapter_tmem -> Which TMEM Lanes Each Warp Can Access
+PTX：tcgen05.cp（UTCCP 的 SMEM → TMEM scale-factor copy 路径；具体编码由 CUTE wrapper 发射）
+```
+
+### 为什么现在讲这个
+
+上一个知识点已经说明 block-scaled MMA 不只读取 A/B，还会读取 SFA/SFB，并且 SF 要被放入 MMA 期望的 TMEM 位置。但“值对”还不够：SF 在 shared memory 中的**物理排列**也要满足 UTCCP 的输入布局。如果把普通 M-major SF 顺序直接交给按 UTCCP 布局解释的搬运路径，scale 可能和错误的 token 行对应，导致结果错配；若在 GEMM consumer 阶段临时转置，又会增加运行时整理工作。MegaMoE 因此在准备输入池时就把 activation SF 放成 UTCCP 需要的次序。
+
+### 心智模型：不是改数值，是改地址
+
+把一个固定 K-scale word 对应的 128 个 M/token 位置排成 4 行 × 32 列：
+
+```text
+q=0:   0   1   2  ...  31
+q=1:  32  33  34  ...  63
+q=2:  64  65  66  ...  95
+q=3:  96  97  98  ... 127
+```
+
+普通行优先内存的顺序是 `0, 1, ..., 31, 32, ..., 127`。UTCCP 要用的顺序是转置后的列优先分组：
+
+```text
+0, 32, 64, 96,  1, 33, 65, 97,  ...  31, 63, 95, 127
+```
+
+这里的 4×32 是 **128 个 token/M 位置的重排形状**。它不是 GEMM 又多出来的逻辑维度，也不是“每个 token 有 4×32 个 scale”。同一个 scale 的数值不变，仍然代表原来的 token 和 K 区块；变化的只有该 scale 的物理存放位置。
+
+### 维度、单位与不变量
+
+| 符号/概念 | 本节中的含义 |
+|---|---|
+| `idx` | 当前 expert 的一个 `BLOCK_M` tile 内的 token/M 行位置 |
+| `q` | 128 行组内的 4 个 32 行子组编号，`0..3` |
+| `r` | 子组内的位置，`0..31` |
+| `j` | 某个 `uint32_t` SF word；沿 hidden/K 方向变化 |
+| `SF_BLOCK_M` | 为 UTCCP 对齐而按 128 对齐的 M 方向 SF 页大小 |
+| `UTCCP` | Blackwell 上将 shared-memory 中 SF 搬到 TMEM 的专用 copy 路径；DeepGEMM 通过 CUTE wrapper 调用 |
+
+重要不变量：
+
+```text
+SF 的数值不变
+SF 对应的 token 和 K 区块不变
+只有 token/M 方向的物理索引做 4×32 transpose
+每个 128-token 组独立变换；组外偏移保留
+```
+
+这里转置的是 SF 的 **M/token 位置**。`j` 代表哪个 K/SF word；对每个 `j`，都按同一规则重排 M 方向。不要把它和“一个 `uint32_t` 打包四个 UE8M0 SF 字节”混为一谈：那是 K 方向的 packing，与此处 M 方向的 4×32 transpose 是两个不同操作。
+
+### 完整可运行的索引模型
+
+下面程序用纯 Python 模拟 DeepGEMM 的 128 元素索引映射。矩阵单元直接存 token 行号，因此可以观察重排前后每个值去了哪里；固定第二维 `k=0`，相当于只观察一个 SF/K word。
+
+```python
+from typing import List
+
+
+def utccp_m_index(m: int) -> int:
+    """Map one M/token row to its UTCCP 4x32-transposed row."""
+    group_base = (m // 128) * 128
+    local = m % 128
+    q = local // 32
+    r = local % 32
+    return group_base + r * 4 + q
+
+
+def transpose_sf_m_axis(sf: List[List[int]]) -> List[List[int]]:
+    """Reorder SF rows in each 128-row group; preserve every SF value."""
+    num_m = len(sf)
+    if num_m == 0:
+        return []
+    num_k_words = len(sf[0])
+    if any(len(row) != num_k_words for row in sf):
+        raise ValueError("SF must be a rectangular [M, K_words] matrix")
+
+    out: List[List[int] | None] = [None] * num_m
+    for m in range(num_m):
+        dst_m = utccp_m_index(m)
+        if dst_m >= num_m:
+            raise ValueError("M must be padded to a multiple of 128 before transpose")
+        out[dst_m] = list(sf[m])
+
+    if any(row is None for row in out):
+        raise AssertionError("mapping must be a permutation of the M rows")
+    return [row for row in out if row is not None]
+
+
+def main() -> None:
+    # sf[m][0] carries the source token/M row id for easy tracing.
+    sf = [[m, 1000 + m] for m in range(128)]
+    transposed = transpose_sf_m_axis(sf)
+
+    # r=5: source rows 5, 37, 69, 101 become adjacent at 20..23.
+    print("dest[0:8], K-word 0:", [row[0] for row in transposed[0:8]])
+    print("dest[20:24], K-word 0:", [row[0] for row in transposed[20:24]])
+    print("source row 37 -> dest row:", utccp_m_index(37))
+    assert [transposed[m][0] for m in range(20, 24)] == [5, 37, 69, 101]
+    assert sorted(row[0] for row in transposed) == list(range(128))
+    print("checks: permutation and SF values preserved")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+运行命令：
+
+```bash
+python3 utccp_sf_layout_demo.py
+```
+
+将上述代码保存为 `utccp_sf_layout_demo.py` 后，预期输出：
+
+```text
+dest[0:8], K-word 0: [0, 32, 64, 96, 1, 33, 65, 97]
+dest[20:24], K-word 0: [5, 37, 69, 101]
+source row 37 -> dest row: 21
+checks: permutation and SF values preserved
+```
+
+程序特意用 token 行号当作 SF 内容。比如输出中的 `37` 仍然是来源 token 行 37 的值，它只是从旧物理行 37 移到了新物理行 21；没有发生数值缩放或量化。
+
+### 索引推导：`idx = 37`
+
+将 37 拆成“4 行 × 32 列”坐标：
+
+```text
+q = 37 // 32 = 1
+r = 37 % 32  = 5
+```
+
+转置后：
+
+```text
+dst = r * 4 + q
+    = 5 * 4 + 1
+    = 21
+```
+
+同一列 `r=5` 的四个来源行：
+
+| 来源 `idx` | `q` | `r` | 目标 `dst` |
+|---:|---:|---:|---:|
+| 5 | 0 | 5 | 20 |
+| 37 | 1 | 5 | 21 |
+| 69 | 2 | 5 | 22 |
+| 101 | 3 | 5 | 23 |
+
+因此原本相隔 32 个位置的四个值，现在连续存放在目标的 `[20, 24)`。这就是“转置后变相邻”的具体含义。
+
+### DeepGEMM 中它发生在哪、谁执行
+
+源码位置：`deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh`。
+
+1. **host/编译期配置：对齐页大小。** `kNumUTCCPAlignedElems = 128`，且 `SF_BLOCK_M` 对 `BLOCK_M` 按 128 对齐。这样 M 方向的 SF 页能被切成完整 128 行组；不足的尾部属于 padding。
+2. **dispatch warp 计算目标 SF 行。** `transform_sf_token_idx()` 对 token 的 tile-local M 行应用 4×32 映射；之后叠加 ring-block 的 SF 页偏移。
+3. **warp lanes 并行复制 SF word。** lane `lane_idx` 负责一个或多个 `j = i*32 + lane_idx`；它从远端地址读取 `remote_sf_ptr[j]`，写到本地 `local_sf_ptr[j*kNumSFRingTokens + sf_ring_token_idx]`。这里 `j` 沿 K/SF word 方向，`sf_ring_token_idx` 是已转置的 M 位置。
+4. **GEMM consumer 准备 mainloop。** TMA 把 L1 中的 SFA 与 A tile 搬入 `smem_sfa` / `smem_a`，共享 full barrier 表示数据到齐。
+5. **UTCCP 再把 SFA 从 SMEM 搬到 TMEM。** `SM100_UTCCP_4x32dp128bit_2cta::copy` 写入 SFA 对应的 TMEM columns，后续 block-scaled UMMA 使用它。这里是专用硬件 copy，不是普通线程逐个做浮点乘法。
+
+关键的源码片段（完整索引公式与调用点）：
+
+```cpp
+constexpr uint32_t kNumUTCCPAlignedElems = 128;
+
+const auto transform_sf_token_idx = [](const uint32_t& token_idx_in_expert) {
+    const uint32_t idx = token_idx_in_expert % BLOCK_M;
+    return token_idx_in_expert / BLOCK_M * SF_BLOCK_M +
+           (idx & ~127u) + (idx & 31u) * 4 + ((idx >> 5) & 3u);
+};
+
+const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
+const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
+    transform_sf_token_idx(token_idx_in_block);
+
+for (uint32_t i = 0; i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++i) {
+    const uint32_t j = i * 32 + lane_idx;
+    if (j < kNumSFUint32)
+        local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] = remote_sf_ptr[j];
+}
+```
+
+对 MegaMoE 的 GEMM mainloop，后续路径是：
+
+```text
+L1 SF ring buffer
+  -> TMA -> smem_sfa
+  -> UTCCP 4×32 copy -> TMEM SFA columns
+  -> block-scaled UMMA
+```
+
+DeepGEMM 的普通 1D1D GEMM 也能作为对照：它先让 warp 从 shared memory 读取四行、每行一个 lane 的值，再按 lane 连续写出，注释明确称为 `UTCCP transposer`。MegaMoE 则把 activation SF 的转换并入接收/pull 布局，并对 weight SF 做预变换，从而让后续 consumer 直接使用目标布局。
+
+### 为什么硬件喜欢这种布局：别把原因说错
+
+可以确定的原因是**硬件 copy 的数据布局契约**：UTCCP 的实现按 4×32 组织处理 SF，TMEM 中的 scale 位置又必须与 UMMA 的 M/K 坐标对上。因此需要在 UTCCP 前提供正确排列；普通顺序不能被当成同一个布局直接解释。
+
+这次重排也把同一个 32-lane 列位置所对应的四个 SF 排到相邻地址，方便按该路径搬运。但不要把它泛化成“所有转置都是为了避免 shared-memory bank conflict”，本路径最直接的正确性要求是 **UTCCP 布局匹配**。具体吞吐收益要由目标 GPU、tile 与实现测量，不能只凭转置公式推断。
+
+MegaMoE 在 pull 时每个 routed token 将 SF 写进目标 ring 布局；consumer 后续可能按多个 K-block 使用这份 SF，因此在生产阶段写好布局，省去 consumer 再做一遍整理。相反，在另一个 GEMM 实现中也可看到 consumer warp 显式执行 shared-memory transpose。两种实现是在不同阶段支付同一布局转换成本。
+
+### 常见误解与可见症状
+
+| 误解/错误 | 实际问题 | 典型表现 |
+|---|---|---|
+| 把 4×32 当成每 token 的 SF shape | 混淆 M/token 重排与 K 方向 scale packing | SF buffer stride、地址计算不匹配 |
+| 认为转置改变 SF 数值 | 把地址变换误当成反量化或缩放 | 与 reference 的数值结果整体不符 |
+| 把 `j` 和 `sf_ring_token_idx` 都当成 token 轴 | 混淆 K-word 与 M-row | 多个 token 读错 scale，数值随 hidden block 异常 |
+| 把未转置布局直接交给按 UTCCP 布局解释的消费端 | 布局契约不满足 | scale 与 M 行错配，GEMM 输出错误；若另一路显式转置则会多出整理工作 |
+| 只看 128 项，不处理 BLOCK_M 尾部对齐 | padded SF 行未按页布局处理 | 最后一个 tile 越界或读到错误 padding |
+
+### 验证边界
+
+纯 Python 映射程序可在普通 CPU 上运行；它验证的是索引是一一置换、特定坐标映射正确、SF 值不变。它**不验证**实际 NVIDIA UTCCP 指令、SMEM/TMEM 可见性、barrier 时序、UMMA 数值正确性或性能。要验证完整路径，需要支持对应 DeepGEMM MegaMoE 实现的 Blackwell NVIDIA GPU、CUDA/CUTLASS 构建环境，并运行仓库中 MegaMoE 测试；仅在 Mac/无 CUDA 环境下跑 Python demo 不能代替 GPU 验证。
+
+### 自测（含答案）
+
+1. **`idx=37` 时 `q`、`r` 和目标位置是多少？**
+   答：`q=1`、`r=5`，目标为 `5*4+1=21`。
+2. **来源位置 5、37、69、101 转置后在哪里？**
+   答：20、21、22、23，连续相邻。
+3. **4×32 transpose 改的是 token 轴还是 hidden/K 轴？**
+   答：改 M/token 轴；`j` 保持 K/SF-word 轴。
+4. **重排后 SF 数值和语义是否变化？**
+   答：不变，只改变物理地址；每个值仍属于相同 token 与 K 区块。
+5. **为什么不直接给 UTCCP 普通行优先布局？**
+   答：UTCCP 与 UMMA 使用有约定的 SF 布局；不匹配可能导致 scale 行错配。可在 producer 预变换，也可在 consumer 前由 warp 转置，但必须满足布局契约。
