@@ -1098,6 +1098,70 @@ B_scale.shape = (N, K // VEC_SIZE)
 
 MX 的 `e8m0` 是只有 exponent、没有 mantissa 的 scale，表示的数值是 2 的整数次幂。`VEC_SIZE=32` 意味着每 32 个 K 元素共享一个二进制指数。
 
+### 追问补充：MXFP4 与 NVFP4 的区别
+
+本次讲解位置
+
+章节：`Triton Gluon 09–13：Blackwell 数据流与卷积`<br>
+小节：Block-scaled MMA → 支持的 FP4 格式<br>
+知识点：两种 FP4 的 scale 分组长度、scale dtype 与布局含义<br>
+上次：`tcgen05_copy` 把 C tile 初始化进 TMEM accumulator<br>
+下次：FP4 逻辑 K 到 packed byte / scale 坐标的换算，再读完整 scaled-MMA 路径
+PTX：`tcgen05.mma` scaled variants（本节聚焦 Gluon 格式约定）
+
+#### 为什么现在讲这个
+
+两种格式的低位宽数值都是 FP4，但 scale 的分组长度不同。若只看 A/B 的 packed `uint8`，容易误以为它们可以共用同一种 scale tensor；实际上，`VEC_SIZE` 不同会改变 scale 的 shape 和索引 `k // VEC_SIZE`。配置错了，可能仍能读到合法地址，却把错误 scale 乘到数据块上，导致数值悄悄偏离。
+
+#### 核心对比
+
+| 项目 | MXFP4 | NVFP4 |
+|---|---|---|
+| FP4 载荷 | E2M1，两个 4-bit 元素打包为一个 byte | E2M1，两个 4-bit 元素打包为一个 byte |
+| 一个 block 的 K 元素数 | 32（`VEC_SIZE=32`） | 16（`VEC_SIZE=16`） |
+| block scale | E8M0（`fp8e8m0`，指数型 scale） | E4M3（`float8_e4m3fn`） |
+| 一个 scale 对多少个元素广播 | 32 个 | 16 个 |
+| 主要取舍 | block 较大，scale 字节相对少；scale 只能取 E8M0 表示的指数值 | block 较小，局部缩放更细；E4M3 scale 有尾数，scale 元数据相对更多 |
+
+两者的差别不在“一个是 FP4、另一个不是”：载荷都是 FP4；主要差别在 **block 粒度及 block scale 的表示**。MX 的 E8M0 只有 exponent、没有 mantissa，scale 是 2 的幂次；NV 的 E4M3 block scale 有 mantissa，能在指数之间表示更细的取值。较小 block 和更细的 block-scale 表示通常更有利于局部适配，但不应据此保证任何输入上 NVFP4 一定误差更小：实际误差还受量化算法、校准、舍入与数据分布影响。
+
+#### K=128 的具体计数
+
+按每一行的 K 轴分组：
+
+| 计算 | MXFP4 | NVFP4 |
+|---|---:|---:|
+| scale 数量 | `128 / 32 = 4` | `128 / 16 = 8` |
+| FP4 载荷字节数 | `128 × 4 / 8 = 64 B` | `128 × 4 / 8 = 64 B` |
+| block scale 字节数（每 scale 1 B） | `4 B` | `8 B` |
+| block-scale bytes / payload bytes | `4/64 = 6.25%` | `8/64 = 12.5%` |
+
+这里的比例是 **scale 字节数相对于 FP4 payload 字节数**；若用总字节数作分母，比例分别是 `4/68 ≈ 5.88%` 和 `8/72 ≈ 11.11%`。大型 tensor 可能还带额外的 tensor/global scaling 因子；上表只数 block-scale 数组。
+
+注意本教程源码的 `random_quantized_tensor` 为了构造 scaled-MMA 测试输入，直接生成 MX scale，再把 NVFP4 测试的 block scales 转为 E4M3。实际量化管线可能还有 tensor/global scale，并可能按 API 约定把它单独传递或折入 scale；**不要仅凭这一测试 helper 推断所有生产 NVFP4 张量的完整元数据格式**。读当前 Gluon kernel 时，明确可见的关键差别是 `VEC_SIZE` 和 scale dtype。
+
+#### 在 kernel 里的地址后果
+
+本章 scale shape 约定是 `A_scale.shape=(M, K/VEC_SIZE)`。取 `K=128`、某一行的 `k=64`：
+
+```text
+MXFP4: VEC_SIZE=32 -> scale index = 64 // 32 = 2
+NVFP4: VEC_SIZE=16 -> scale index = 64 // 16 = 4
+```
+
+所以同一逻辑 K 坐标在两种格式中会落到不同的 scale 项。A/B 的 scale layout、`VEC_SIZE` 和 MMA 格式必须成套；不能只换 packed FP4 数据而保留旧 scale stride。
+
+#### 自我检查
+
+1. **MXFP4 和 NVFP4 的 FP4 payload 是否不同？**
+   - 答：本教程中的两者都是 E2M1 FP4；关键差别是 scale 分组与 scale 格式。
+2. **`K=128, k=64` 时，两种格式分别读哪个 scale？**
+   - 答：MXFP4 读 `64//32=2`；NVFP4 读 `64//16=4`。
+3. **为什么 NVFP4 的 block-scale 开销较高？**
+   - 答：同样 128 个 FP4 值，16 个一组需要 8 个 1-byte scales；MXFP4 32 个一组只需要 4 个。
+4. **能否保证 NVFP4 的误差总比 MXFP4 小？**
+   - 答：不能。它的粒度和 scale 表示更细，但最终误差还取决于量化与校准方法和数据分布。
+
 ### fp4 的坐标轨迹
 
 设 `K=128`、`VEC_SIZE=32`，逻辑元素按 K 方向每两个打包一个 `uint8`：
@@ -1751,6 +1815,7 @@ pytest -q operators/code/triton/gluon/tutorials/13-conv-im2col.py
 - [x] TMA gather/scatter 单独搬运：offsets layout、descriptor 约束与边界行为
 - [x] 融合 gather → tcgen05 GEMM → scatter：persistent tile 与多缓冲流水
 - [x] `tcgen05_copy`：SMEM → TMEM 的异步搬运、累加式 GEMM 与同步契约
+- [x] MXFP4 与 NVFP4：E2M1 payload、`VEC_SIZE`、block-scale dtype 与 scale-index 对照
 
 ### 下一知识点
 

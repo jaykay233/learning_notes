@@ -146,6 +146,66 @@ mma = mma.issue_async_mma(a, b)
 
 这不是烦琐的对象风格，而是在编译期明确状态依赖。每次状态变化都有新的 SSA 值，MMA 与等待之间的顺序可以被正确追踪。
 
+### 澄清：`@gluon.aggregate` 不是 scheduler 装饰器
+
+本次讲解位置
+
+章节：`Triton Gluon 07–08：Persistent Kernel 与 Warp Specialization`<br>
+小节：`@gluon.aggregate` 的状态模型<br>
+知识点：aggregate 是 JIT 可用的状态/结构类型；scheduler 是由方法实现的调度逻辑<br>
+上次：grouped scheduler 的 tile 重排与 L2 复用动机<br>
+下次：aggregate 如何封装 Hopper/Blackwell MMA adapter 的状态
+PTX：无；这是 Gluon 源码层的类型与调度抽象
+
+#### 为什么现在讲这个
+
+`GroupedPersistentTileSchedulerImpl` 确实用了 `@gluon.aggregate`，很容易误以为这个 decorator“就是 scheduler”。但同一份课程里，`Counter` 和 `PartitionArgs` 也用 aggregate：前者保存 barrier ring 的 index/phase，后者打包 partition 参数，它们都不是 scheduler。若把两者混为一谈，就会把“包装状态的类型”和“决定 CTA 下一个算哪个 tile 的算法”误认成同一件事。
+
+#### 心智模型：容器类型与调度算法分开
+
+- `@gluon.aggregate`：声明一个 Gluon JIT 能理解、能传递的聚合类型；字段可以保存 tensor 状态、descriptor、barrier、buffer 或 `gl.constexpr` 参数。它本身不选择 tile，也不启动循环。
+- scheduler：一段调度策略。课程里的调用方按 `initialize(...)` 建状态，再调用 `get_num_tiles()` 和 `get_tile(i)`；真正的坐标映射写在这些方法里。
+- 二者的关系：scheduler **可以**用 aggregate 表示其状态，但 aggregate 并不专属于 scheduler；scheduler 也不是由装饰器自动生成的。
+
+```text
+@gluon.aggregate  -> “这个对象有哪些状态字段，如何作为 JIT 值传递”
+initialize/get_num_tiles/get_tile -> “有多少 tile，序号 i 对应哪个 (pid_m, pid_n)”
+
+Counter          -> aggregate，不是 scheduler
+PartitionArgs    -> aggregate，不是 scheduler
+Grouped...Impl   -> aggregate 类型 + scheduler 方法，因此它承载 scheduler 状态
+```
+
+例如 persistent loop 的职责边界是：
+
+```python
+scheduler = SchedulerImpl.initialize(M, N, BLOCK_M, BLOCK_N)
+for i in range(scheduler.get_num_tiles()):
+    pid_m, pid_n = scheduler.get_tile(i)
+    # kernel 用该坐标处理对应 tile
+```
+
+这段代码假设 `SchedulerImpl` 已有相应方法；方法名是课程实现采用的协议，不是 `@gluon.aggregate` 自动注入的功能。Grouped scheduler 怎样把线性 tile id 映射成 `(pid_m, pid_n)`，看 `get_tile()`；aggregate 只让其中的 `start_pid`、`num_pid_m` 等状态能作为 Gluon JIT 对象组织起来。
+
+#### 常见误解
+
+| 误解 | 正确理解 | 会造成什么问题 |
+|---|---|---|
+| “aggregate 就是 scheduler” | aggregate 是类型/状态载体；scheduler 是调度算法 | 找不到调度逻辑到底在哪定义 |
+| “加上 decorator 就有 `get_tile`” | `get_tile` 必须由类的方法实现 | 调用不存在的方法，或误以为装饰器决定 tile 顺序 |
+| “所有 aggregate 都会派发工作” | `Counter`、`PartitionArgs` 等只是组织状态/参数 | 把状态打包和执行调度混为一谈 |
+
+Gluon aggregate 的状态更新还遵循前文说明的不可变/显式返回模式：方法返回新的 aggregate 值，调用方重新赋值；这有利于编译器追踪 SSA 状态依赖，但与“是否是 scheduler”是另一维概念。
+
+#### 自我检查
+
+1. **`@gluon.aggregate` 会不会自动创建 tile 调度？**
+   - 答：不会。tile 数量和 tile 坐标由 scheduler 方法定义。
+2. **为什么 `Counter` 是 aggregate，却不是 scheduler？**
+   - 答：它保存 buffer index/phase 状态，不负责把 tile 序号映射为 program tile 坐标。
+3. **`GroupedPersistentTileSchedulerImpl` 为什么既是 aggregate 又属于 scheduler？**
+   - 答：aggregate 描述它的状态容器；其 `initialize`、`get_num_tiles`、`get_tile` 方法共同实现调度策略。
+
 ## 统一 Hopper 与 Blackwell 的 MMA 接口
 
 官方把 WGMMA 和 tcgen05 包装成相同的方法集合：
