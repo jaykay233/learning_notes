@@ -20,6 +20,7 @@ operators/
 ├── 10-triton-gluon-persistent-warp-specialization.md  # persistent 与 warp specialization
 ├── 11-triton-gluon-blackwell-dataflow-and-convolution.md  # gather/scatter、scaled MMA、CLC、im2col
 ├── 12-triton-gluon-multicta-and-capstone.md  # CGA、multicast、2CTA 与 capstone GEMM
+├── 13-flashmla-sparse-attention-reading-guide.md  # FlashMLA sparse decode：API、paged KV、split-KV 与 softmax merge
 └── code/
     ├── cuda/       # 原生 CUDA / WMMA
     ├── triton/     # OpenAI Triton；含固定 revision 的 gluon 教程归档
@@ -65,5 +66,6 @@ operators/
 | [10-triton-gluon-persistent-warp-specialization.md](10-triton-gluon-persistent-warp-specialization.md) | Persistent kernel 与 `gl.warp_specialize`：grouped scheduler、`@gluon.aggregate`、producer/MMA/epilogue 分工与 barrier phase |
 | [11-triton-gluon-blackwell-dataflow-and-convolution.md](11-triton-gluon-blackwell-dataflow-and-convolution.md) | Blackwell 数据流与卷积：TMA gather/scatter、`tcgen05_copy`、block-scaled MMA、CLC、TMA im2col 与 implicit GEMM |
 | [12-triton-gluon-multicta-and-capstone.md](12-triton-gluon-multicta-and-capstone.md) | CGA/multi-CTA：`cga_layout` 分片与广播、cluster barrier、TMA multicast、2CTA tcgen05、CLC+四角色 capstone GEMM；kernel 开发流程：correctness baseline、profile、逐层引入硬件数据流 |
+| [13-flashmla-sparse-attention-reading-guide.md](13-flashmla-sparse-attention-reading-guide.md) | FlashMLA sparse decode：DSA indices 与 paged quantized KV 的接口契约、Python→C++→kernel dispatch、split-KV 稳定 softmax 合并 |
 
-示例脚本：[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。Gluon 官方教程按固定 revision 归档在 [code/triton/gluon](code/triton/gluon/)，provenance 与运行范围见 [PROVENANCE.md](code/triton/gluon/PROVENANCE.md)。
+示例脚本：[sparse_attention_split_merge.py](code/flashmla/sparse_attention_split_merge.py)、[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。Gluon 官方教程按固定 revision 归档在 [code/triton/gluon](code/triton/gluon/)，provenance 与运行范围见 [PROVENANCE.md](code/triton/gluon/PROVENANCE.md)。
