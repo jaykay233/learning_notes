@@ -60,7 +60,8 @@ DeepGEMM/                    # DeepGEMM / MegaMoE 概念与数据流学习
 ├── 01-deepgemm-project-and-kernel-model.md
 ├── 02-megamoe-dispatch-pull.md
 ├── 03-megamoe-x-sf-utccp-and-warp-roles.md
-└── 04-megamoe-l1-l2-epilogue.md
+├── 04-megamoe-l1-l2-epilogue.md
+└── 05-k-grouped-gemm-dataflow.md
 modern-gpu-programming-for-mlsys/  # MLSys GPU 编程课程笔记
 ├── README.md
 ├── 01-data-layout-and-named-axes.md
