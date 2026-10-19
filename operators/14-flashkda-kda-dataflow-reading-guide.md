@@ -757,6 +757,243 @@ $$
 - $\mathrm{INV}$ 把 chunk 内顺序依赖改写成一次小型三角系统求解：$U=\mathrm{INV}\,\widetilde V$。$I+L$ 是单位下三角矩阵，可以用 forward substitution 求逆／求解。
 - $M_{qk}$ 保留下三角（含对角），把 chunk 中各 token 的 update 投影到各个 Query 上。
 
+### 补充问答四：为什么需要 $U=\mathrm{INV}\,\widetilde V$？
+
+> 补充同步：2026-10-19，飞书 revision 122。[为什么需要 U 的三角修正](https://pcng0ddyhlxs.feishu.cn/wiki/VralwO1dmi4mzAk0Z9kcDdT3nzt#doxcnm1qHSgRhuvPI31g0UfO7Ac)。与飞书新增讲解使用同一份内容；这里用 $d_k$、$d_v$ 区分特征维度与矩阵名称。
+
+**本次讲解位置：**章节：算子开发／FlashKDA；小节：K2 的 chunk 内残差修正；知识点：从逐 token 递归推导单位下三角系统；上次：四种 Q/K 衰减变换及 workspace 保存方式；下次：用 U 计算输出与 chunk 末尾 state，再映射到 K2 MMA tile；PTX：本节为数学与源码数据流，不展开单条 PTX 指令。
+
+**为什么现在讲这个：**Q/K 变换已经说明一次读写经历哪一段衰减，但没有解释后一个 token 为什么依赖前一个 token 更新后的 state。若把只扣除入口旧状态的残差直接当作实际写入量，就会漏掉本 chunk 内更早更新的预测贡献，得到错误的输出与最终状态。
+
+**先记住一句话：**$\widetilde V$ 只减掉了“chunk 入口旧状态”的预测；$U$ 还要扣除“本 chunk 内更早 token 的更新”带来的预测。$\mathrm{INV}$ 完成的就是这层因果修正，而不是额外的归一化或 softmax。
+
+#### 1. U 是什么：实际写入 state 的残差修正
+
+为避免矩阵名称与维度重名，下文用 $d_k$、$d_v$ 表示 Key、Value 维度，用 $C$ 表示 chunk 内 token 数。它们对应原文形状中的 K、V、C。当前实现完整 chunk 为 $C=16$，$d_k=d_v=128$；后面的标量手算是缩小的数学例子，不是改动真实 kernel 配置。
+
+每个 $k_t\in\mathbb R^{d_k}$ 和 $v_t\in\mathbb R^{d_v}$ 都按列向量理解；Key 是 K1 归一化后的 Key，$\beta_t$ 是激活后的写入强度。state 的形状沿用本文的 Value × Key 约定：
+
+$$
+S_{t-1}\in\mathbb R^{d_v\times d_k},\qquad D_t=\operatorname{diag}\!\left(2^{\boldsymbol g_{\mathrm{act},t}}\right)
+$$
+
+原始逐 token 更新按“先遗忘 → 预测 → 计算残差 → 写入”的顺序进行：
+
+$$
+\overline S_t=S_{t-1}D_t
+$$
+
+$$
+u_t=\beta_t\left(v_t-\overline S_t k_t\right)
+$$
+
+$$
+S_t=\overline S_t+u_tk_t^{\mathsf T}
+$$
+
+$\overline S_t k_t$ 是已有状态根据当前 Key 预测出的 Value；$u_t$ 是目标 Value 与这个预测的差，再乘写入强度。真正加到记忆矩阵里的是外积 $u_tk_t^{\mathsf T}$，而不是直接把原始 Value 写进去。
+
+把各 token 的修正向量按行堆叠，得到矩阵 U；其中 $U_{t,:}=u_t^{\mathsf T}$：
+
+$$
+U=\begin{bmatrix}u_0^{\mathsf T}\\u_1^{\mathsf T}\\\vdots\\u_{C-1}^{\mathsf T}\end{bmatrix}\in\mathbb R^{C\times d_v}
+$$
+
+#### 2. 为什么不能直接用带波浪号的 V？
+
+$$
+\widetilde V=\operatorname{diag}(\boldsymbol\beta)\left(V-K_{\mathrm{decay}}S_{\mathrm{in}}^{\mathsf T}\right)
+$$
+
+$S_{\mathrm{in}}$ 是 chunk 开始之前的状态，不是处理当前 token 时已经包含块内更新的状态。因而这一步只从目标 Value 中扣掉了入口旧记忆的预测。
+
+$$
+\widetilde v_t=\beta_t\left(v_t-S_{\mathrm{in}}\operatorname{diag}(2^{\boldsymbol G_t})k_t\right)
+$$
+
+这里定义 $\widetilde V_{t,:}=\widetilde v_t^{\mathsf T}$，$G_{t,k}=\sum_{\tau=0}^{t}g_{\mathrm{act},\tau,k}$ 是本 chunk 内的累计 gate。入口旧状态到当前 token 的衰减已经包含在正衰减 Key 中。
+
+但当前 token 的实际旧状态还含有 token 0 到前一个 token 在本 chunk 内的写入。这些写入也会根据当前 Key 产生预测，不能被当成“尚未学到的残差”再写一遍。
+
+| 量 | 已经扣掉的预测 | 是否等于实际修正量 |
+| --- | --- | --- |
+| $\widetilde v_t$ | 入口旧状态到当前 token 的预测 | 一般不是；尚未扣掉块内更早更新的贡献 |
+| $u_t$ | 入口旧状态 + 块内更早更新的全部预测 | 是；这是实际写入强度乘残差 |
+| $u_0=\widetilde v_0$ | 第一个 token 没有块内更早更新 | 相等；但后续 token 一般不相等 |
+
+#### 3. 更早更新如何影响当前 token：L 的来源
+
+把写入之前的状态展开成两部分，第一部分来自入口旧状态，第二部分来自本 chunk 内更早 token 的修正：
+
+$$
+\overline S_t=S_{\mathrm{in}}\operatorname{diag}(2^{\boldsymbol G_t})+\sum_{s=0}^{t-1}u_s k_s^{\mathsf T}\operatorname{diag}\!\left(2^{\boldsymbol G_t-\boldsymbol G_s}\right)
+$$
+
+更早 token s 的更新写入时是 $u_sk_s^{\mathsf T}$，到当前 token t 时经过写入后的相对衰减，再用当前 Key 检索。注意相对衰减从 s 写入之后开始，不重新包含 s 自己写入之前的遗忘。
+
+$$
+L_{t,s}=\beta_t\sum_{k=0}^{d_k-1}K_{t,k}K_{s,k}2^{G_{t,k}-G_{s,k}},\qquad s<t
+$$
+
+对于 $s\ge t$，定义 $L_{t,s}=0$。因此 L 严格下三角：当前 token 的残差只受块内更早更新影响，不受当前写入或未来 token 影响。
+
+| 系数部分 | 含义 |
+| --- | --- |
+| $K_{t,k}K_{s,k}$ | 更早写入的 Key 与当前 Key 的匹配 |
+| $2^{G_{t,k}-G_{s,k}}$ | 从 s 写入后到 t 的逐 Key 维衰减 |
+| $\beta_t$ | 当前 token 对整个残差的写入强度；不是更早 token 的 beta |
+
+这里不再额外乘一次更早 token 的 beta，因为 $u_s$ 已经包含自己的写入强度。对应前面保存的小矩阵，就是：
+
+$$
+L=\operatorname{diag}(\boldsymbol\beta)\operatorname{tril}\!\left(K_{\mathrm{decay}}K_{\mathrm{inv}}^{\mathsf T},-1\right)
+$$
+
+把展开后的状态代入原始残差公式，就得到关键递归：
+
+$$
+\boxed{u_t=\widetilde v_t-\sum_{s<t}L_{t,s}u_s}
+$$
+
+减号来自 delta rule：更早写入已经贡献了预测，所以应从当前尚需写入的修正量中扣除；不是把历史贡献继续叠加到目标 Value 上。
+
+#### 4. 把递归移项：为什么出现三角矩阵求逆？
+
+以三个 token 为例，原本需要按顺序计算：
+
+$$
+\begin{aligned}u_0&=\widetilde v_0,\\u_1&=\widetilde v_1-L_{1,0}u_0,\\u_2&=\widetilde v_2-L_{2,0}u_0-L_{2,1}u_1.\end{aligned}
+$$
+
+将右侧更早更新移到左侧，并把列向量转置后按行排起来：
+
+$$
+\begin{bmatrix}1&0&0\\L_{1,0}&1&0\\L_{2,0}&L_{2,1}&1\end{bmatrix}\begin{bmatrix}u_0^{\mathsf T}\\u_1^{\mathsf T}\\u_2^{\mathsf T}\end{bmatrix}=\begin{bmatrix}\widetilde v_0^{\mathsf T}\\\widetilde v_1^{\mathsf T}\\\widetilde v_2^{\mathsf T}\end{bmatrix}
+$$
+
+$$
+(I+L)U=\widetilde V
+$$
+
+这只是逐 token 递归的矩阵表达，不是改变了 KDA 更新规则。求解这个方程得到：
+
+$$
+\mathrm{INV}=(I+L)^{-1},\qquad\boxed{U=\mathrm{INV}\,\widetilde V}
+$$
+
+L 严格下三角，所以 $I+L$ 是单位下三角矩阵，对角线全是 1；在精确数学中必定可逆。可以用前向代入求解，不需要通用大矩阵求逆。FlashKDA 则在 K1 准备小型三角逆，供 K2 后续 MMA 使用。
+
+$$
+\underbrace{\mathrm{INV}}_{C\times C}\;\underbrace{\widetilde V}_{C\times d_v}=\underbrace{U}_{C\times d_v}
+$$
+
+左乘表示沿 token 维组合更早行的贡献，并对每个 Value 通道应用同一个因果系统；它不是对 Value 维做归一化，也不是逐元素乘法。
+
+#### 5. 两 token 数值轨迹：多出来的 0.25 到底从哪里来？
+
+沿用原文的标量例子：两个 token，Key、Value 各一个维度。每步旧记忆保留一半，写入强度也为一半：
+
+$$
+C=2,\quad d_k=d_v=1,\quad S_{\mathrm{in}}=2,\quad k_0=k_1=1
+$$
+
+$$
+v_0=3,\quad v_1=4,\quad D_0=D_1=0.5,\quad\beta_0=\beta_1=0.5
+$$
+
+先按真实递归计算 token 0：
+
+$$
+\overline S_0=2\times0.5=1,\qquad u_0=0.5(3-1)=1,\qquad S_0=1+1=2
+$$
+
+再计算 token 1；这里使用的是 token 0 更新后的 state，而不是只使用入口旧 state：
+
+$$
+\overline S_1=2\times0.5=1,\qquad u_1=0.5(4-1)=1.5,\qquad S_1=1+1.5=2.5
+$$
+
+接着比较：如果只扣除入口旧状态，那么入口到两个 token 的累计保留比例分别是 0.5、0.25：
+
+$$
+\widetilde V=\begin{bmatrix}0.5(3-2\times0.5)\\0.5(4-2\times0.25)\end{bmatrix}=\begin{bmatrix}1\\1.75\end{bmatrix}
+$$
+
+第二行得到 1.75，而真正应写入的是 1.5。差的 0.25 来自更早更新：token 0 写入了 1，到 token 1 衰减后剩 0.5；当前 Key 是 1，它贡献 0.5 的额外预测，再乘当前写入强度 0.5，必须多扣掉 0.25。
+
+$$
+L_{1,0}=\beta_1 k_1k_0\times0.5=0.5\times1\times1\times0.5=0.25
+$$
+
+$$
+u_1=\widetilde v_1-L_{1,0}u_0=1.75-0.25\times1=1.5
+$$
+
+| token | 入口旧状态预测 | 更早块内更新预测 | 只减旧状态的修正 | 实际修正 |
+| --- | --- | --- | --- | --- |
+| 0 | 1 | 0 | 1 | 1 |
+| 1 | 0.5 | 0.5 | 1.75 | 1.5 |
+
+对应的小矩阵和乘法为：
+
+$$
+L=\begin{bmatrix}0&0\\0.25&0\end{bmatrix},\quad I+L=\begin{bmatrix}1&0\\0.25&1\end{bmatrix},\quad\mathrm{INV}=\begin{bmatrix}1&0\\-0.25&1\end{bmatrix}
+$$
+
+$$
+U=\begin{bmatrix}1&0\\-0.25&1\end{bmatrix}\begin{bmatrix}1\\1.75\end{bmatrix}=\begin{bmatrix}1\\-0.25\times1+1.75\end{bmatrix}=\begin{bmatrix}1\\1.5\end{bmatrix}
+$$
+
+再用 chunk 末尾公式核对正确与错误两种情况：第一个更新到块末尾保留 0.5，第二个更新没有后续遗忘。
+
+$$
+S_{\mathrm{out}}=2\times0.25+0.5\times1+1\times1.5=2.5
+$$
+
+$$
+S_{\mathrm{wrong}}=2\times0.25+0.5\times1+1\times1.75=2.75
+$$
+
+因此省略三角修正不只是中间量名称不同：它会把块内已有预测又写入一次，让这个例子的最终状态从正确的 2.5 变成 2.75。
+
+#### 6. 为什么 FlashKDA 要这样改写：先准备依赖，再做矩阵计算
+
+$$
+\text{逐 token 路径：}\quad u_0\longrightarrow S_0\longrightarrow u_1\longrightarrow S_1\longrightarrow u_2
+$$
+
+$$
+\text{chunk 路径：}\quad(K,\boldsymbol G,\boldsymbol\beta)\longrightarrow L\longrightarrow\mathrm{INV},\qquad(V,S_{\mathrm{in}})\longrightarrow\widetilde V\longrightarrow U
+$$
+
+原始路径沿 token 时间顺序推进；chunk 路径先把这些依赖装进小型三角矩阵，再将整块残差修正写成矩阵运算，便于用 Tensor Core MMA 处理多个 token 和 Value 通道。
+
+关键边界：$\mathrm{INV}$ 只依赖本 chunk 的归一化 Key、gate 和 beta，不依赖入口 state，也不依赖 Value。因此 K1 能按 head × chunk 独立提前准备它；K2 得到当前入口 state 后，再计算带波浪号的 V 和 U，并复用同一个三角逆处理不同 Value tile。
+
+这不表示所有时间步变得独立。块内依赖被编码进 INV，不是被删除；不同 chunk 之间依旧必须先得到上一个 chunk 的输出 state，才能计算下一个 chunk 的入口预测。
+
+数学等价是精确算术中的结论。当前实现有低精度 workspace 与 MMA，中间值舍入会产生数值误差；本节手算与 CPU 检验验证公式及因果关系，不声称在这台机器上运行过真实 FlashKDA GPU kernel。
+
+#### 7. 常见误读与自检
+
+误读一：U 就是原始 V。纠正：U 是预测残差乘 beta，再扣除块内更早更新影响后的实际修正量；把原始 V 直接当 U 会丢掉 delta rule 的纠错。
+
+误读二：带波浪号的 V 已扣掉所有历史预测。纠正：它只扣掉入口旧状态的预测；本例第二行仍是 1.75，而不是正确的 1.5。
+
+误读三：INV 是 K 的矩阵逆、逆 gate 或 softmax 归一化。纠正：它是单位下三角因果系统的逆，跟前面逐元素逆累计衰减的 Key 不是一回事。
+
+问：为什么第一个 token 不需要额外块内修正？答：它没有块内更早 token，所以严格下三角第一行全为零，实际修正等于只减入口旧预测的修正。
+
+问：何时可以直接用 $U=\widetilde V$？答：当块内因果耦合全部为零，即 $L=0$ 时；一般不能省略三角修正。
+
+问：L 的系数为什么乘当前 token 的 beta，而不是再乘更早 token 的 beta？答：当前 beta 作用于当前整个预测残差；更早 beta 已经包含在更早修正向量里。
+
+问：提前算出 INV 后，所有 chunk 都能独立更新 state 吗？答：不能。INV 不依赖入口状态，但带波浪号的 V 依赖；跨 chunk 的 state 仍按顺序传递。
+
+### 回到 K2：用修正后的 U 计算输出与末尾状态
+
+现在得到的 U 已包含本 chunk 内的递归修正。下面继续原流程：用它产生当前 chunk 的输出，并将各 token 的更新推进到 chunk 末尾，再交给下一个 chunk。
+
 对输入 state $S$，参考实现中的核心数据流可以写成：
 
 $$
@@ -1111,6 +1348,7 @@ python3 operators/code/flashkda/kda_scalar_trace.py
 - [x] KDA 原始逐 token 公式逐项拆解、统一 LaTeX 记号与递归数据流图、2×2 遗忘／残差／秩一更新数值例子。
 - [x] gate 激活四步拆解、自然指数与 base-2 换算、前缀和的连乘含义、chunk 数量／大小／局部时间索引与尾块边界。
 - [x] K_decay／Q_decay／K_inv／K_restored 的传播区间、相对衰减因式分解、两 token 数值轨迹与 K1/K2 workspace 保存边界。
+- [x] U 的实际残差写入含义、入口旧状态与块内更新预测的区别、从逐 token 递归推导单位下三角系统、两 token 修正数值轨迹与省略 INV 的错误结果。
 - [x] FlashKDA 的 KDA 数学、16-token chunk 内三角系统、K1 prepare → workspace → K2 recurrent state 的执行数据流及 TMA/warp specialization 边界。
 
 下一知识点：
