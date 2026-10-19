@@ -336,6 +336,202 @@ $$
 G_{t,j}=\sum_{\tau=0}^{t}g_{\mathrm{act},\tau,j},\qquad g_{\mathrm{total},j}=G_{C-1,j}
 $$
 
+### 补充问答一：gate 激活、base-2 转换与前缀和到底在做什么？
+
+> 补充同步：2026-10-19，飞书 revision 117。[问答一：gate 与前缀和](https://pcng0ddyhlxs.feishu.cn/wiki/VralwO1dmi4mzAk0Z9kcDdT3nzt#doxcnjeMes1JBtRlDAMcUQCQA0g)；[问答二：chunk 与局部位置](https://pcng0ddyhlxs.feishu.cn/wiki/VralwO1dmi4mzAk0Z9kcDdT3nzt#doxcn8GvqsrrjMp1fmrUl3uOIu8)。下文用 $k$ 表示 Key 特征维度，对应上文公式中的 $j$。
+
+**本次讲解位置：**章节：算子开发／FlashKDA；小节：K1 的 gate 预处理；知识点：单步遗忘与累计遗忘；上次：逐 token 状态递归；下次：理解 chunk 的局部位置与跨 chunk 状态传递；PTX：本节为数学数据流，不涉及单条 PTX 指令。
+
+**为什么现在讲这个：**前面的公式把 Q/K 归一化、beta 激活、gate 激活和前缀和写在一起，容易把 sigmoid 的输出当作保留比例，或在每一步重复使用累计衰减。先区分“本步保留多少”和“从 chunk 入口累计剩多少”，才能正确理解后面的 decay 矩阵。
+
+#### 1. gate 最终决定的是旧记忆各个 Key 列的保留比例
+
+固定一个 sequence 和 head，状态布局为 $S\in\mathbb R^{V\times K}$。旧记忆在当前 token 到来时，沿 Key 列衰减：
+
+$$
+d_{t,k}=2^{g_{\mathrm{act},t,k}},\qquad D_t=\operatorname{diag}(\boldsymbol d_t),\qquad \bar S_t=S_{t-1}D_t
+$$
+
+$t$ 是 chunk 内的 token 位置；$k$ 是 Key 向量的特征维度，不是另一个 token 下标。$g_{\mathrm{act},t,k}$ 是保留比例的 base-2 对数，不是保留比例本身。它越负，遗忘越强；越接近零，保留越多。
+
+| 激活后的 gate | 保留比例 | 含义 |
+| --- | --- | --- |
+| $0$ | $2^0=1$ | 完全保留 |
+| $-1$ | $2^{-1}=0.5$ | 保留一半 |
+| $-2$ | $2^{-2}=0.25$ | 保留四分之一 |
+
+#### 2. 把大公式拆成四步：调整输入、sigmoid、负遗忘量、换指数域
+
+以下省略 head 下标，并临时引入 $x_{t,k}$、$r_{t,k}$ 和 $\ell_{t,k}$，只为看清中间步骤：
+
+$$
+\begin{aligned}x_{t,k}&=e^{A_{\mathrm{log}}}(g_{\mathrm{in},t,k}+b_{\mathrm{dt},k}),\\r_{t,k}&=\sigma(x_{t,k}),\\\ell_{t,k}&=g_{\min}r_{t,k},\\g_{\mathrm{act},t,k}&=\ell_{t,k}\log_2(e).\end{aligned}
+$$
+
+第一步加偏置、乘正系数；第二步用 sigmoid 得到控制量；第三步乘负的下界，得到自然指数域的遗忘量；第四步把它转换到 base-2，便于实现使用 `exp2`。
+
+| 符号／API | 作用 | 当前实现的共享范围 |
+| --- | --- | --- |
+| $g_{\mathrm{in},t,k}$／`g` | 原始 gate 输入，尚不是保留比例 | 每个 token、head、Key 维度 |
+| $b_{\mathrm{dt},k}$／`dt_bias` | 平移 sigmoid 输入，改变控制量 | 每个 head、Key 维度，沿 token 共享 |
+| $A_{\mathrm{log}}$／`A_log` | 取指数得到正系数，调整 sigmoid 对输入的敏感程度 | 每个 head，沿 token 和 Key 维度共享 |
+| $g_{\min}$／`lower_bound` | 负的自然指数域 gate 下界，限制遗忘量范围 | 本次调用的标量配置 |
+
+**sigmoid 的输出不是保留比例。**在理想数学下，若 $g_{\min}<0$，则 $\ell_{t,k}\in(g_{\min},0)$，真正的保留比例为 $e^{\ell_{t,k}}$，位于 $(e^{g_{\min}},1)$；有限精度会产生舍入，极小值还可能下溢。
+
+$$
+\boxed{2^{\ell\log_2(e)}=e^{\ell}}
+$$
+
+**乘以 $\log_2(e)$ 只是换指数表示，不是额外遗忘一次。**自然指数域和 base-2 指数域的数值不能直接混用。
+
+#### 3. 用一组真实代入把激活流程算完
+
+为了手算，取以下教学参数；它们不是对默认 kernel 配置的声明：
+
+$$
+g_{\mathrm{in}}=0,\quad b_{\mathrm{dt}}=0,\quad A_{\mathrm{log}}=0,\quad g_{\min}=-2
+$$
+
+$$
+\begin{aligned}x&=e^0(0+0)=0,\\r&=\sigma(0)=0.5,\\\ell&=-2\times0.5=-1,\\g_{\mathrm{act}}&=-\log_2(e)\approx-1.442695,\\d&=2^{-\log_2(e)}=e^{-1}\approx0.367879.\end{aligned}
+$$
+
+结论：这一步，旧记忆的这个 Key 列保留约 36.79%。虽然 sigmoid 给出 0.5，但最终保留比例不是 50%。
+
+#### 4. 前缀和：比例连乘，等价于对数相加
+
+同一个 Key 列连续经过多个 token 的遗忘时，保留比例连续相乘。把比例写成指数，就可以用前缀和表达：
+
+$$
+G_{t,k}=\sum_{\tau=0}^{t}g_{\mathrm{act},\tau,k},\qquad 2^{G_{t,k}}=\prod_{\tau=0}^{t}2^{g_{\mathrm{act},\tau,k}}
+$$
+
+接着上面的例子，假设前三个 token 的输入相同，每一步都保留 $e^{-1}$。只跟踪 chunk 入口旧记忆的直接传播，不考虑新写入：
+
+| 局部位置 $t$ | 本步 $g_{\mathrm{act},t,k}$ | 累计 $G_{t,k}$ | 本步保留 | 入口旧记忆累计保留 | 入口元素为 100 时 |
+| --- | --- | --- | --- | --- | --- |
+| 0 | -1.442695 | -1.442695 | 36.79% | 36.79% | 36.787944 |
+| 1 | -1.442695 | -2.885390 | 36.79% | 13.53% | 13.533528 |
+| 2 | -1.442695 | -4.328085 | 36.79% | 4.98% | 4.978707 |
+
+$g_{\mathrm{act},t,k}$ 管“当前这一步”；$G_{t,k}$ 管“从 chunk 入口累计到这一步”。逐 token 递归使用本步 gate，chunk 矩阵化时使用前缀和来组织累计衰减坐标。
+
+**不要在每步递归中对完整状态再乘累计比例。**例如前两步各保留 $e^{-1}$，正确累计是 $e^{-2}$；若第一步乘 $e^{-1}$、第二步错误地乘前缀比例 $e^{-2}$，会得到 $e^{-3}$，重复衰减了第一步。
+
+对在局部位置 $s$ 写入的信息，其后仅由遗忘造成、直到位置 $t$ 的保留因子为 $2^{G_{t,k}-G_{s,k}}$，其中 $s\le t$。它没有经历写入之前的遗忘；后续 delta 修正还可能改变这份信息，因此该因子只描述遗忘部分。
+
+#### 5. Q/K 归一化、beta 和 gate 不是同一个门控
+
+| 操作 | 控制什么 |
+| --- | --- |
+| Q/K 的 L2 归一化 | 规范向量长度，保留方向；实现含 epsilon 和有限精度 |
+| $\beta_t=\sigma(\beta_{\mathrm{logit},t})$ | 当前 token 的残差修正／写入强度，一个标量 |
+| $2^{g_{\mathrm{act},t,k}}$ | 旧记忆在 Key 维度上的保留比例，每个 Key 维度可以不同 |
+
+$$
+S_t=\bar S_t+\beta_t(v_t-\bar S_tk_t)k_t^{\mathsf T}
+$$
+
+gate 管“旧的保留多少”，beta 管“新的残差修正写多少”。两者都使用 sigmoid，但不是同一个量；把 beta 当作旧状态的衰减比例，会改变递归结果。
+
+### 补充问答二：chunk 大小为什么会和时间 t 有关系？
+
+**本次讲解位置：**章节：算子开发／FlashKDA；小节：chunk 的索引与状态边界；知识点：区分 chunk 数量、chunk 大小、局部 token 位置和全局位置；上次：单步 gate 与前缀和；下次：回到 K1 的 decay 矩阵与三角系统；PTX：本节为数学索引，不涉及单条 PTX 指令。
+
+**为什么现在讲这个：**如果把 $C=16$ 误读为 16 个 chunk，或把 $t$ 当作 GPU 墙钟时间，就无法理解为什么要取前缀和的第 $C-1$ 项，也容易在 chunk 边界错误地清空记忆。
+
+#### 1. C 是每个 chunk 的 token 数，不是 chunk 的数量
+
+chunk 是把原始序列中的连续 token 分成小组。取一条长度 $T=32$ 的序列，每组放 $C=16$ 个 token，则它有两个 chunk：
+
+| 符号 | 含义 | 本例 |
+| --- | --- | --- |
+| $T$ | 一条序列的 token 总数 | 32 |
+| $C$ | 每个 chunk 的 token 容量 | 16 |
+| $N_{\mathrm{chunks}}$ | 这条序列的 chunk 数量 | 2 |
+| $c$ | 当前 chunk 的编号 | 0 或 1 |
+| $t$ | 当前 token 在 chunk 内的局部位置 | 0 到 15 |
+| $n$ | token 在这条完整序列中的全局位置 | 0 到 31 |
+| $k$ | Key 特征维度 | 与 token 位置是不同轴 |
+
+$$
+N_{\mathrm{chunks}}=\left\lceil\frac{T}{C}\right\rceil,\qquad n=cC+t,\qquad 0\le t<C
+$$
+
+这里的“时间”表示 token 的逻辑序列顺序，不是 GPU 的执行耗时。
+
+| chunk 编号 | 原始序列位置 | chunk 内局部位置 |
+| --- | --- | --- |
+| $c=0$ | $n=0,1,\ldots,15$ | $t=0,1,\ldots,15$ |
+| $c=1$ | $n=16,17,\ldots,31$ | $t=0,1,\ldots,15$ |
+
+例如全局位置为 19 的 token：
+
+$$
+19=1\times16+3\quad\Longrightarrow\quad c=1,\quad t=3
+$$
+
+#### 2. 前缀和为什么带 t：走到哪一个 token，就累计到哪里
+
+为了消除歧义，这里把前面省略的 chunk 下标也写出来：
+
+$$
+G_{c,t,k}=\sum_{\tau=0}^{t}g_{\mathrm{act},c,\tau,k}
+$$
+
+固定一个 chunk，局部位置从零开始推进。$G_{c,3,k}$ 累计前 4 个 token；$G_{c,7,k}$ 累计前 8 个 token；$G_{c,15,k}$ 累计整个 16-token chunk。
+
+**不是 chunk 大小随着 t 变化，而是当前 token 在一个固定大小的 chunk 里处于不同位置。**固定的是 $C$，变化的是局部位置 $t$。
+
+#### 3. 为什么整个 chunk 的 gate 等于最后一个前缀和
+
+$$
+g_{\mathrm{total},c,k}=G_{c,C-1,k}=\sum_{\tau=0}^{C-1}g_{\mathrm{act},c,\tau,k}
+$$
+
+因为下标从零开始，最后一个 token 的位置是 $C-1$。对当前实现 $C=16$，最后一项是 $G_{c,15,k}$，不是第 16 个 chunk，也不是物理时间的第 15 秒。$g_{\mathrm{total},c,k}$ 是前缀和最后一项，不是一套新的 gate 激活。
+
+#### 4. 下一个 chunk 的 t 从零开始，但 state 不清零
+
+每个 chunk 在自己的局部坐标中重新计算前缀和；上一个 chunk 的最终状态作为下一个 chunk 的入口状态：
+
+$$
+S_{\mathrm{in},c+1}=S_{\mathrm{out},c}
+$$
+
+$$
+S_{\mathrm{out},c}=S_{\mathrm{in},c}\operatorname{diag}\!\left(2^{\boldsymbol g_{\mathrm{total},c}}\right)+\Delta S_c
+$$
+
+$\Delta S_c$ 是包含 chunk 内因果 delta 修正、并换算到 chunk 末尾坐标的写入贡献。入口旧状态的直接传播项乘整个 chunk 的累计保留比例，新写入并不是全部都经历同样的 16 次遗忘。
+
+所以“局部下标与前缀和重新开始”不等于“历史记忆重新开始”。K1 可以并行准备各个 chunk 的 gate 与 workspace；K2 仍在每个 sequence/head 内按 chunk 顺序传递 state。
+
+#### 5. 不满 16 个 token 的尾块怎么理解
+
+例如 $T=19$、$C=16$，仍有两个 chunk，但第二块只含局部位置 $t=0,1,2$ 的三个有效 token。当前实现将尾块无效位置的已激活 gate 填零，零 gate 对应保留比例为 1，不额外遗忘：
+
+$$
+g_{\mathrm{act},c,t,k}=0\quad(t\ge3),\qquad G_{c,15,k}=G_{c,2,k}
+$$
+
+**这里填零的是激活后的 gate，不是把 raw gate 输入填零后再做 sigmoid。**本节前面的数值例子已说明，raw 输入为零仍可能产生非零遗忘量。无效 token 也不会产生有效的新写入。
+
+#### 6. 自检：三个容易混淆的点
+
+问：sigmoid 输出 0.5，旧记忆就保留 50% 吗？答：不是。本例 $g_{\min}=-2$ 时，保留比例是 $e^{-1}\approx36.79\%$。
+
+问：$G_{c,3,k}$ 累计几个 token？沿哪个轴累积？答：固定 chunk 和 Key 维度，沿 token 轴累计局部位置 0、1、2、3，共 4 个 token。
+
+问：$T=32$、$C=16$ 时，全局位置 19 在哪里？进入第二个 chunk 时要清空 state 吗？答：$c=1,t=3$；不能清空 state，第二块继承第一块的最终状态。
+
+**源码对应：**`tests/torch_ref.py` 中 gate activation 对应加 `dt_bias`、计算 `exp(A_log)`、乘 `lower_bound * LOG2E` 与 sigmoid；`g_chunk.cumsum(dim=0)` 沿 token 轴求前缀和，`g_cumsum[-1:]` 取整个 chunk 的累计 gate，尾块通过零初始化的 gate buffer 保持前缀和不变。
+
+### 回到 K1：构造衰减矩阵与三角系统
+
+**回到 K1 原流程：**弄清单步 gate、累计 gate 和局部时间坐标后，再看下一步如何用它们构造不同衰减坐标下的 Q/K 矩阵。
+
 以下乘法和指数都按元素计算，$\alpha$ 对应 API 的 `scale`，$K_{t,j}$、$Q_{t,j}$ 已做 L2 normalize：
 
 $$
@@ -715,6 +911,7 @@ python3 operators/code/flashkda/kda_scalar_trace.py
 已经覆盖：
 
 - [x] KDA 原始逐 token 公式逐项拆解、统一 LaTeX 记号与递归数据流图、2×2 遗忘／残差／秩一更新数值例子。
+- [x] gate 激活四步拆解、自然指数与 base-2 换算、前缀和的连乘含义、chunk 数量／大小／局部时间索引与尾块边界。
 - [x] FlashKDA 的 KDA 数学、16-token chunk 内三角系统、K1 prepare → workspace → K2 recurrent state 的执行数据流及 TMA/warp specialization 边界。
 
 下一知识点：
