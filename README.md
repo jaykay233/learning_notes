@@ -7,7 +7,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo / Hunyuan Hy4 …） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
-| [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton 分块循环、blocked GEMM、seeded dropout，以及 Gluon layout / TMA / tensor core / multi-CTA 全链路与 FlashMLA sparse decode 读码 |
+| [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton/Gluon、FlashMLA/FlashKDA 数据流，以及 DeepSelect 阈值式精确 TopK 读码 |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
 | [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、Blackwell TMEM，以及 CUDA kernel launch 机制 |
 | [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
@@ -46,6 +46,9 @@ operators/                   # 算子开发（CUDA / Triton / TileLang）
 ├── 10-triton-gluon-persistent-warp-specialization.md
 ├── 11-triton-gluon-blackwell-dataflow-and-convolution.md
 ├── 12-triton-gluon-multicta-and-capstone.md
+├── 13-flashmla-sparse-attention-reading-guide.md
+├── 14-flashkda-kda-dataflow-reading-guide.md
+├── 15-deepselect-threshold-topk.md
 └── code/
     ├── cuda/                # 原生 CUDA / WMMA
     ├── triton/              # Triton；含固定 revision 的 Gluon 教程归档
@@ -274,6 +277,8 @@ models/
 | 算子开发 / Gluon Blackwell 数据流与卷积 | [operators/11-triton-gluon-blackwell-dataflow-and-convolution.md](operators/11-triton-gluon-blackwell-dataflow-and-convolution.md)；[算子目录](operators/README.md) |
 | 算子开发 / Gluon CGA、multicast、2CTA 与 capstone GEMM | [operators/12-triton-gluon-multicta-and-capstone.md](operators/12-triton-gluon-multicta-and-capstone.md)；[算子目录](operators/README.md) |
 | 算子开发 / FlashMLA sparse decode、paged quantized KV 与 split-KV softmax merge | [operators/13-flashmla-sparse-attention-reading-guide.md](operators/13-flashmla-sparse-attention-reading-guide.md)；[可运行 CPU 数学示例](operators/code/flashmla/sparse_attention_split_merge.py) |
+| 算子开发 / FlashKDA KDA 递归、chunk 三角系统与 K1/K2 | [operators/14-flashkda-kda-dataflow-reading-guide.md](operators/14-flashkda-kda-dataflow-reading-guide.md) |
+| 算子开发 / DeepSelect 阈值筛选式精确 TopK、动态 pivot 与反向最小 TopK | [operators/15-deepselect-threshold-topk.md](operators/15-deepselect-threshold-topk.md)；[可运行 CPU trace](operators/code/deepselect_threshold_demo.py) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
 | GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
