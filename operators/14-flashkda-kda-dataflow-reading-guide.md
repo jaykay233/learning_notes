@@ -545,6 +545,204 @@ $$
 
 其中 $K_{\mathrm{decay}}$、$Q_{\mathrm{decay}}$、$K_{\mathrm{inv}}$、$K_{\mathrm{restored}}$ 形状都是 $C\times K=16\times128$，$\boldsymbol g_{\mathrm{total}}$ 是 $K$ 维向量。$K_{\mathrm{restored}}$ 把 chunk 内逆衰减的 Key 换算到 chunk 末尾 state 的时间坐标。
 
+### 补充问答三：四种 Q/K 变换为什么要计算和保存？
+
+> 补充同步：2026-10-19，飞书 revision 119。[四种 Q/K 变换的含义与保存方式](https://pcng0ddyhlxs.feishu.cn/wiki/VralwO1dmi4mzAk0Z9kcDdT3nzt#doxcnd6UFEm42AmpUk83Z6tvVkc)。下文用 $k$ 表示 Key 特征维度，对应上文的 $j$；局部时间含义与前一补充问答一致。
+
+**本次讲解位置：**章节：算子开发／FlashKDA；小节：K1 的 Q/K 衰减变换；知识点：入口旧记忆、token 间影响与 chunk 末尾状态的衰减坐标；上次：gate 激活、前缀和与局部时间下标；下次：用这些矩阵构造下三角系统并计算残差修正；PTX：本节解释数学与 workspace 数据流，不展开单条 PTX 指令。
+
+**为什么现在讲这个：**只知道累计 gate 还不能判断一次读取或写入应经历哪一段衰减。若对新写入也乘入口到当前的累计比例，就会让它经历写入前的遗忘；若把逆衰减看成矩阵求逆，或把四份变换都当作历史 KV Cache，也会误读 K1/K2 的分工。
+
+**先记住一句话：它们不是四份历史 KV Cache，而是同一个 chunk 的 Q/K，预先乘好不同的衰减系数，供后面的不同计算使用。**K1 可以在不知道入口 state 内容的情况下，准备这些只依赖本 chunk 输入的变换；K2 再将它们与实际的入口 state 结合。
+
+#### 1. 同一个 K 为什么需要不同版本：传播区间不同
+
+以下固定一个 chunk，省略 chunk、sequence 和 head 下标。$t$ 是当前局部 token 位置，$s$ 是更早的局部位置，$k$ 是 Key 特征维度。$q_t,k_t\in\mathbb R^{K\times1}$ 按列向量理解；矩阵 Q/K 的第 t 行分别是它们的转置。
+
+| 要回答的问题 | 遗忘传播区间 | 对应的逐 Key 维因子 |
+| --- | --- | --- |
+| 当前 token 从 chunk 入口旧记忆读到什么 | 入口到当前 token，包含当前 token 的遗忘 | $2^{G_{t,k}}$ |
+| 更早 token 的写入对当前 token 有什么影响 | 在 token s 写入后，到 token t | $2^{G_{t,k}-G_{s,k}}$ |
+| 当前 token 的写入最终传给下一块多少 | 在当前 token 写入后，到 chunk 末尾 | $2^{g_{\mathrm{total},k}-G_{t,k}}$ |
+
+**“不同时间坐标”不是移动 token 的位置，也不是 GPU 墙钟时间，而是把不同传播区间的衰减系数提前放进向量。**所有指数都是按 Key 维逐元素计算。
+
+#### 2. K_decay：用当前 Key 查询入口旧记忆，带上入口到当前的衰减
+
+$$
+(K_{\mathrm{decay}})_{t,k}=K_{t,k}2^{G_{t,k}}
+$$
+
+令 $S_{\mathrm{in}}\in\mathbb R^{V\times K}$ 为 chunk 入口状态。先只看入口旧记忆的直接传播，不考虑 chunk 内新写入。走到 token t 时，它的贡献为 $S_{\mathrm{in}}\operatorname{diag}(2^{\boldsymbol G_t})$。用当前 Key 查询：
+
+$$
+S_{\mathrm{in}}\operatorname{diag}(2^{\boldsymbol G_t})k_t=S_{\mathrm{in}}(k_t\odot2^{\boldsymbol G_t})
+$$
+
+$\odot$ 表示逐元素乘法；右侧括号中的列向量就是 $K_{\mathrm{decay}}$ 第 t 行的转置。因此无需为每个 token 先生成一份完整的“衰减后状态”，可以把衰减移到 Key 上，再用矩阵乘法统一查询入口 state：
+
+$$
+P_{\mathrm{old}}=K_{\mathrm{decay}}S_{\mathrm{in}}^{\mathsf T}\in\mathbb R^{C\times V}
+$$
+
+它表示各 token 的 Key 从入口旧记忆预测出的 Value，不是最终输出，也还没有包含本 chunk 中更早 token 的新写入影响。后续先形成残差，再通过三角系统把这些因果修正一起解出来。
+
+#### 3. Q_decay：计算入口旧记忆对当前输出的贡献
+
+$$
+(Q_{\mathrm{decay}})_{t,k}=\alpha Q_{t,k}2^{G_{t,k}}
+$$
+
+逻辑与 Key 变换相同，但 Query 用于输出读出，$\alpha$ 对应 API 的 scale。单个 token 的入口旧记忆输出贡献是：
+
+$$
+o_{\mathrm{old},t}=S_{\mathrm{in}}(\alpha q_t\odot2^{\boldsymbol G_t})
+$$
+
+整个 chunk 一起计算：
+
+$$
+O_{\mathrm{old}}=Q_{\mathrm{decay}}S_{\mathrm{in}}^{\mathsf T}\in\mathbb R^{C\times V}
+$$
+
+**它只是完整输出中的旧记忆部分。**完整输出还要加上 chunk 内新写入的贡献，即 $O=O_{\mathrm{old}}+M_{qk}U$。
+
+#### 4. K_inv：拼出从更早 token 到当前 token 的相对衰减
+
+$$
+(K_{\mathrm{inv}})_{s,k}=K_{s,k}2^{-G_{s,k}}
+$$
+
+**这里 inv 指逆累计衰减系数，不是对 K 矩阵求逆。**一个在 token s 写入的内容，不应该经历写入之前的遗忘。到 token t 时，单由后续遗忘造成的保留比例是：
+
+$$
+2^{G_{t,k}-G_{s,k}}=2^{G_{t,k}}2^{-G_{s,k}},\qquad s\le t
+$$
+
+当前 Query 乘正累计衰减，更早的 Key 乘逆累计衰减，两者相乘就消去了写入前的那段衰减：
+
+$$
+(Q_{\mathrm{decay}}K_{\mathrm{inv}}^{\mathsf T})_{t,s}=\alpha\sum_kQ_{t,k}K_{s,k}2^{G_{t,k}-G_{s,k}}
+$$
+
+这给出更早 token 的实际修正写入，在经过中间遗忘后，对当前 Query 的投影系数。保留下三角，只允许当前 token 读取自己及更早 token 的贡献：
+
+$$
+M_{qk}=\operatorname{tril}(Q_{\mathrm{decay}}K_{\mathrm{inv}}^{\mathsf T},0)
+$$
+
+同样，Key 与 Key 的相对衰减关系用于构造 delta 修正的严格下三角依赖：
+
+$$
+L=\operatorname{diag}(\boldsymbol\beta)\operatorname{tril}(K_{\mathrm{decay}}K_{\mathrm{inv}}^{\mathsf T},-1)
+$$
+
+逆衰减可能使中间数值变大，但它只是因式分解中的补偿项，不意味着真实历史记忆被放大；真正的因果系数包含正、逆累计衰减的组合。$K_{\mathrm{inv}}$ 与 $\mathrm{INV}=(I+L)^{-1}$ 是两个不同概念。
+
+#### 5. K_restored：把各 token 的实际写入推进到 chunk 末尾
+
+$$
+(K_{\mathrm{restored}})_{t,k}=(K_{\mathrm{inv}})_{t,k}2^{g_{\mathrm{total},k}}=K_{t,k}2^{g_{\mathrm{total},k}-G_{t,k}}
+$$
+
+这次传播区间是“当前 token 写入后，到本 chunk 末尾”。越早的写入，通常经历越多后续遗忘；最后一个有效 token 的写入不再经历本块内的后续遗忘。
+
+**restored 不是说恢复成原始 K，而是把写入贡献换算到 chunk 末尾状态的时间坐标。**令 $u_t\in\mathbb R^{V\times1}$ 为实际残差修正向量，它由三角系统求出，不是直接等于原始 Value。将 $K_{\mathrm{restored}}$ 第 t 行转成列向量 $r_t$，则：
+
+$$
+r_t=k_t\odot2^{\boldsymbol g_{\mathrm{total}}-\boldsymbol G_t},\qquad \Delta S=\sum_{t=0}^{C-1}u_tr_t^{\mathsf T}=(K_{\mathrm{restored}}^{\mathsf T}U)^{\mathsf T}
+$$
+
+其中 U 的第 t 行为 $u_t^{\mathsf T}$。每一项是一个 $V\times K$ 的外积；全部写入到 chunk 末尾的贡献相加，再加入口旧状态的整块衰减：
+
+$$
+S_{\mathrm{out}}=S_{\mathrm{in}}\operatorname{diag}(2^{\boldsymbol g_{\mathrm{total}}})+\Delta S
+$$
+
+#### 6. 两 token 数值例子：亲手检查不同衰减区间
+
+为了手算，使用一个 Key 特征、两个 token，取 Q/K 都为 1、scale 为 1；这只是数学教学形状，不代表真实 FlashKDA kernel 支持该维度：
+
+$$
+K_0=K_1=Q_0=Q_1=1,\qquad\alpha=1,\qquad g_{\mathrm{act},0}=g_{\mathrm{act},1}=-1
+$$
+
+每个 token 都保留一半，因此：
+
+$$
+G_0=-1,\qquad G_1=-2,\qquad g_{\mathrm{total}}=-2
+$$
+
+| token | $K_{\mathrm{decay}}$ | $Q_{\mathrm{decay}}$ | $K_{\mathrm{inv}}$ | $K_{\mathrm{restored}}$ |
+| --- | --- | --- | --- | --- |
+| 0 | 0.5 | 0.5 | 2 | 0.5 |
+| 1 | 0.25 | 0.25 | 4 | 1 |
+
+token 0 的写入对 token 1 的系数：
+
+$$
+(Q_{\mathrm{decay}})_1(K_{\mathrm{inv}})_0=0.25\times2=0.5
+$$
+
+它只经历 token 1 的一次减半。若省略逆累计衰减、直接使用原始 Key，则会错误地得到 0.25，让新写入额外经历写入前的遗忘。
+
+当前 token 对自己输出的系数：
+
+$$
+(Q_{\mathrm{decay}})_1(K_{\mathrm{inv}})_1=0.25\times4=1
+$$
+
+当前写入不应再经历当前 token 写入前的遗忘。到 chunk 末尾，两个写入的保留系数分别为：
+
+$$
+(K_{\mathrm{restored}})_0=2\times0.25=0.5,\qquad(K_{\mathrm{restored}})_1=4\times0.25=1
+$$
+
+完整输出投影矩阵为：
+
+$$
+Q_{\mathrm{decay}}K_{\mathrm{inv}}^{\mathsf T}=\begin{bmatrix}1&2\\0.5&1\end{bmatrix},\qquad M_{qk}=\begin{bmatrix}1&0\\0.5&1\end{bmatrix}
+$$
+
+右上角是未来 token 对过去 token 的影响，必须被因果 mask 去掉。若接着本文原两 token 例子的 $U=[1,1.5]^{\mathsf T}$、入口状态 $S_{\mathrm{in}}=[2]$，则：
+
+$$
+\Delta S=[0.5\times1+1\times1.5]=[2],\qquad S_{\mathrm{out}}=[2\times0.25+2]=[2.5]
+$$
+
+#### 7. 实际保存在哪里：不是四份矩阵都交给 K2
+
+| 变换量 | 数学用途 | 当前 FlashKDA 的保存／使用方式 |
+| --- | --- | --- |
+| $K_{\mathrm{decay}}$ | 入口旧状态的 Key 预测；参与构造 L | K1 写到全局内存 workspace，K2 读取并与入口 state 相乘 |
+| $Q_{\mathrm{decay}}$ | 入口旧状态的输出；参与构造 Mqk | K1 写到 workspace，K2 读取并计算旧记忆输出贡献 |
+| $K_{\mathrm{inv}}$ | 构造相对时间衰减、L、Mqk 与 K_restored | K1 内部中间量，不作为独立 workspace 项交给 K2 |
+| $K_{\mathrm{restored}}$ | 把实际写入推进到 chunk 末尾 | K1 写到 workspace，K2 读取并计算状态更新 |
+
+四种变换的数学形状都是 $C\times K=16\times128$。其中跨 kernel 保存的三份 Q/K 变换矩阵，在当前源码中是 BF16。它们按 head 和 chunk 存放，是本次调用的中间工作区；不作为不断增长的历史 KV Cache 在后续推理调用中保留。
+
+workspace 还保存 $\boldsymbol g_{\mathrm{total}}$、$\mathrm{INV}$ 和 $M_{qk}$，加上上述三份变换矩阵，共六类中间结果：
+
+$$
+K_{\mathrm{decay}},\quad Q_{\mathrm{decay}},\quad K_{\mathrm{restored}},\quad\boldsymbol g_{\mathrm{total}},\quad\mathrm{INV},\quad M_{qk}
+$$
+
+读取流程是 K1 准备并写 workspace，然后 K2 读取；当前 launcher 在同一个 CUDA stream 中按顺序启动两者。workspace 让 K2 无需重复执行 gate 激活、前缀和、变换和三角矩阵预处理。跨 chunk 传递历史记忆的是 state，不是这些变换矩阵。
+
+#### 8. 自检与源码对应
+
+问：$K_{\mathrm{inv}}$ 是矩阵 K 的逆吗？答：不是，它是 Key 逐元素乘逆累计衰减；真正的三角矩阵逆是 $\mathrm{INV}=(I+L)^{-1}$。
+
+问：最后一个有效 token 的 $K_{\mathrm{restored}}$ 为什么等于该 token 的原始归一化 Key？答：此时 $G_{t,k}=g_{\mathrm{total},k}$，两者差为零，写入之后没有本块内的后续遗忘；这不意味着所有 token 的 K_restored 都恢复成原始 Key。
+
+问：K2 从 workspace 读取四种 Q/K 变换吗？答：不是，只独立读取其中的 K_decay、Q_decay、K_restored；K_inv 的作用已经体现在 K1 生成的小矩阵与 K_restored 中。
+
+**源码对应：**`tests/torch_ref.py` 的 `k_decayed`、`q_decayed`、`k_inv`、`k_restored` 对应四种变换；后续分别用于 state prediction、output projection、L/Mqk 和 delta state。`csrc/smxx/fwd_launch.cu` 的 workspace 布局有 `ws_kd`、`ws_qd`、`ws_kr`、`ws_gt`、`ws_inv`、`ws_mqk`，没有独立的 K_inv workspace 数组。
+
+### 回到 K1：用变换矩阵构造因果三角系统
+
+下面继续原流程：把不同时间区间的衰减装进 Q/K 之后，再构造 L、INV 与 Mqk，并把 K2 所需的六类结果写入 workspace。
+
 接着构造两个 chunk 矩阵。定义 $\boldsymbol\beta=(\beta_0,\ldots,\beta_{C-1})^{\mathsf T}$，其中 $\beta_t=\sigma(\beta_{\mathrm{logit},t})$，左乘对角矩阵表示逐 token 行缩放，而非普通矩阵与向量相乘：
 
 $$
@@ -912,6 +1110,7 @@ python3 operators/code/flashkda/kda_scalar_trace.py
 
 - [x] KDA 原始逐 token 公式逐项拆解、统一 LaTeX 记号与递归数据流图、2×2 遗忘／残差／秩一更新数值例子。
 - [x] gate 激活四步拆解、自然指数与 base-2 换算、前缀和的连乘含义、chunk 数量／大小／局部时间索引与尾块边界。
+- [x] K_decay／Q_decay／K_inv／K_restored 的传播区间、相对衰减因式分解、两 token 数值轨迹与 K1/K2 workspace 保存边界。
 - [x] FlashKDA 的 KDA 数学、16-token chunk 内三角系统、K1 prepare → workspace → K2 recurrent state 的执行数据流及 TMA/warp specialization 边界。
 
 下一知识点：
