@@ -23,12 +23,14 @@ operators/
 ├── 13-flashmla-sparse-attention-reading-guide.md  # FlashMLA sparse decode：API、paged KV、split-KV 与 softmax merge
 ├── 14-flashkda-kda-dataflow-reading-guide.md  # FlashKDA KDA：chunkwise delta rule、K1/K2 与 recurrent state
 ├── 15-deepselect-threshold-topk.md  # DeepSelect：阈值筛选式精确 TopK 与候选重选
+├── 16-official-flash-attention-varlen-paged.md  # 官方 FlashAttention：varlen/ragged prefill 与 paged KV decode
 └── code/
     ├── cuda/       # 原生 CUDA / WMMA
     ├── triton/     # OpenAI Triton；含固定 revision 的 gluon 教程归档
     ├── tilelang/   # TileLang DSL
     ├── flashmla/   # FlashMLA 数学 trace 示例
     ├── flashkda/   # FlashKDA chunk recurrence 数学 trace 示例
+    ├── flash_attention/  # ragged packing 与 paged KV 地址映射 trace
     └── deepselect_threshold_demo.py  # DeepSelect 阈值 TopK 的 CPU 可运行模型
 ```
 
@@ -74,5 +76,6 @@ operators/
 | [13-flashmla-sparse-attention-reading-guide.md](13-flashmla-sparse-attention-reading-guide.md) | FlashMLA sparse decode：DSA indices 与 paged quantized KV 的接口契约、Python→C++→kernel dispatch、split-KV 稳定 softmax 合并 |
 | [14-flashkda-kda-dataflow-reading-guide.md](14-flashkda-kda-dataflow-reading-guide.md) | FlashKDA：逐 token 公式拆解与 LaTeX 数据流图、gate/前缀和与 chunk 时间索引、四种 Q/K 变换与 workspace、U 的残差修正与三角系统推导、数值轨迹、chunkwise delta rule、三角矩阵求解、K1/K2 与 TMA/warp specialization |
 | [15-deepselect-threshold-topk.md](15-deepselect-threshold-topk.md) | DeepSelect：初始窗口精确 TopK、动态阈值过滤、shared-memory 候选重选、RadixSelect 与最小 TopK 对偶；含 CPU 可运行 trace |
+| [16-official-flash-attention-varlen-paged.md](16-official-flash-attention-varlen-paged.md) | 官方 FlashAttention：`cu_seqlens` 无 padding 打包、`cache_seqlens` 变长 decode、`block_table` paged KV，以及与 FlashInfer ragged kernel 的区别 |
 
-示例脚本：[sparse_attention_split_merge.py](code/flashmla/sparse_attention_split_merge.py)、[kda_scalar_trace.py](code/flashkda/kda_scalar_trace.py)、[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。Gluon 官方教程按固定 revision 归档在 [code/triton/gluon](code/triton/gluon/)，provenance 与运行范围见 [PROVENANCE.md](code/triton/gluon/PROVENANCE.md)。
+示例脚本：[sparse_attention_split_merge.py](code/flashmla/sparse_attention_split_merge.py)、[kda_scalar_trace.py](code/flashkda/kda_scalar_trace.py)、[varlen_paged_layout_demo.py](code/flash_attention/varlen_paged_layout_demo.py)、[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。Gluon 官方教程按固定 revision 归档在 [code/triton/gluon](code/triton/gluon/)，provenance 与运行范围见 [PROVENANCE.md](code/triton/gluon/PROVENANCE.md)。
