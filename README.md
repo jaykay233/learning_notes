@@ -162,6 +162,8 @@ models/
 │   ├── architecture.md   # DeepSeek-V4：MQA / CSA / HCA、MoE、mHC
 │   ├── mhc.md            # mHC（流形约束超连接）详解与伪代码
 │   └── mqa.md            # MQA / Attention Layer 详解
+├── deepinfer/
+│   └── architecture.md   # DeepInfer 执行骨架与 YOCO 跨层 KV source / consumer
 ├── glm-5.3/
 │   ├── architecture.md   # GLM-5.3 text-only：MLA + DSA + MoE
 │   ├── mla.md            # MLA latent attention
@@ -219,6 +221,7 @@ models/
 | 目录 | 模型 | 主干注意力 | 残差 / 额外容量 | 备注 |
 |---|---|---|---|---|
 | `deepseek_v4/` | DeepSeek-V4 | MQA + CSA/HCA | **mHC** | 压缩稀疏检索 |
+| `deepinfer/` | DeepInfer / DeepSeek-V4.1-Flash runtime | YOCO 跨层 KV 共享 | CrossLayerRuntime | 离线执行骨架、source/consumer 映射 |
 | `glm-5.3/` | GLM-5.3 text | **MLA + DSA** | 单流 | 与 Flash 不是同一套 |
 | `glm-5.3-flash/` | GLM-5.3-Flash | **KDA + MLA**（hybrid） | **mHC** | `Glm5Next*` |
 | `kimi-k3/` | Kimi-K3 | **KDA + MLA** | **AttnRes** | 对称 KDA 等 |
@@ -554,6 +557,14 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [architecture.md](models/deepseek_v4/architecture.md) | 模块树、MQA / CSA / HCA、MoE、KV 与压缩状态 |
 | [mhc.md](models/deepseek_v4/mhc.md) | mHC 动机、公式、Sinkhorn、层内数据流与伪代码 |
 | [mqa.md](models/deepseek_v4/mqa.md) | MQA 投影形状、单 KV head、RoPE/nope、CSA/HCA 与 Attention 数据流 |
+
+## DeepInfer
+
+基于 [DeepInfer 源码](https://github.com/deepseek-ai/DeepInfer)，记录离线推理执行链和 YOCO 跨层共享实现。
+
+| 文档 | 内容 |
+|---|---|
+| [architecture.md](models/deepinfer/architecture.md) | `LLM.generate()` 到 model forward 的执行骨架；YOCO 的 KV source/consumer、`shared_hidden` 与 cache alias |
 
 ## GLM-5.3
 
