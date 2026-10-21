@@ -13,7 +13,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
-| [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU） |
+| [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口与 draft block 因果可见性 |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
 | [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、SP 布局转换与 Vocab Embedding、数据随机性与 SLURM |
 | [`quantization/`](quantization/) | LLM 低比特量化、W4A8KV4、QoQ、KV4 Attention 与 SmoothAttention |
@@ -146,7 +146,8 @@ communication/
 
 ```
 speculative-decoding/
-└── 01-gpu-vs-lpu-sram.md   # verify(K)≪K×decode(1)；大 SRAM/低算力为何吃不满收益
+├── 01-gpu-vs-lpu-sram.md   # verify(K)≪K×decode(1)；大 SRAM/低算力为何吃不满收益
+└── 02-dflash-cache-window-and-block-visibility.md # SWA 窗口、DFlash cache 和 block 内 query 可见性
 ```
 
 ```
@@ -270,6 +271,7 @@ models/
 | GPU-initiated RDMA / doorbell / WQE fetch / CQE / DC / QP sharing | [communication/21](communication/21-gpu-initiated-rdma-submission-dc-qp-sharing.md) |
 | GPU-initiated 通信成本 / ordering / proxy / message rate / kernel·NIC 资源 | [communication/22](communication/22-gpu-initiated-communication-performance-cost-model.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
+| DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
 | 算子开发 / Triton `for` 循环、分块与累加 | [operators/01-triton-for-loops.md](operators/01-triton-for-loops.md)；[算子目录](operators/README.md) |
 | 算子开发 / Triton blocked GEMM 与 K-loop | [operators/02-triton-matmul-blocked-kernel.md](operators/02-triton-matmul-blocked-kernel.md)；[算子目录](operators/README.md) |
 | 算子开发 / Triton low-memory dropout 与 seeded PRNG | [operators/03-triton-low-memory-dropout.md](operators/03-triton-low-memory-dropout.md)；[算子目录](operators/README.md) |
@@ -570,7 +572,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [architecture.md](models/deepinfer/architecture.md) | `LLM.generate()` 到 model forward 的执行骨架；YOCO 的 KV source/consumer、`shared_hidden` 与 cache alias |
 | [swa-bounded-replay.md](models/deepinfer/swa-bounded-replay.md) | 主/block KV 与 SWA KV 的存储边界；精确/有界窗口公式；encoder/decoder replay；开源 mask/compact 开关与生产策略边界 |
 | [zero-overhead-scheduling.md](models/deepinfer/zero-overhead-scheduling.md) | ZOS 的 forward/post-process/sample 流水；`DEEPINFER_ZERO_OVERHEAD_SCHEDULING` 默认值；zero-overhead 与 CUDA Graph/device launch 的区别 |
-| [speculative-decoding.md](models/deepinfer/speculative-decoding.md) | DFlash 如何提出 drafts；主模型 rejection sampling 如何接受前缀/修正拒绝；Confidence Head 与 varlen 验证预算的分工 |
+| [speculative-decoding.md](models/deepinfer/speculative-decoding.md) | DFlash draft 与 target 验证；Engine/Scheduler/Worker 实际执行回路；MTPVarlen 动态预算；ZOS 跨轮 CPU/GPU overlap 与同步边界 |
 
 ## GLM-5.3
 

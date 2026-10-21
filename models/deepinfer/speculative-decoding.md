@@ -116,7 +116,157 @@ draft:       y1       y2       y3       y4
 
 注意，遇到拒绝时并不是把主模型对该位置的一次普通随机采样结果直接拿来顶替；采样器从 `max(P-Q, 0)` 的 residual 分布取 correction token。若整段 draft 都通过，则最后 fresh row 给出 bonus token。最终化逻辑在 [get_accept_result](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/tilelang_ops/sampler.py#L227-L249) 与 [finalize_verification](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/tilelang_ops/sampler.py#L338-L380)。
 
-## 5. 数值执行轨迹
+## 5. 把算法放回 DeepInfer 的真实执行循环
+
+### 本次讲解位置
+
+```text
+章节：models/deepinfer
+小节：DeepInfer speculative decode 的 Engine / Scheduler / Worker 执行链
+知识点：动态 query 长度、target 验证、下一轮 draft、ZOS 跨轮 overlap 与同步点
+上次：P/Q rejection sampling 如何接受连续前缀并修正首个拒绝
+下次：结合 Nsight Systems trace 验证这条执行链上的真实 GPU 空档
+PTX：不适用
+```
+
+### 为什么现在讲这个
+
+只知道“draft 先生成、target 再验证”还回答不了实现问题：草稿究竟在哪一轮生成、谁决定本轮验证几个、CPU 什么时候拿到接受结果、ZOS 把哪段 host 工作移出了 GPU 等待路径？这些边界决定了执行图里哪些箭头是数据依赖、哪些只是调度并行。下面按 DeepInfer 的 `LLMEngine.step()`、C++ `Scheduler`、Python `Worker` 和 GPU sampler 把稳态 decode 还原出来。
+
+### 5.1 先看一轮的真实数据与状态回路
+
+```mermaid
+flowchart LR
+  subgraph HOST[CPU 主机侧]
+    E[LLMEngine.step]
+    S[Scheduler.schedule]
+    V[MTPVarlen 选 total_q 与每请求 seqlen_q]
+    PACK[构造本轮 token 和 metadata]
+    POST[延迟处理上一轮输出<br/>更新请求 token、KV commit、draft 与 confidence]
+    E --> S --> V --> PACK
+    POST -->|更新 host MTP 状态| S
+  end
+
+  subgraph DEVICE[GPU 执行侧]
+    FIX[可选：按上一轮 sampler 结果修正本轮 seqlen]
+    FWD[主模型 forward<br/>计算 target logits 与 KV]
+    CACHE[DFlash target layers<br/>写 main cache]
+    VERIFY[sampler verification<br/>验证上一轮 draft 前缀]
+    DRAFT[DFlash decode_forward<br/>生成下一轮 draft 与 confidence]
+    OUT[保存 device 输出与 sample event]
+    FIX --> FWD --> CACHE
+    FWD --> VERIFY --> DRAFT --> OUT
+  end
+
+  PACK --> FIX
+  OUT -->|accepted count / confidence GPU tensors| FIX
+  OUT -->|sample event 完成后可被 host 回收| POST
+  DRAFT -->|新 draft token / confidence| POST
+```
+
+这张图表示的是一个稳态循环，不是“CPU 完全不碰结果”。关键状态分两处：GPU 上的 `SamplerOutput` 保存采样 token、已接受长度、预测 draft 和 confidence 等 device 结果；CPU/C++ 的 `Sequence::mtp` 与 sequence token/KV 账本由延迟的 post-process 更新。`MTPInfoPool` 则是 GPU sampler 读写 draft token 与 proposal probability 等信息的设备侧存储。
+
+### 5.2 从 `step()` 到下一轮 draft：按源码顺序走
+
+| 阶段 | 实际动作 | 产物/下一阶段依赖 | 源码 |
+|---|---|---|---|
+| 1. Engine 调度 | `LLMEngine.step()` 调 `scheduler.schedule()`，之后把 metadata 和 scheduler outputs 交给 Worker | 本轮活跃请求、`seqlen_q/k`、`total_q` | [`llm_engine.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/engine/llm_engine.py#L881-L885) |
+| 2. 选验证预算 | Decode scheduler 调 `MTPVarlen::schedule()`；无 perf curve 时每请求验证已有的全部 draft，有曲线时按预期 token/time 选预算 | 每请求 query 长度；总 query 行数限制本轮 graph size | [`scheduler.hpp`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/scheduler.hpp#L648-L659)、[`mtp_varlen.hpp`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/mtp_varlen.hpp#L150-L267) |
+| 3. 拼 query 输入 | 每请求先放一个已确定 token，再把本轮选中的 draft token 顺序放入后续 query 行 | `[当前 token, draft_1, ...]` 进入主模型 | [`prepare_tensor_input_base.cpp`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/input_metadata/prepare_tensor_input_base.cpp#L98-L122) |
+| 4. 提交主模型 | Worker 调 `execute_main_model()`；函数明确禁止内部 CUDA synchronize。启用 main CUDA Graph 时 replay 对应 graph，否则走普通 forward | 一批 query 的 target logits；主 KV 更新；DFlash 所需 target feature | [`model_runner.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/model_runner.py#L307-L335) |
+| 5. 更新 DFlash main cache | 主模型 forward 收集目标层特征，forward 尾部调用 `dflash.update_main_cache()`；decode 时这段随主模型 graph 捕获 | 下一次 DFlash draft 所需的主模型特征缓存 | [`deepseek.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/models/deepseek.py#L172-L224) |
+| 6. 验证旧 draft | sampler 用主模型 logits 和 `MTPInfoPool` 中的旧 draft 信息做真实 verification，确定连续接受前缀、拒绝修正 token 或 bonus token | `sampled_tokens`、`last_valid_offset`、接受长度 | [`sampler.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py#L213-L233)、[`_verification()`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py#L410-L480) |
+| 7. 生成新 draft | 同一次 decode sampler 接着以 `sampled_tokens.token_ids`、`last_valid_offset` 调 `mtp_module.decode_forward()` | 下一轮 draft token、proposal probability、confidence | [`sampler.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/layers/sampler.py#L235-L251)、[`dflash.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/model_executor/models/mtp/dflash.py#L347-L387) |
+| 8. 延迟回收 | sample event 完成后，host callback 把结果写回 CPU/C++ sequence 状态；C++ 只追加接受的连续 draft 前缀和最终 sampled token，并按真实产出数 commit KV | 下一轮调度可见的请求状态和新 draft 状态 | [`worker.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/worker.py#L247-L272)、[`llm_engine.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/engine/llm_engine.py#L686-L733)、[`scheduler.hpp`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/scheduler.hpp#L955-L1000) |
+
+注意阶段 6 和 7 的先后关系：**先验证旧 draft，得到本轮权威采样 token；再以这个 token 和接受位置生成新 draft。**新 draft 不能提前于它依赖的 target 验证结果产生。DFlash CUDA Graph runner 可以把 `run_drafts()` 路径 capture/replay，但这不改变上述依赖顺序，也不等于它和 target forward 并发运行，见 [`dflash_cuda_graph_runner.py`](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/dflash_cuda_graph_runner.py#L42-L91)。
+
+### 5.3 MTPVarlen 怎样把候选分配给请求
+
+先区分两个量：`num_seqs` 是当前请求数；`total_q` 是所有请求 query 行数之和。每条请求先保留一行已确定 token，因此初始预算为 `num_seqs`；额外行才是要验证的 draft。
+
+有 decode perf curve 时，源码把候选 draft 的前缀接受率估计从高到低排序。对每个候选总行数 `q`，估计：
+
+\[
+E(q)=N+\sum_{j=1}^{q-N} c_{(j)},\qquad
+T(q)=T_{base}(G(q))+s\cdot G(q)+T_{sampler},\qquad
+R(q)=\frac{E(q)}{T(q)}
+\]
+
+其中 `N=num_seqs`，`G(q)` 是能容纳 `q` 行的已 capture graph size，`s` 是 forward time slope。scheduler 选 `R(q)` 最大的 query 总预算，再把新增行分给对应请求。源码按“先选总预算、再分配到每个请求”维护两份 rate queue；ZOS 下 `schedule_cnt/process_cnt` 用来识别 post-process 是否已追上本轮 schedule，因为总预算估计与单请求分配可能拿到不同新旧轮次的 confidence。
+
+一个教学例子：两个请求 A/B，各有两个 draft 前缀估计。A 的单 token confidence 是 `[0.90, 0.67]`，累乘后 prefix rates 为 `[0.90, 0.603]`；B 的单 token confidence 是 `[0.80, 0.50]`，prefix rates 为 `[0.80, 0.40]`。假设当前活跃请求数 `N=2`，性能曲线本轮选择 `total_q=5`，也就是给两个请求基础行之外再加 3 个 draft 行：
+
+| 排名 | 候选前缀 | 估计接受概率 | 是否占用额外 query 行 |
+|---:|---|---:|---|
+| 1 | A 的第 1 个 draft | 0.900 | 是 |
+| 2 | B 的第 1 个 draft | 0.800 | 是 |
+| 3 | A 的前 2 个 draft 都通过 | 0.603 | 是 |
+| 4 | B 的前 2 个 draft 都通过 | 0.400 | 否 |
+
+于是 `seqlens_q(A)=3`、`seqlens_q(B)=2`，总和为 5。**这个例子只演示预算分配，不代表 DeepInfer 某个 benchmark 的实测值；真实选出的 `total_q` 由启动测得的 decode perf curve 和运行时 sampler 时间共同决定。**如果 perf curve 为空，代码走固定回退：每请求 `1 + draft_tokens.size()`，不做上述最优预算搜索。
+
+### 5.4 ZOS 到底重叠了什么
+
+普通同步路径常会在拿到第 N 轮 GPU 结果之后，才处理第 N 轮 host 状态、再发第 N+1 轮 forward。DeepInfer 的 ZOS 改变了 Worker 内的顺序：**先提交当前主模型 forward，再等待并处理 `prev_step_state`，最后提交当前 sample。**
+
+```mermaid
+sequenceDiagram
+  participant H as CPU Engine / Worker
+  participant S as C++ Scheduler
+  participant G as GPU stream
+
+  H->>S: schedule(N)，构造当前 batch
+  S-->>H: seq metadata / seqlens_q / total_q
+  H->>G: 可选：排入 ZOS 长度修正(N)
+  H->>G: enqueue main forward(N)，不做 CUDA synchronize
+  Note over H,G: forward(N) 已提交后，Worker 才处理上一轮状态
+  par GPU 队列
+    G->>G: sample(N-1) 完成后执行 correction(N) 与 forward(N)
+  and CPU Worker
+    H->>H: 等待 sample_end(N-1) 事件
+    H->>H: post-process(N-1)，更新 CPU 请求与 MTP 状态
+  end
+  opt 启用 MTP varlen 且存在 ZOS correction
+    H->>G: 等待 seqlens_q D2H event
+    G-->>H: corrected seqlens_q 已回到 pinned host buffer
+    H->>H: 修正 sampler metadata
+  end
+  H->>G: enqueue sample(N)
+  G->>G: 验证旧 drafts(N)，再生成新 drafts(N)
+  H->>H: 保存当前 WorkerStepState 为 prev_step_state
+  Note over H,S: 下一次 Engine.step 可先 schedule(N+1)，不先回收当前 sample(N)
+```
+
+把时间轴压成两条 lane，可以看到“overlap”具体指什么：
+
+```text
+时间 ───────────────────────────────────────────────────────────────────────>
+
+CPU: schedule(N) -> enqueue forward(N) -> wait sample_end(N-1) -> post-process(N-1)
+                                         [这段 CPU 回收可与 GPU forward(N) 重叠]
+                 -> [varlen 时 wait corrected-q D2H] -> enqueue sample(N) -> schedule(N+1)
+
+GPU: ... -> sample(N-1) -> correction(N) -> forward(N) -> sample(N) -> correction(N+1)...
+                                      └──────────────┘
+                                      可能覆盖 CPU post-process(N-1)
+```
+
+`execute_main_model()` 明确声明不得 CUDA synchronize；`Worker.execute_model_step()` 随后才调用 `_post_process_step(prev_step_state)`。后者会等上一轮 `sample_end_evt`，再做 Python/C++ 回调。因为当前 forward 已经先提交，GPU 可以在旧 sample 结束后继续跑当前 forward，而 CPU 同时处理旧结果。这是**跨 step 的 host/GPU 流水**，不是让同一个 target forward 和它依赖的 DFlash draft 任意并行。
+
+### 5.5 真实同步边界与不能夸大的地方
+
+| 边界 | 作用 | 是否仍可能挡住后续工作 |
+|---|---|---|
+| `_post_process_step(prev)` 的 `sample_end_evt.synchronize()` | 保证上一轮 GPU sampler 的结果可以被 host callback 安全读取 | 会等前一轮 sample；只是当前 forward 已在这次 wait 前提交，争取把等待藏在 forward 前段 |
+| varlen correction 的 `d2h_evt.synchronize()` | host 要用 GPU 修正后的 `seqlens_q` 改 sampler metadata | **会挡住当前 sample 的提交**；D2H 可与前面已提交的 main forward 重叠，但若 correction/拷贝较晚仍会形成 bubble |
+| verification 输出到 DFlash draft | `decode_forward()` 需要 `sampled_tokens` 与 `last_valid_offset` | 是算法数据依赖，不能把“下一轮 draft”移到本轮 target verification 之前 |
+| main forward 与 DFlash graph replay | 两种 CUDA Graph 分别减少对应路径的 host launch 开销 | graph replay 本身不证明两图重叠；main target forward 先产生 DFlash main cache，sampler verification 后再生成 draft |
+| 当前 sample 完成到 host 状态更新 | 将 device 输出转为 scheduler 可用的 accepted token、draft/confidence 状态 | ZOS 把它延迟到下一次 Worker 调用处理，没有取消同步与 host 工作 |
+
+因此读 Nsight Systems 时应验证三件事：`forward(N)` 是否覆盖了 CPU 的 `post-process(N-1)`；`corrected-q` D2H wait 是否在 forward 结束后留下空档；GPU 上 `forward(N)` 与 `sample(N)` 之间是否有 host 提交气泡。不能只看“CUDA Graph 开了”或“worker 返回了”，就推断流水没有空泡。
+
+## 6. 数值执行轨迹
 
 词表用 `A/B/C/D`，以下只演示 rejection sampling，概率按位置分别变化。
 
@@ -136,11 +286,11 @@ residual 总质量 = 0.6
 
 若 residual 抽样随机数为 `0.5`，累积分布在 `B` 后为 `1/6`，在 `C` 后为 `1`，所以 correction 是 `C`。这轮输出 `B, C`；后续 draft 全部作废。若所有 draft 都接受，则还要从最后 fresh row 的 target 分布再采一个 bonus token。
 
-## 6. Confidence Head 与动态验证长度
+## 7. Confidence Head 与动态验证长度
 
 草稿最多能提多少个 token，与本轮值得验证多少个 token，是两件事。DeepInfer 可先生成最大长度的候选，再依据每个候选的预期收益动态决定 query 中放多少个。
 
-### 6.1 Confidence 不是接受判决
+### 7.1 Confidence 不是接受判决
 
 Confidence Head 给出每个候选位置的接受率估计 `c_i`。调度侧把它们累乘成“到该位置为止整个 draft prefix 都被接受”的估计：
 
@@ -151,7 +301,7 @@ Confidence Head 给出每个候选位置的接受率估计 `c_i`。调度侧把�
 
 这让前缀成功概率随位置不增。`process_MTPInfo()` 负责累乘并保存历史接受率估计；主模型之后仍使用真实的 target/draft 分布做 rejection sampling。对应 [scheduler.hpp](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/scheduler.hpp#L1190-L1245)。
 
-### 6.2 调度器在优化什么
+### 7.2 调度器在优化什么
 
 如果当前有 `N` 个活跃请求，至少每个请求有一行当前 token；再给草稿位置分配验证预算。粗略地说，候选总 query 大小 `B` 的期望产出是：
 
@@ -163,7 +313,7 @@ E[\text{tokens}] \approx N + \sum_{j=1}^{B-N} c_{(j)}
 
 代码可在 [MTPVarlen::schedule()](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/csrc/engine/mtp_varlen.hpp#L133-L260) 阅读。confidence 与 verify 存在流水延迟：代码区分了用于 batch 总预算的旧一轮估计、用于请求长度分配的较新估计；ZOS 下最新 confidence 尚未返回时，相关长度还会由 GPU TileLang 路径异步修正。性能曲线在启用 CUDA Graph 且打开 varlen 时通过 warmup profile 初始化，见 [base.py](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/base.py#L270-L286) 与 [model_runner.py](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/deepinfer/worker/model_runner.py#L562-L610)。若没有 decode perf curve，代码回退为验证已有的全部 draft，而不是做完整的吞吐曲线优化。
 
-### 6.3 配置开关
+### 7.3 配置开关
 
 | 变量 | 含义 | 源码默认/注意事项 |
 |---|---|---|
@@ -184,7 +334,7 @@ DEEPINFER_USE_NEXTN_DECODE=0 python your_inference_entry.py
 
 DeepInfer 的部署 QA 给出 EP64/DP64 benchmark 推算：并发约 `60 sequences/rank` 时，固定验证 5 个 draft 平均验证长度约 `5.00`，动态长度约 `3.58`；平均接受长度近似 `3.30` 对 `3.21`，估算吞吐增益 `+5.4%`。这不是所有 batch、模型或机器都保证获得的提升，也不是本机实测；不同并发点的结果从 `-1.5%` 到 `+11.0%` 不等，说明调度要贴合实际性能曲线。数据在 [inference_deployment_qa.md](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/doc/inference_deployment_qa.md#L239-L256)。
 
-## 7. 可运行的 rejection sampling 教学代码
+## 8. 可运行的 rejection sampling 教学代码
 
 下面是标准公式的独立 Python 教学实现，不依赖 PyTorch/CUDA。它用逆 CDF 模拟抽样，演示“接受 draft、首拒绝时从 residual 修正、全接受时额外采 bonus”。它刻意没有加入源码的 `5e-5` 数值 penalty，以便逐项对应标准公式；这与 DeepInfer fused sampler 的浮点实现细节不同。
 
@@ -296,7 +446,7 @@ all accepted: ['B', 'D'] | all drafts accepted; appended bonus token
 
 第一种情形位置 0 接受 `B`；位置 1 拒绝 `A`，residual 抽到 `C`，后续 draft 不再输出。第二种情形 draft `B` 被接受，然后从最后一行 target 分布中按 `u=0.85` 抽出 bonus `D`。
 
-## 8. 常见误解与症状
+## 9. 常见误解与症状
 
 | 误解 | 正确理解 | 会造成什么误读 |
 |---|---|---|
@@ -307,7 +457,7 @@ all accepted: ['B', 'D'] | all drafts accepted; appended bonus token
 | “打开 varlen 就一定动态选择长度” | 没有可用 decode perf curve 时源码会走固定候选长度回退 | 以为配置名本身保证收益 |
 | “speculative decoding 免费” | 减少主模型串行步数，但额外执行 draft、保存分布/元数据和做验证 | 低接受率或小 batch 下可能没有收益 |
 
-## 9. 自测题
+## 10. 自测题
 
 1. `P(y)=0.2, Q(y)=0.8` 时 draft token 的接受概率是多少？
    答：`min(1, 0.2/0.8)=0.25`。
