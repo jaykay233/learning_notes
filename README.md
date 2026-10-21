@@ -165,7 +165,8 @@ models/
 ├── deepinfer/
 │   ├── architecture.md   # DeepInfer 执行骨架与 YOCO 跨层 KV source / consumer
 │   ├── swa-bounded-replay.md # SWA 与主 KV 状态边界、重放窗口与近似来源
-│   └── zero-overhead-scheduling.md # CPU/GPU step 流水、开关默认值与 launch 边界
+│   ├── zero-overhead-scheduling.md # CPU/GPU step 流水、开关默认值与 launch 边界
+│   └── speculative-decoding.md # DFlash 草稿、target rejection sampling、confidence 动态验证长度
 ├── glm-5.3/
 │   ├── architecture.md   # GLM-5.3 text-only：MLA + DSA + MoE
 │   ├── mla.md            # MLA latent attention
@@ -569,6 +570,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [architecture.md](models/deepinfer/architecture.md) | `LLM.generate()` 到 model forward 的执行骨架；YOCO 的 KV source/consumer、`shared_hidden` 与 cache alias |
 | [swa-bounded-replay.md](models/deepinfer/swa-bounded-replay.md) | 主/block KV 与 SWA KV 的存储边界；精确/有界窗口公式；encoder/decoder replay；开源 mask/compact 开关与生产策略边界 |
 | [zero-overhead-scheduling.md](models/deepinfer/zero-overhead-scheduling.md) | ZOS 的 forward/post-process/sample 流水；`DEEPINFER_ZERO_OVERHEAD_SCHEDULING` 默认值；zero-overhead 与 CUDA Graph/device launch 的区别 |
+| [speculative-decoding.md](models/deepinfer/speculative-decoding.md) | DFlash 如何提出 drafts；主模型 rejection sampling 如何接受前缀/修正拒绝；Confidence Head 与 varlen 验证预算的分工 |
 
 ## GLM-5.3
 
