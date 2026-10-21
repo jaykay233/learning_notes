@@ -13,7 +13,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
-| [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口与 draft block 因果可见性 |
+| [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口、DFlash 2 候选路径选择 |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
 | [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、SP 布局转换与 Vocab Embedding、数据随机性与 SLURM |
 | [`quantization/`](quantization/) | LLM 低比特量化、W4A8KV4、QoQ、KV4 Attention 与 SmoothAttention |
@@ -147,7 +147,8 @@ communication/
 ```
 speculative-decoding/
 ├── 01-gpu-vs-lpu-sram.md   # verify(K)≪K×decode(1)；大 SRAM/低算力为何吃不满收益
-└── 02-dflash-cache-window-and-block-visibility.md # SWA 窗口、DFlash cache 和 block 内 query 可见性
+├── 02-dflash-cache-window-and-block-visibility.md # SWA 窗口、DFlash cache 和 block 内 query 可见性
+└── 03-dflash2-candidate-path-selection.md # Top-K 候选、相邻边打分与轻量贪心路径选择；非标准 beam search
 ```
 
 ```
