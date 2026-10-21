@@ -9,7 +9,7 @@
 小节：DeepInfer 执行骨架与 YOCO 跨层 KV 共享
 知识点：source layer、consumer layer、shared hidden 与 KV cache alias 的区别
 上次：DeepInfer 顶层模块与 YOCO 共享缓存的口头梳理
-下次：YOCO prefill 边界、compact replay 与 SWA bounded replay
+下次：SWA KV miss、窗口截断公式与 bounded replay（见 [swa-bounded-replay.md](swa-bounded-replay.md)）
 PTX：不适用
 ```
 
@@ -253,3 +253,11 @@ layer -> kv source
 ```
 
 记住这条区分就不容易把图画反：**source 决定 cache 从哪层来；consumer 决定哪层读取它；shared hidden 是另一个跨层临时状态。**
+
+## DeepInfer 学习进度
+
+- [x] 执行骨架与 YOCO source / consumer / cache alias
+- [x] SWA KV 状态、cache miss、有界重放：[swa-bounded-replay.md](swa-bounded-replay.md)
+- [x] Zero-overhead asynchronous scheduling：[zero-overhead-scheduling.md](zero-overhead-scheduling.md)
+
+下一知识点：结合 benchmark 与 Nsight Systems trace 验证 schedule、forward、sample 和 post-process 的真实重叠。

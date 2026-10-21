@@ -163,7 +163,9 @@ models/
 │   ├── mhc.md            # mHC（流形约束超连接）详解与伪代码
 │   └── mqa.md            # MQA / Attention Layer 详解
 ├── deepinfer/
-│   └── architecture.md   # DeepInfer 执行骨架与 YOCO 跨层 KV source / consumer
+│   ├── architecture.md   # DeepInfer 执行骨架与 YOCO 跨层 KV source / consumer
+│   ├── swa-bounded-replay.md # SWA 与主 KV 状态边界、重放窗口与近似来源
+│   └── zero-overhead-scheduling.md # CPU/GPU step 流水、开关默认值与 launch 边界
 ├── glm-5.3/
 │   ├── architecture.md   # GLM-5.3 text-only：MLA + DSA + MoE
 │   ├── mla.md            # MLA latent attention
@@ -560,11 +562,13 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 
 ## DeepInfer
 
-基于 [DeepInfer 源码](https://github.com/deepseek-ai/DeepInfer)，记录离线推理执行链和 YOCO 跨层共享实现。
+基于 [DeepInfer 源码](https://github.com/deepseek-ai/DeepInfer)，记录离线推理执行链、YOCO/SWA cache 行为与异步调度。
 
 | 文档 | 内容 |
 |---|---|
 | [architecture.md](models/deepinfer/architecture.md) | `LLM.generate()` 到 model forward 的执行骨架；YOCO 的 KV source/consumer、`shared_hidden` 与 cache alias |
+| [swa-bounded-replay.md](models/deepinfer/swa-bounded-replay.md) | 主/block KV 与 SWA KV 的存储边界；精确/有界窗口公式；encoder/decoder replay；开源 mask/compact 开关与生产策略边界 |
+| [zero-overhead-scheduling.md](models/deepinfer/zero-overhead-scheduling.md) | ZOS 的 forward/post-process/sample 流水；`DEEPINFER_ZERO_OVERHEAD_SCHEDULING` 默认值；zero-overhead 与 CUDA Graph/device launch 的区别 |
 
 ## GLM-5.3
 
