@@ -206,6 +206,22 @@ R(q)=\frac{E(q)}{T(q)}
 
 于是 `seqlens_q(A)=3`、`seqlens_q(B)=2`，总和为 5。**这个例子只演示预算分配，不代表 DeepInfer 某个 benchmark 的实测值；真实选出的 `total_q` 由启动测得的 decode perf curve 和运行时 sampler 时间共同决定。**如果 perf curve 为空，代码走固定回退：每请求 `1 + draft_tokens.size()`，不做上述最优预算搜索。
 
+#### 调度器每轮都会重新选长度吗？
+
+启用 MTPVarlen 的 decode 路径时，每次进入 decode scheduler，都会按当轮可调度请求和当前可用的 confidence 状态生成验证预算：有 decode perf curve 时重新比较候选 `total_q`，再得到各请求的 `seqlens_q`；曲线不可用时则走上面的固定回退。这个决策粒度是**每次 batch/decode 调度**，不是每个 draft token 单独调一次，也不是一个请求只在开始时选一次。
+
+`decode perf curve` 通常在启动 warmup/profile 阶段测好，后续调度复用它；每轮做的是查曲线并结合 sampler 时间估算，不是重新跑 benchmark。confidence 则来自 GPU 上的 sampler/draft 路径，因此长度决策只能使用调度时已经可用的状态。普通路径通常在下一轮利用上一轮已回收的 confidence；ZOS 下 schedule 与 post-process 有流水重叠，batch 总预算和请求级分配可能看到不同新旧轮次的 confidence，部分请求长度也可能由 GPU 路径异步修正。**这不表示当前轮 target 分布 `P` 先决定了长度：当前轮的 `P` 要等主模型 forward 后才用于实际 verification。**
+
+```text
+第 t 轮调度：读取当前可用 confidence + 已测性能曲线 → 选择 q_t / seqlens_q
+      ↓
+主模型 forward：产生本轮 target 分布 P_t，并验证选中的 draft
+      ↓
+sampler：确定真实接受/拒绝，产生后续 draft 与 confidence
+      ↓
+后续调度：使用届时已经可用的状态重新选择长度
+```
+
 ### 5.4 ZOS 到底重叠了什么
 
 普通同步路径常会在拿到第 N 轮 GPU 结果之后，才处理第 N 轮 host 状态、再发第 N+1 轮 forward。DeepInfer 的 ZOS 改变了 Worker 内的顺序：**先提交当前主模型 forward，再等待并处理 `prev_step_state`，最后提交当前 sample。**
