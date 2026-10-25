@@ -9,6 +9,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
 | [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton/Gluon、FlashMLA/FlashKDA、官方 FlashAttention varlen/paged KV，以及 DeepSelect 阈值式精确 TopK 读码 |
 | [`mlc-tvm/`](mlc-tvm/) | MLC / TVM：TensorIR、Schedule、端到端模型与 tensorization |
+| [`mlir-tutorial/`](mlir-tutorial/) | MLIR 实战：Operation 树、Toy Dialect、Pass、Pattern Rewrite 与 lowering |
 | [`modern-gpu-programming-for-mlsys/`](modern-gpu-programming-for-mlsys/) | GPU layout、Tensor Core、pipeline、Blackwell TMEM，以及 CUDA kernel launch 机制 |
 | [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
@@ -291,6 +292,7 @@ models/
 | 算子开发 / 官方 FlashAttention varlen、ragged prefill 与 paged KV decode | [operators/16-official-flash-attention-varlen-paged.md](operators/16-official-flash-attention-varlen-paged.md)；[可运行 CPU layout trace](operators/code/flash_attention/varlen_paged_layout_demo.py) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
+| MLIR / Operation 树 / Toy Dialect / Pass | [mlir-tutorial/README.md](mlir-tutorial/README.md) |
 | GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
 | CUDA kernel launch / PDL / Dynamic Parallelism | [24-kernel-launch-pdl-and-dynamic-parallelism.md](modern-gpu-programming-for-mlsys/24-kernel-launch-pdl-and-dynamic-parallelism.md) |
 | LLM 量化 / W4A8KV4 / QoQ / KV4 / SmoothAttention | [quantization/01-qoq-w4a8kv4.md](quantization/01-qoq-w4a8kv4.md) |
@@ -320,6 +322,13 @@ models/
 | [03-end-to-end-model.md](mlc-tvm/03-end-to-end-model.md) | Relax 计算图、`call_tir`、DPS 与端到端执行 |
 
 完整学习环境、API 差异和后续计划见 [mlc-tvm/README.md](mlc-tvm/README.md)。
+
+## MLIR 实战系列
+
+以手写 Toy Dialect 为主线，从 IR 结构走到 Pass、Pattern Rewrite 和 dialect conversion。第一课已通过本机 LLVM/MLIR 19.1.7 验证：
+
+- [课程地图与版本说明](mlir-tutorial/README.md)
+- [01 · Operation、Block 与 Region](mlir-tutorial/01-operation-tree.md)
 
 ## Modern GPU Programming for MLSys
 
