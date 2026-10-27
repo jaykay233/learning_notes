@@ -14,7 +14,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
-| [`inference-scheduling/`](inference-scheduling/) | vLLM V1 token budget、SGLang DP attention/prefill delayer；后续覆盖 TensorRT-LLM 调度与 KV cache 抢占 |
+| [`inference-scheduling/`](inference-scheduling/) | vLLM/SGLang/TensorRT-LLM 的 token budget、DP attention、KV 抢占与 EPLB |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口、DFlash 2 候选路径选择 |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
 | [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、SP 布局转换与 Vocab Embedding、数据随机性与 SLURM |
@@ -99,7 +99,7 @@ quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
-inference-scheduling/        # V1 token budget、DP attention、prefill delayer
+inference-scheduling/        # token budget、KV 抢占、DP attention、EPLB
 speculative-decoding/        # 投机解码
 torch_compile/               # Dynamo、AOTAutograd、Dispatcher
 training/                     # autograd、初始化、训练并行、数据随机性与 SLURM
@@ -152,9 +152,17 @@ inference-scheduling/
 ├── README.md
 ├── 01-vllm-v1-token-budget-and-spec-slots.md # 两本预算账、per-request draft slot、数值 trace
 ├── 02-sglang-dp-attention-prefill-delayer.md # DP attention 混合 P/D、collective 同步、有界 prefill 延迟
+├── 03-tensorrt-llm-generation-first-and-mixed-batch.md # generation-first 与 chunked prefill 混批
+├── 04-tensorrt-llm-kv-cache-preemption.md # suspend、recompute、self-evict 阶梯
+├── 05-tensorrt-llm-ep-eplb-and-dispatch-layout.md # logical expert → physical slot 与 dispatch
+├── 06-kv-preemption-requester-vs-victim.md   # requester 与 victim 的跨框架策略差异
 └── examples/
     ├── vllm_v1_token_budget.py              # CPU 可运行预算模拟
-    └── sglang_dp_prefill_delayer.py         # CPU 可运行 DP attention 调度模拟
+    ├── sglang_dp_prefill_delayer.py         # CPU 可运行 DP attention 调度模拟
+    ├── tensorrt_llm_generation_first_budget.py
+    ├── tensorrt_llm_preemption_ladder.py
+    ├── tensorrt_llm_eplb_dispatch.py
+    └── kv_preemption_victim_policy.py       # 六个 victim policy trace
 ```
 
 ```
@@ -287,6 +295,10 @@ models/
 | GPU-initiated 通信成本 / ordering / proxy / message rate / kernel·NIC 资源 | [communication/22](communication/22-gpu-initiated-communication-performance-cost-model.md) |
 | vLLM V1 token budget / running-first / 投机 draft slot | [inference-scheduling/01](inference-scheduling/01-vllm-v1-token-budget-and-spec-slots.md) |
 | SGLang DP attention / prefill delayer / MLP·EP collective | [inference-scheduling/02](inference-scheduling/02-sglang-dp-attention-prefill-delayer.md) |
+| TensorRT-LLM generation-first / chunked prefill / PD batch 边界 | [inference-scheduling/03](inference-scheduling/03-tensorrt-llm-generation-first-and-mixed-batch.md) |
+| TensorRT-LLM KV 压力 / suspend / recompute / self-evict | [inference-scheduling/04](inference-scheduling/04-tensorrt-llm-kv-cache-preemption.md) |
+| TensorRT-LLM EP/EPLB / logical expert → physical slot | [inference-scheduling/05](inference-scheduling/05-tensorrt-llm-ep-eplb-and-dispatch-layout.md) |
+| KV 抢占 / requester vs victim / FCFS·priority·length·GNE | [inference-scheduling/06](inference-scheduling/06-kv-preemption-requester-vs-victim.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
 | 算子开发 / Triton `for` 循环、分块与累加 | [operators/01-triton-for-loops.md](operators/01-triton-for-loops.md)；[算子目录](operators/README.md) |
