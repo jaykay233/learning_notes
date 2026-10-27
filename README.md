@@ -198,6 +198,7 @@ models/
 - [ascend-ai-compiler/README.md](ascend-ai-compiler/README.md)
 - [00-syllabus-checklist.md](ascend-ai-compiler/00-syllabus-checklist.md)
 - [glossary.md](ascend-ai-compiler/glossary.md)（缩写英中对照）
+- [19-onnx-graph-optimization-and-mlir.md](ascend-ai-compiler/19-onnx-graph-optimization-and-mlir.md)（ONNX graph pass、MLIR 分层与 round-trip 边界）
 
 | 阶段 | 内容 |
 |---|---|

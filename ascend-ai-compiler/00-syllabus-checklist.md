@@ -69,6 +69,12 @@
 | 课程框架图（Frontend/Backend 分块说明） | [02](./02-compiler-overview.md) §框架图 | ✅ |
 | 适合学员 / 培养目标 | [18](./18-interview-career.md) + 本清单 | ✅ |
 
+## 补充专题
+
+| 用户问题 | 课件 | 状态 |
+|---|---|---|
+| ONNX 能否自定义图优化、它与 MLIR 是什么关系、是否应当转成 MLIR 再转回 ONNX | [19-onnx-graph-optimization-and-mlir.md](./19-onnx-graph-optimization-and-mlir.md) | ✅ |
+
 ---
 
 ## 名词替换速查

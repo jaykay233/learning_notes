@@ -3,7 +3,7 @@
 > 按原「AI 编译器」大纲 **逐条覆盖**，硬件/工具链从算能 tpu-mlir 改为 **昇腾 CANN（Compute Architecture for Neural Networks，昇腾异构计算架构；含 ATC / GE / om）**。
 > 校对表见 [00-syllabus-checklist.md](./00-syllabus-checklist.md)；**缩写英中对照**见 [glossary.md](./glossary.md)。
 >
-> **讲义深度约定**：各章按「为什么 → 怎样工作/实现（概念）→ 效果 → 用在哪 → 与前后章怎么连」展开（[01](./01-cpp-foundations.md) 为范例；**02–18 与 labs 已按同一标准加厚**）。
+> **讲义深度约定**：各章按「为什么 → 怎样工作/实现（概念）→ 效果 → 用在哪 → 与前后章怎么连」展开（[01](./01-cpp-foundations.md) 为范例；**02–19 与 labs 已按同一标准加厚**）。
 
 ## 学习顺序（与大纲一致）
 
@@ -16,6 +16,7 @@
 | **CV 部署** | [14](./14-yolov8-deploy.md) → [Lab5](./labs/lab5-yolo-stream.md) |
 | **LLM** | [15](./15-attention-on-npu.md) → [16](./16-kv-cache.md) → [17](./17-qwen-quant-deploy.md) → [Lab6](./labs/lab6-chatbot.md) |
 | **求职** | [18](./18-interview-career.md) |
+| **补充专题** | [19](./19-onnx-graph-optimization-and-mlir.md)：ONNX 自定义图优化、MLIR 关系与 round-trip 边界 |
 
 ## 文件树
 
@@ -41,6 +42,7 @@ ascend-ai-compiler/
 ├── 16-kv-cache.md
 ├── 17-qwen-quant-deploy.md
 ├── 18-interview-career.md
+├── 19-onnx-graph-optimization-and-mlir.md
 └── labs/
     ├── lab1-redundant-op-pass.md
     ├── lab2-resnet50.md
