@@ -14,6 +14,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
+| [`inference-scheduling/`](inference-scheduling/) | vLLM V1 统一 token budget、running-first、投机解码 draft slot；后续覆盖 KV cache 抢占 |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口、DFlash 2 候选路径选择 |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
 | [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、SP 布局转换与 Vocab Embedding、数据随机性与 SLURM |
@@ -98,6 +99,7 @@ quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
+inference-scheduling/        # V1 token budget、running-first、投机 slot
 speculative-decoding/        # 投机解码
 torch_compile/               # Dynamo、AOTAutograd、Dispatcher
 training/                     # autograd、初始化、训练并行、数据随机性与 SLURM
@@ -143,6 +145,13 @@ communication/
 ├── 26-deepep-v2-pp-send-recv-ring.md # V2 PP：环邻接 send/recv + inflight 槽
 ├── 27-deepep-ep-train-infer-and-backward-dual.md # EP 训练/推理边界 + 反传对偶
 └── 28-deepep-eplb-logical-physical-expert-map.md # EPLB：逻辑/物理专家与框架 remap
+```
+
+```
+inference-scheduling/
+├── README.md
+├── 01-vllm-v1-token-budget-and-spec-slots.md # 两本预算账、per-request draft slot、数值 trace
+└── examples/vllm_v1_token_budget.py        # CPU 可运行预算模拟
 ```
 
 ```
@@ -273,6 +282,7 @@ models/
 | DeepEP V1 LL recv hook / 「0 SM」重叠 | [communication/18](communication/18-deepep-v1-ll-recv-hook-zero-sm.md) |
 | GPU-initiated RDMA / doorbell / WQE fetch / CQE / DC / QP sharing | [communication/21](communication/21-gpu-initiated-rdma-submission-dc-qp-sharing.md) |
 | GPU-initiated 通信成本 / ordering / proxy / message rate / kernel·NIC 资源 | [communication/22](communication/22-gpu-initiated-communication-performance-cost-model.md) |
+| vLLM V1 token budget / running-first / 投机 draft slot | [inference-scheduling/01](inference-scheduling/01-vllm-v1-token-budget-and-spec-slots.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
 | 算子开发 / Triton `for` 循环、分块与累加 | [operators/01-triton-for-loops.md](operators/01-triton-for-loops.md)；[算子目录](operators/README.md) |
