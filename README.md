@@ -16,7 +16,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`inference-scheduling/`](inference-scheduling/) | vLLM/SGLang/TensorRT-LLM 的 token budget、DP attention、KV 抢占与 EPLB |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口、DFlash 2 候选路径选择 |
-| [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher |
+| [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher / make_fx 内部机制 |
 | [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、SP 布局转换与 Vocab Embedding、数据随机性与 SLURM |
 | [`quantization/`](quantization/) | LLM 低比特量化、W4A8KV4、QoQ、KV4 Attention 与 SmoothAttention |
 
@@ -101,7 +101,7 @@ cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
 inference-scheduling/        # token budget、KV 抢占、DP attention、EPLB
 speculative-decoding/        # 投机解码
-torch_compile/               # Dynamo、AOTAutograd、Dispatcher
+torch_compile/               # Dynamo、AOTAutograd、Dispatcher、make_fx
 training/                     # autograd、初始化、训练并行、数据随机性与 SLURM
 models/                      # DeepSeek / GLM / Kimi / Qwen / MiMo 架构笔记
 ```
@@ -176,7 +176,10 @@ speculative-decoding/
 torch_compile/
 ├── 01-dynamo-and-fx.md           # Dynamo 调用过程；FX；Script/LazyTensor 对照
 ├── 02-aot-autograd.md            # AOTAutograd：joint 图、Proxy 四步追踪、反向捕获、partition
-└── 03-dispatcher-and-modes.md    # DispatchKey / Mode / TLS / 拦截边界 / AOT 衔接
+├── 03-dispatcher-and-modes.md    # DispatchKey / Mode / TLS / 拦截边界 / AOT 衔接
+├── 04-make-fx-internals.md       # make_fx 记账循环；Proxy vs Node；不存 edges；args 不收真值
+└── code/
+    └── mini_make_fx.py           # 400 行可运行 mini make_fx，11 个 demo 逐条验证本文结论
 ```
 
 ```
@@ -323,7 +326,7 @@ models/
 | GPU layout / Tensor Core / WGMMA / TMEM | [modern-gpu-programming-for-mlsys/README.md](modern-gpu-programming-for-mlsys/README.md) |
 | CUDA kernel launch / PDL / Dynamic Parallelism | [24-kernel-launch-pdl-and-dynamic-parallelism.md](modern-gpu-programming-for-mlsys/24-kernel-launch-pdl-and-dynamic-parallelism.md) |
 | LLM 量化 / W4A8KV4 / QoQ / KV4 / SmoothAttention | [quantization/01-qoq-w4a8kv4.md](quantization/01-qoq-w4a8kv4.md) |
-| torch.compile / Dynamo / FX / AOTAutograd / Dispatcher | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md) |
+| torch.compile / Dynamo / FX / AOTAutograd / Dispatcher / make_fx | [01](torch_compile/01-dynamo-and-fx.md)、[02](torch_compile/02-aot-autograd.md)、[03 · Dispatcher/Mode](torch_compile/03-dispatcher-and-modes.md)、[04 · make_fx 内部](torch_compile/04-make-fx-internals.md) |
 | PyTorch 训练：autograd / TP-SP-DP-EP / 数据随机性 / SLURM | [training/README.md](training/README.md) |
 | MLA | [glm-5.3/mla.md](models/glm-5.3/mla.md)、[glm-5.3-flash/architecture.md](models/glm-5.3-flash/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | DSA（token/KPool 稀疏） | [glm-5.3/dsa.md](models/glm-5.3/dsa.md) |

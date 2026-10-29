@@ -533,3 +533,5 @@ compiled = aot_function(
 机制关键词：**Functionalization、FakeTensor、joint + autograd.grad、`__torch_dispatch__`、partitioner、autograd.Function 胶水。**
 
 Dispatcher / Mode / TLS /「Mode 如何排到前面」见 [03-dispatcher-and-modes.md](./03-dispatcher-and-modes.md)。
+
+`__torch_dispatch__` 内部如何记账、Proxy 与 Node 的分工、图为何不存边见 [04-make-fx-internals.md](./04-make-fx-internals.md)。

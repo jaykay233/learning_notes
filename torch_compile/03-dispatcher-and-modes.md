@@ -285,5 +285,6 @@ ProxyTorchDispatchMode / make_fx
 
 - [01-dynamo-and-fx.md](./01-dynamo-and-fx.md) — Dynamo / FX  
 - [02-aot-autograd.md](./02-aot-autograd.md) — joint 图、FakeTensor、partition  
+- [04-make-fx-internals.md](./04-make-fx-internals.md) — 进入 `__torch_dispatch__` 之后：建节点、绑句柄、模式进出栈
 - [PyTorch dispatcher walkthrough](https://github.com/pytorch/pytorch/wiki/PyTorch-dispatcher-walkthrough)  
 - [ezyang: Let's talk about the PyTorch dispatcher](https://blog.ezyang.com/2020/09/lets-talk-about-the-pytorch-dispatcher/)
