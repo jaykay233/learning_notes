@@ -4,7 +4,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 
 | 目录 | 侧重 |
 |---|---|
-| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo / Hunyuan Hy4 …） |
+| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo HySparse / Hunyuan Hy4 …） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
 | [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton/Gluon、FlashMLA/FlashKDA、官方 FlashAttention varlen/paged KV，以及 DeepSelect 阈值式精确 TopK 读码 |
@@ -210,6 +210,9 @@ models/
 │   └── ple.md            # N-gram / PLE（hash 查表、门控注入 HC）
 ├── mimo-v2.6-flash/
 │   └── architecture.md   # MiMo-V2.6-Flash：多模态、SWA/GA、GQA、MoE、MTP
+├── mimo-hysparse/
+│   ├── block-sparse-attention.md # HySparse：Q'、Top-K KV block、SWA 双分支与 causal mask
+│   └── block_gather_trace.py     # block gather、mask 与 SWA 交集的可运行 trace
 └── hy4-preview/
     └── architecture.md   # Hunyuan Hy4 Preview：Gated DSA + IndexCache、MoE、iHC
 ```
@@ -662,6 +665,7 @@ Qwen4 架构预览（`qwen4_exp`）：GDN + **QSA**，**Gated Residual（HC×4�
 | 文档 | 内容 |
 |---|---|
 | [architecture.md](models/mimo-v2.6-flash/architecture.md) | 多模态编码器、SWA/GA + GQA 公式、稀疏 MoE 与 MTP |
+| [block-sparse-attention.md](models/mimo-hysparse/block-sparse-attention.md) | HySparse 的 `Q'`、Top-K K/V block gather、候选内 dense attention、SWA 双分支与 causal mask |
 
 要点备忘：
 
