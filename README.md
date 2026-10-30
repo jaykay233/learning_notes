@@ -144,7 +144,8 @@ communication/
 ├── 25-deepep-v2-engram-fetch-rdma-get.md # V2 Engram：RDMA GET + defer/aggregate/doorbell
 ├── 26-deepep-v2-pp-send-recv-ring.md # V2 PP：环邻接 send/recv + inflight 槽
 ├── 27-deepep-ep-train-infer-and-backward-dual.md # EP 训练/推理边界 + 反传对偶
-└── 28-deepep-eplb-logical-physical-expert-map.md # EPLB：逻辑/物理专家与框架 remap
+├── 28-deepep-eplb-logical-physical-expert-map.md # EPLB：逻辑/物理专家与框架 remap
+└── 29-mok-moe-task-graph-and-grouped-gemm.md  # MoK：任务表 / CLC 抢活 / 专家行段映射
 ```
 
 ```
@@ -281,6 +282,7 @@ models/
 | CUDA Graph / memory-saver / SGLang Runner | [01](cuda-graph/01-basics-and-memory-saver.md)、[02](cuda-graph/02-sglang-cudagraph-vs-inductor-trees.md)、[03 · 几种外壳与 VMM](cuda-graph/03-flavors-vmm-and-hijack.md) |
 | GPU 通信提交 / Proxy / GDAKI / GPI | [communication/01](communication/01-proxy-gdaki-gpi.md) |
 | MoE 训练 / MoK / pull-push / buffer | [communication/02](communication/02-mok-scheduling-and-buffers.md) |
+| MoK megakernel / 任务表 / CLC 抢活 / 专家行段映射 | [communication/29](communication/29-mok-moe-task-graph-and-grouped-gemm.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
@@ -595,6 +597,7 @@ PDL 不消除 CPU launch；Dynamic Parallelism 不等同于 PDL
 | [26-deepep-v2-pp-send-recv-ring.md](communication/26-deepep-v2-pp-send-recv-ring.md) | V2 PP：环上 prev/next；四区×inflight 槽；TMA staging→put+到达 signal；recv 拷出→释放 signal |
 | [27-deepep-ep-train-infer-and-backward-dual.md](communication/27-deepep-ep-train-infer-and-backward-dual.md) | 主路径=EP（推理/训练）；PP/Engram/CP=实验旁路；反传=dispatch↔combine 对偶，复用 handle，无内置 autograd |
 | [28-deepep-eplb-logical-physical-expert-map.md](communication/28-deepep-eplb-logical-physical-expert-map.md) | EPLB：DeepEP 只认物理槽整除；框架 logical→physical + 冗余副本 + 搬权重；DeepSeek/SGLang/vLLM |
+| [29-mok-moe-task-graph-and-grouped-gemm.md](communication/29-mok-moe-task-graph-and-grouped-gemm.md) | MoK 计算编排：任务表公式与数值、grid 上界 vs 真实 cluster、CLC `try_cancel` 抢活与 drain、`compute_cluster_idx`→(expert,row block,col block) 走查、五个计数器的 `required_count`、bwd replay；附 CPU 复算脚本 |
 
 ## DeepSeek-V4
 
