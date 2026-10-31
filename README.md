@@ -146,7 +146,8 @@ communication/
 ├── 27-deepep-ep-train-infer-and-backward-dual.md # EP 训练/推理边界 + 反传对偶
 ├── 28-deepep-eplb-logical-physical-expert-map.md # EPLB：逻辑/物理专家与框架 remap
 ├── 29-mok-moe-task-graph-and-grouped-gemm.md  # MoK：任务表 / CLC 抢活 / 专家行段映射
-└── 30-mok-count-pad-schedule-dataflow.md      # MoK：count/pad/schedule 三阶段与行语义
+├── 30-mok-count-pad-schedule-dataflow.md      # MoK：count/pad/schedule 三阶段与行语义
+└── 31-mok-dispatch-combine-direction.md       # MoK：谁发起 / pull vs push / 无冲突原因
 ```
 
 ```
@@ -285,6 +286,7 @@ models/
 | MoE 训练 / MoK / pull-push / buffer | [communication/02](communication/02-mok-scheduling-and-buffers.md) |
 | MoK megakernel / 任务表 / CLC 抢活 / 专家行段映射 | [communication/29](communication/29-mok-moe-task-graph-and-grouped-gemm.md) |
 | MoK count·pad·schedule / 交错排位 / 行语义三次变化 | [communication/30](communication/30-mok-count-pad-schedule-dataflow.md) |
+| MoK dispatch·combine 方向 / pull vs push / 写冲突消除 | [communication/31](communication/31-mok-dispatch-combine-direction.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
