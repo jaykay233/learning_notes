@@ -261,10 +261,11 @@ A² = A A   ⇒  A² 也对称
 
 实现要点：
 
-- 只对 `tileI ≤ tileJ` 的 tile 发 block，算完镜像写入另一半。
-- 对角 tile 内部也对称，可再省一半，但只占 8/36，收益小，先不做。
-- 镜像写代价：每 GEMM 多 4 MB 读 + 4 MB 写 ≈ 0.025 ms，10 个 SYRK GEMM 共 0.25 ms。相对省下的 1.65 ms 完全值得。
-- 对角线的 tile 若也算半份（`i ≤ j` 的内部三角），需要 tile 内掩码，复杂度上升，先不做。
+- 只对 `ti ≤ tj` 的 tile 发 block。`grid = ntri = nt(nt+1)/2`，`blockIdx.x` 单调映射到 `(ti, tj)` 的字典序（见 §7.2 的 `tri_decode`）。
+- **镜像不能靠 epilogue 双写。** 转置位置 `C[j][i]` 跨行，单次写退化成 32 次内存事务：`2 MB × 32 = 64 MB/GEMM`，比 SYRK 省下的 165 µs 还贵。必须用一个独立的 32×32 smem 分块 transpose-copy kernel，读写两侧都合并（§7.2）。
+- 镜像代价的实测量级：4 MB 读 + 2 MB 写（只写下三角）≈ 20 µs/GEMM，10 个 SYRK GEMM 共 0.2 ms，小于省下的 1.65 ms。
+- 对角 tile 内部也对称，可再省一半 FLOP，但只占 8/36 的 tile，且需要 tile 内掩码，先不做。
+- **FLOP 只省 44% 而非 50%**：对角 tile 整块算完了 8192 个输出里的全部，浪费约 `nt × TILE²/2 = 512K` 个 FLOP，占总量的 6%。
 
 ---
 
@@ -310,6 +311,110 @@ const int bj = (blockIdx.x % nTilesN) * 32;   // N 方向
 ```
 
 一旦只有一个 block 维度，就没有「`x` 是哪个维度」可以搞反。这个改动看起来笨，但它把一个**已经犯过两次**的错误变成了不可表达。
+
+### 7.2 优化版：三处改动全是「少算」
+
+完整代码：[code/muon/muon_opt.cu](code/muon/muon_opt.cu)。对拍 + 计时脚本：[code/muon/bench_muon.py](code/muon/bench_muon.py)。
+
+> **状态**：这个版本尚未在 GPU 上跑过，数学与索引经过逐行审计但未实测。基线 [muon.cu](code/muon/muon.cu) 才是已通过 R1 对拍的那个。改动时如果只能信一个文件，信基线。
+
+| 改动 | 省掉什么 | 预期收益 |
+|---|---|---|
+| SYRK 上三角 | 两个对称 GEMM 的一半 block | `5 × 330 µs ≈ 1.65 ms` |
+| `B = cA² + bA` 融进 `A@A` 的 epilogue | 每 iter 一个独立 axpby（4 MB 读 + 4 MB 写） | `5 × 25 µs ≈ 0.13 ms` |
+| `B@X` 的 `a·Xold + acc` 融进 epilogue | 每 iter 一次 4 MB 读 + 4 MB 写 | `5 × 25 µs ≈ 0.13 ms` |
+
+新时间模型：
+
+| 项 | 每 iter | 5 iter |
+|---|---|---|
+| `A = XXᵀ`（36 块 / 1 轮） | 165 µs | 0.83 ms |
+| `A²`（36 块 / 1 轮，融合 axpby） | 165 µs | 0.83 ms |
+| `B@X`（64 块 / 2 轮） | 330 µs | 1.65 ms |
+| 两次镜像 | 20 µs | 0.10 ms |
+| **合计** | **680 µs** | **3.40 ms** |
+
+对比基线 5.3 ms：**−36%**。注意 `B@X` 占了剩下的一半，它**不能**用 SYRK 优化——`B` 对称但 `X` 是 `R×C`，`B@X` 的输出没有任何对称性。
+
+#### 三角索引解码
+
+```cuda
+// 上三角（含对角）的线性 blockIdx -> (ti, tj)。nt <= 8，循环开销可忽略。
+__device__ __forceinline__ void tri_decode(int bid, int nt, int& ti, int& tj) {
+    ti = 0;
+    int off = 0;
+    while (ti < nt - 1 && off + (nt - ti) <= bid) { off += nt - ti; ++ti; }
+    tj = ti + (bid - off);
+}
+```
+
+`nt = 8` 时 `blockIdx.x ∈ [0, 36)`，解码出 `(0,0)…(0,7), (1,1)…(1,7), … (7,7)`。这与 `ntri = nt(nt+1)/2` 的 grid 严格配对，**不会漏块**——这点比省时间更重要。
+
+#### 镜像 kernel
+
+```cuda
+// 32x32 smem 分块 transpose-copy，读写两侧都保持合并。
+// grid = nt32 * nt32；下三角块的 block 立刻 return，空转开销可忽略。
+__global__ void mirror_kernel(float* __restrict__ C, int R) {
+    __shared__ float tile[32][33];          // +1 防 bank conflict
+    const int nt32 = (R + 31) >> 5;
+    const int bi = (blockIdx.x / nt32) * 32;    // 上三角的行
+    const int bj = (blockIdx.x % nt32) * 32;    // 上三角的列
+    if (bi > bj) return;
+
+    const int tx = threadIdx.x, ty = threadIdx.y;
+    for (int a = ty; a < 32; a += blockDim.y) {
+        const int gi = bi + a, gj = bj + tx;
+        tile[a][tx] = (gi < R && gj < R) ? C[(size_t)gi * R + gj] : 0.0f;
+    }
+    __syncthreads();
+    // 只写下三角：gi > gj。对角线上已有正确值，不必重写。
+    for (int a = ty; a < 32; a += blockDim.y) {
+        const int gi = bj + a, gj = bi + tx;
+        if (gi < R && gj < R && gi > gj) C[(size_t)gi * R + gj] = tile[tx][a];
+    }
+}
+```
+
+`grid` 仍然开成正方形 `nt32 × nt32` 而不是上三角形状——因为 kernel 里已经能一步 `if (bi > bj) return;` 过滤，而用一维三角网格再解码会把「哪个是行」又搞成可错的。这里选择「多开一半 block 换掉一个 bug 面」。
+
+#### 顺序约束（最易错的一处）
+
+```text
+syrk(上三角, A = XXᵀ)  →  mirror(Am)  →  syrk(融合, B = cAm² + bAm)  →  mirror(Bm)  →  B@X
+```
+
+融合 SYRK 的 epilogue 要读 `Lin[i][j] = Am[i][j]`，而它只对上三角发 block。**如果把 `mirror(Am)` 排到融合 SYRK 后面**，`am` 的下三角还是未初始化值，结果是数值错但不会崩、不会 NaN、误差量级看着像「精度问题」。这类错误最难查，必须在注释里钉死。
+
+```cuda
+// Lin 必须指向已经镜像完成的 Am；顺序颠倒会读到未初始化的下三角。
+syrk_kernel<true><<<ntri, THREADS>>>(Am, Am, Am, Bm, R, R, nt, kCoefC, kCoefB);
+```
+
+#### 共用归约主体
+
+SYRK 与完整 GEMM 的「沿 `K` 分 stage、双缓冲累加」逐字相同，抽成 `accumulate_tile<TRANS_B>()`，两个 kernel 只在 epilogue 上分叉：
+
+| kernel | `TRANS_B` | 归约长度 | epilogue |
+|---|---|---|---|
+| `syrk_kernel<false>` | `true` | `C` | `C = acc` |
+| `syrk_kernel<true>` | `true` | `R` | `C = c·acc + b·Lin` |
+| `sgemm_kernel<false,true>` | `false` | `R` | `C = a·Xold + acc` |
+
+这样调 tile、调 `BK`、改流水线时只改一处，不会出现「两个 kernel 的 tiling 参数不一致」这种低级但致命的偏差。
+
+#### 怎么验证
+
+```bash
+cd operators/code/muon
+nvcc -O3 -arch=sm_75 -shared -Xcompiler -fPIC muon.cu     -o libmuon.so
+nvcc -O3 -arch=sm_75 -shared -Xcompiler -fPIC muon_opt.cu -o libmuon_opt.so
+python bench_muon.py
+```
+
+`bench_muon.py` 拿**基线**做参考而不是 float64 规格参考，理由是：两个版本走同一条 float32 路径，只差 tiling，互比时容差能收紧到 `rel < 3e-5`（只剩累加顺序差异）。若拿 float64 当参考，5 步迭代放大的误差会把两边的差距都盖住，看不出优化版是否引入了新错误。
+
+失败时的诊断会打出「哪些行带超差」和「基线非零而新版为 0 的元素数」——上一次 768 行没写就是这个探针抓到的。
 
 ---
 
@@ -372,6 +477,7 @@ python muon_reference_check.py --trace 1024 1024
 | float32 仿真 vs float64 参考（第 1–3 组） | **已通过**（macOS，无 GPU，`max_diff` 2.3e-5 ~ 3.0e-5） |
 | CUDA 内核 vs float64 参考（第 4 组） | **已通过**（T4 / sm_75，与判题期望逐元素一致） |
 | `spill stores` | 未记录（值得补一次 `nvcc -Xptxas -v`） |
+| 优化版 `muon_opt.cu` | **未跑过**（索引已人工审计）；用 `bench_muon.py` 与基线对拍后再标为通过 |
 
 内核代码见 [code/muon/muon.cu](code/muon/muon.cu)，即通过验证的那一版。
 
@@ -494,11 +600,37 @@ torch.set_float32_matmul_precision("highest")
 
 </details>
 
+**Q6.** SYRK 算完上三角，想让「镜像写另一半」直接放进 epilogue，一次写两个位置，为什么不行？
+
+<details><summary>答案</summary>
+
+因为 `C[j][i]` 是跨行的。线程手里的 `acc[i][j]` 属于同一行 `gi`，8 个值连续；但转置目标 `C[gj0+0..7][gi]` 是 8 个**不同行、同一列**的地址。每个都是独立的内存事务，一次 32 线程的写会裂成 32 组 → `2 MB × 32 = 64 MB/GEMM`，折算约 200 µs，比 SYRK 省下的 165 µs 还贵，整体反而变慢。
+
+必须走独立的 32×32 smem 分块 transpose-copy：先沿行读进 smem（合并），再从 smem 沿列读出后沿行写回（合并）。代价 4 MB 读 + 2 MB 写 ≈ 20 µs。
+
+**一般规律**：融合 epilogue 只在「输出布局与累加器布局一致」时才划算。任何需要转置的写入，都要单独过一遍 smem。
+
+</details>
+
+**Q7.** 优化版里如果 `mirror(Am)` 被误放到融合 SYRK 之后，会出现什么现象？
+
+<details><summary>答案</summary>
+
+不会崩、不会 NaN，只是数值错。融合 SYRK 的 epilogue 要读 `Lin[i][j] = Am[i][j]`，而它只对上三角发 block，所以 `Am` 的下三角此时还是上一轮的旧值（或首次的未初始化内存）。
+
+现象：`max abs diff` 在 1e-1 ~ 1e0 量级，看起来「像精度问题或 tiling 问题」，而行带诊断也查不出来（不是整带为 0，而是全矩阵都轻微偏移）。这类错误靠 `max abs diff` 定位不了，只能靠**审 code 的执行顺序**。
+
+所以 §7.2 里把这个约束写成注释钉在调用点上，而不是只写在笔记里。
+
+</details>
+
 ---
 
 ## 关联
 
 - 完整内核（已对拍通过）：[code/muon/muon.cu](code/muon/muon.cu)
+- 优化内核（SYRK + 融合 epilogue，未实测）：[code/muon/muon_opt.cu](code/muon/muon_opt.cu)
+- 两版对拍 + 计时：[code/muon/bench_muon.py](code/muon/bench_muon.py)
 - 对拍脚本（无需 GPU 也能验证公式）：[code/muon/muon_reference_check.py](code/muon/muon_reference_check.py)
 - 通用算子分析方法论（本文 §3–§6 的六个阶段）：[17-cuda-operator-analysis-methodology.md](17-cuda-operator-analysis-methodology.md)
 - MoE 的 ragged contraction 案例（与本题镜像）：[17-cuda-operator-analysis-methodology.md](17-cuda-operator-analysis-methodology.md) §12
