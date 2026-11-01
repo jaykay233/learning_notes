@@ -270,6 +270,8 @@ A² = A A   ⇒  A² 也对称
 
 ## 7. 实现骨架：三个 GEMM 用两个 kernel
 
+完整代码：[code/muon/muon.cu](code/muon/muon.cu)（已与 PyTorch float64 规格参考对拍通过）。
+
 | 调用 | 形态 | `TRANS_B` | 归约长度 |
 |---|---|---|---|
 | `X Xᵀ` | NT | `true`（两个操作数是同一指针） | `C` |
@@ -362,6 +364,16 @@ python muon_reference_check.py --lib ./libmuon.so
 # 看某个形状的逐步奇异值轨迹（§2 的表格就是这样得到的）
 python muon_reference_check.py --trace 1024 1024
 ```
+
+### 实际验证状态
+
+| 项 | 状态 |
+|---|---|
+| float32 仿真 vs float64 参考（第 1–3 组） | **已通过**（macOS，无 GPU，`max_diff` 2.3e-5 ~ 3.0e-5） |
+| CUDA 内核 vs float64 参考（第 4 组） | **已通过**（T4 / sm_75，与判题期望逐元素一致） |
+| `spill stores` | 未记录（值得补一次 `nvcc -Xptxas -v`） |
+
+内核代码见 [code/muon/muon.cu](code/muon/muon.cu)，即通过验证的那一版。
 
 **一个必须先做的设置**：float32 矩阵乘在 Ampere+ 上可能默认走 TF32，会把误差放大到 1e-3 量级，从而把「实现错误」和「精度选择错误」混在一起。脚本里已关掉：
 
@@ -486,7 +498,8 @@ torch.set_float32_matmul_precision("highest")
 
 ## 关联
 
-- 对拍脚本（可运行，无需 GPU 也能验证公式）：[code/muon/muon_reference_check.py](code/muon/muon_reference_check.py)
+- 完整内核（已对拍通过）：[code/muon/muon.cu](code/muon/muon.cu)
+- 对拍脚本（无需 GPU 也能验证公式）：[code/muon/muon_reference_check.py](code/muon/muon_reference_check.py)
 - 通用算子分析方法论（本文 §3–§6 的六个阶段）：[17-cuda-operator-analysis-methodology.md](17-cuda-operator-analysis-methodology.md)
 - MoE 的 ragged contraction 案例（与本题镜像）：[17-cuda-operator-analysis-methodology.md](17-cuda-operator-analysis-methodology.md) §12
 - Triton 版 blocked GEMM 与 K-loop：[02-triton-matmul-blocked-kernel.md](02-triton-matmul-blocked-kernel.md)

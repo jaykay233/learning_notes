@@ -333,7 +333,7 @@ models/
 | 算子开发 / DeepSelect 阈值筛选式精确 TopK、动态 pivot 与反向最小 TopK | [operators/15-deepselect-threshold-topk.md](operators/15-deepselect-threshold-topk.md)；[可运行 CPU trace](operators/code/deepselect_threshold_demo.py) |
 | 算子开发 / 官方 FlashAttention varlen、ragged prefill 与 paged KV decode | [operators/16-official-flash-attention-varlen-paged.md](operators/16-official-flash-attention-varlen-paged.md)；[可运行 CPU layout trace](operators/code/flash_attention/varlen_paged_layout_demo.py) |
 | 算子开发 / CUDA 算子分析方法论：分类、roofline、下标三分法、tile 反推、`__launch_bounds__`、填零与负载均衡 | [operators/17-cuda-operator-analysis-methodology.md](operators/17-cuda-operator-analysis-methodology.md)；[GELU kernel](operators/code/cuda/gelu_erf.cu)、[MoE dW kernel](operators/code/cuda/moe_expert_dw.cu) |
-| 算子开发 / Muon 单步更新：奇异值标量映射、波量化模型、SYRK 与对拍分层 | [operators/18-muon-newton-schulz-update.md](operators/18-muon-newton-schulz-update.md)；[可运行对拍脚本](operators/code/muon/muon_reference_check.py) |
+| 算子开发 / Muon 单步更新：奇异值标量映射、波量化模型、SYRK 与对拍分层 | [operators/18-muon-newton-schulz-update.md](operators/18-muon-newton-schulz-update.md)；[已对拍的内核](operators/code/muon/muon.cu)、[对拍脚本](operators/code/muon/muon_reference_check.py) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
 | MLIR / Operation 树 / Toy Dialect / Pass | [mlir-tutorial/README.md](mlir-tutorial/README.md) |
