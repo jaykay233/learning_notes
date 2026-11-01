@@ -222,7 +222,7 @@ MoE 这道题输出 134 MB，**任何全局 split-K 都要多写/多次原子累
 要求：  单元数 ≥ 4~8 × SM 数 × 每 SM 驻留 block 数
 ```
 
-- 只按 `g` 并行 → 只有 **64** 个 block，而 T4 有 40 SM × 2 block = 80 个槽位，**一轮都填不满**（0.8 波），**直接否掉**
+- 只按 `g` 并行 → 只有 **64** 个 block。按 `makespan ≈ ceil(nblocks/nSM) × T_block` 量化，64 块落在 40 SM 上必然有 SM 分到 2 块 → 利用率只有 `64/80 = 80%`，而且这 64 块之间**长度参差**，尾波还会再吃掉一截，**直接否掉**（量化模型的推导见 [18 号笔记 §5](18-muon-newton-schulz-update.md)，那里还记录了一个必须撤回的「小 tile 提高利用率」的说法）
 - 加上 k/n tile → 64 × 8 × 4 = **2048** 个单元，够用
 - GELU → 5e7/4 = 1250 万个线程，远超需求（此时反向要担心**单元太多导致发射开销**，用网格跨步循环把 block 数压到 65535 以内）
 
@@ -801,6 +801,7 @@ sync 完成隔离。若写回直接打到 global（本题就是），写回阶�
 ## 关联
 
 - 完整可运行代码：[code/cuda/gelu_erf.cu](code/cuda/gelu_erf.cu)、[code/cuda/moe_expert_dw.cu](code/cuda/moe_expert_dw.cu)
+- 同构的 FP32 GEMM 案例（复合算子、波量化、SYRK）：[18-muon-newton-schulz-update.md](18-muon-newton-schulz-update.md)
 - GPU layout、Tensor Core、pipeline 细节：[../modern-gpu-programming-for-mlsys/](../modern-gpu-programming-for-mlsys/)
 - Grouped GEMM 与 MoE dispatch 数据流：[../DeepGEMM/05-k-grouped-gemm-dataflow.md](../DeepGEMM/05-k-grouped-gemm-dataflow.md)、[../DeepGEMM/06-k-grouped-scheduler-cta-mapping.md](../DeepGEMM/06-k-grouped-scheduler-cta-mapping.md)
 - Triton 版的同类分块与 K-loop：[02-triton-matmul-blocked-kernel.md](02-triton-matmul-blocked-kernel.md)

@@ -25,8 +25,10 @@ operators/
 ├── 15-deepselect-threshold-topk.md  # DeepSelect：阈值筛选式精确 TopK 与候选重选
 ├── 16-official-flash-attention-varlen-paged.md  # 官方 FlashAttention：varlen/ragged prefill 与 paged KV decode
 ├── 17-cuda-operator-analysis-methodology.md  # CUDA 算子分析方法论：分类→roofline→tile 反推（GELU / MoE dW）
+├── 18-muon-newton-schulz-update.md  # Muon 单步更新：5 步 Newton–Schulz、奇异值标量映射、对拍分层
 └── code/
     ├── cuda/       # 原生 CUDA / WMMA
+    ├── muon/       # Muon 参考实现与对拍脚本（无需 GPU 也能验证公式）
     ├── triton/     # OpenAI Triton；含固定 revision 的 gluon 教程归档
     ├── tilelang/   # TileLang DSL
     ├── flashmla/   # FlashMLA 数学 trace 示例
@@ -79,5 +81,6 @@ operators/
 | [15-deepselect-threshold-topk.md](15-deepselect-threshold-topk.md) | DeepSelect：初始窗口精确 TopK、动态阈值过滤、shared-memory 候选重选、RadixSelect 与最小 TopK 对偶；含 CPU 可运行 trace |
 | [16-official-flash-attention-varlen-paged.md](16-official-flash-attention-varlen-paged.md) | 官方 FlashAttention：`cu_seqlens` 无 padding 打包、`cache_seqlens` 变长 decode、`block_table` paged KV，以及与 FlashInfer ragged kernel 的区别 |
 | [17-cuda-operator-analysis-methodology.md](17-cuda-operator-analysis-methodology.md) | CUDA 算子分析方法论：算子分类、roofline 与机器平衡点、下标三分法（独立维 / 分组维 / 归约维）、tile 尺寸公式反推、block 内分工与 `__launch_bounds__`、双缓冲与合并访存、填零统一边界、按最长段做负载均衡、ncu 诊断表；附 GELU 与 MoE dW 两个完整案例 |
+| [18-muon-newton-schulz-update.md](18-muon-newton-schulz-update.md) | Muon 单步更新：`V` 组合与三处待确认参数、整个迭代等价于「奇异值上的标量映射」（`p(1)=0.701`、`max p = 1.2023`、实测 `σ` 区间与 RMS）、复合算子的 roofline、波量化的正确模型（含一次撤回的更正）、SYRK 的 33%、`M>N` 转置写回与一维 grid、对拍四组测试与行带诊断 |
 
-示例脚本：[sparse_attention_split_merge.py](code/flashmla/sparse_attention_split_merge.py)、[kda_scalar_trace.py](code/flashkda/kda_scalar_trace.py)、[varlen_paged_layout_demo.py](code/flash_attention/varlen_paged_layout_demo.py)、[gelu_erf.cu](code/cuda/gelu_erf.cu)、[moe_expert_dw.cu](code/cuda/moe_expert_dw.cu)、[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。Gluon 官方教程按固定 revision 归档在 [code/triton/gluon](code/triton/gluon/)，provenance 与运行范围见 [PROVENANCE.md](code/triton/gluon/PROVENANCE.md)。
+示例脚本：[sparse_attention_split_merge.py](code/flashmla/sparse_attention_split_merge.py)、[kda_scalar_trace.py](code/flashkda/kda_scalar_trace.py)、[varlen_paged_layout_demo.py](code/flash_attention/varlen_paged_layout_demo.py)、[gelu_erf.cu](code/cuda/gelu_erf.cu)、[moe_expert_dw.cu](code/cuda/moe_expert_dw.cu)、[muon_reference_check.py](code/muon/muon_reference_check.py)、[for_loop_row_sum.py](code/triton/for_loop_row_sum.py)、[matmul_tutorial.py](code/triton/matmul_tutorial.py)、[seeded_dropout.py](code/triton/seeded_dropout.py)、[type_promotion.py](code/triton/type_promotion.py)、[broadcasting_and_chained_comparisons.py](code/triton/broadcasting_and_chained_comparisons.py)、[numpy_differences.py](code/triton/numpy_differences.py)。Gluon 官方教程按固定 revision 归档在 [code/triton/gluon](code/triton/gluon/)，provenance 与运行范围见 [PROVENANCE.md](code/triton/gluon/PROVENANCE.md)。
