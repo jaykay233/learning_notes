@@ -51,6 +51,8 @@ operators/                   # 算子开发（CUDA / Triton / TileLang）
 ├── 13-flashmla-sparse-attention-reading-guide.md
 ├── 14-flashkda-kda-dataflow-reading-guide.md
 ├── 15-deepselect-threshold-topk.md
+├── 16-official-flash-attention-varlen-paged.md
+├── 17-cuda-operator-analysis-methodology.md
 └── code/
     ├── cuda/                # 原生 CUDA / WMMA
     ├── triton/              # Triton；含固定 revision 的 Gluon 教程归档
@@ -329,6 +331,7 @@ models/
 | 算子开发 / FlashKDA KDA 递归、chunk 三角系统与 K1/K2 | [operators/14-flashkda-kda-dataflow-reading-guide.md](operators/14-flashkda-kda-dataflow-reading-guide.md) |
 | 算子开发 / DeepSelect 阈值筛选式精确 TopK、动态 pivot 与反向最小 TopK | [operators/15-deepselect-threshold-topk.md](operators/15-deepselect-threshold-topk.md)；[可运行 CPU trace](operators/code/deepselect_threshold_demo.py) |
 | 算子开发 / 官方 FlashAttention varlen、ragged prefill 与 paged KV decode | [operators/16-official-flash-attention-varlen-paged.md](operators/16-official-flash-attention-varlen-paged.md)；[可运行 CPU layout trace](operators/code/flash_attention/varlen_paged_layout_demo.py) |
+| 算子开发 / CUDA 算子分析方法论：分类、roofline、下标三分法、tile 反推、`__launch_bounds__`、填零与负载均衡 | [operators/17-cuda-operator-analysis-methodology.md](operators/17-cuda-operator-analysis-methodology.md)；[GELU kernel](operators/code/cuda/gelu_erf.cu)、[MoE dW kernel](operators/code/cuda/moe_expert_dw.cu) |
 | AscendC CPU 孪生 / Colima | [ascendc/README.md](ascendc/README.md)、[add_custom](ascendc/examples/add_custom/) |
 | MLC / TVM / TensorIR / Tensorization | [mlc-tvm/README.md](mlc-tvm/README.md) |
 | MLIR / Operation 树 / Toy Dialect / Pass | [mlir-tutorial/README.md](mlir-tutorial/README.md) |
