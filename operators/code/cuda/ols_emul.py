@@ -57,24 +57,25 @@ def gram(X: np.ndarray, y: np.ndarray):
 
 
 def gj_solve(A0: np.ndarray, b0: np.ndarray, p: int) -> np.ndarray:
-    """阶段 2（ols.cu 的选择）：Gauss-Jordan 直接消 [A|b]。零归约。"""
+    """阶段 2（ols.cu 的选择）：Gauss-Jordan，不归一化主元行。
+
+    乘数用 f = A[i][c] / A[c][c]，消完 A 只剩对角，最后 beta[i] = b[i]/A[i][i]。
+    这样第 c 步里没有任何线程写 row c，读 A[c][c] 不存在读写竞争，
+    也就不需要 warp 级同步；__syncthreads() 只要 p 次而不是 2p 次。
+    """
     A = A0.copy()
     b = b0.copy()
     for c in range(p):
-        inv = f32(1.0) / A[c, c]               # 2a 归一化第 c 行
-        for j in range(c, p):
-            A[c, j] = f32(A[c, j] * inv)
-        b[c] = f32(b[c] * inv)
-
-        for i in range(p):                      # 2b 消去其余各行
+        inv = f32(1.0) / A[c, c]
+        for i in range(p):
             if i == c:
                 continue
-            f = A[i, c]
+            f = f32(A[i, c] * inv)
             for j in range(c + 1, p):
                 A[i, j] = f32(A[i, j] - f32(f * A[c, j]))
             b[i] = f32(b[i] - f32(f * b[c]))
         # 不写回 A[i][c]：第 c 列此后再不被读，写它反而构成竞争
-    return b[:p]
+    return np.array([f32(b[i] / A[i, i]) for i in range(p)], dtype=f32)
 
 
 def chol_solve(A0: np.ndarray, b0: np.ndarray, p: int) -> np.ndarray:
