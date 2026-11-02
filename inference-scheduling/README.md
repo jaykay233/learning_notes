@@ -1,6 +1,6 @@
 # Inference Scheduling
 
-推理框架的 token budget、running/waiting 与 KV 抢占、DP attention 混合 P/D 执行、EPLB、跨 rank 同步，以及带分层 KV 的集群性能仿真。
+推理框架的 token budget、running/waiting 与 KV 抢占、DP attention 混合 P/D 执行、EPLB、跨 rank 同步、带分层 KV 的集群性能仿真，以及单机 CPU-GPU MoE 专家卸载。
 
 ## 文档索引
 
@@ -13,6 +13,7 @@
 | [05-tensorrt-llm-ep-eplb-and-dispatch-layout.md](05-tensorrt-llm-ep-eplb-and-dispatch-layout.md) | EPLB 的 logical expert → global slot/rank 映射，EP rank-major、expert-major 与 combine |
 | [06-kv-preemption-requester-vs-victim.md](06-kv-preemption-requester-vs-victim.md) | 区分 KV requester 与 victim：FCFS、priority、SGLang length retraction、GNE 与 MAX_UTILIZATION |
 | [07-compositional-inference-cluster-simulator.md](07-compositional-inference-cluster-simulator.md) | 组合式离散事件仿真：局部 compute/transfer profile、分层 KV 不变量、P-D handoff、1P-1D 标定复用与策略对比 |
+| [08-pdscope-prefill-decode-moe-offload.md](08-pdscope-prefill-decode-moe-offload.md) | PDScope：单机 MoE 专家 offload、PhasePer 分相预测、AdaptSched 跨层调度与异步 I/O |
 | [examples/vllm_v1_token_budget.py](examples/vllm_v1_token_budget.py) | 可运行的预算模拟：两个请求、14 个普通 token、6 个 draft slot、20 个输入 slot |
 | [examples/sglang_dp_prefill_delayer.py](examples/sglang_dp_prefill_delayer.py) | 可运行的 DP attention 调度模拟：三个 rank 的 mixed/all 状态与 idle units |
 | [examples/tensorrt_llm_generation_first_budget.py](examples/tensorrt_llm_generation_first_budget.py) | generation-first 与 chunked prefill 两种预算分配 trace |
@@ -31,6 +32,7 @@
 - [x] TensorRT-LLM EP/EPLB 的 logical expert 到 physical slot，以及 rank-major/expert-major dispatch
 - [x] KV allocation 失败时 requester 与 victim 的角色分离，以及跨框架 victim policy
 - [x] LLM 集群的组合式性能建模：局部服务时间、KV 容量预留、资源排队与跨拓扑复用
+- [x] PDScope 的 prefill/decode 分相专家预测、跨层代价模型与静态图异步搬运
 - [ ] TensorRT-LLM 的 ADP router、phase intent 与 dummy request
 
 ## 已经覆盖
@@ -57,6 +59,10 @@
 - 集群仿真把路由策略、局部 compute/transfer 服务模型和共享资源队列分开；换 worker 数时复用兼容 profile，重新组合事件顺序。
 - 分层 KV 的搬运必须满足目标容量先预留、源副本使用中受保护、目标副本传输完成后才可见。
 - Qwen3/L20Z/TP2 上的 1.34% 是 QA E2E MAPE；不能直接外推到 H800、其他 TP 或不同推理引擎。
+- PDScope 的跷跷板来自 prefill 的权重复用与 decode 的单 token 搬运差异；同一层专家加载成本在 decode 中无法被后续 token 摊薄。
+- PhasePer 分别为 prefill 与 decode 预测下一层专家，预测只决定预取和放置；真实 gate 输出后必须覆盖草稿路由。
+- AdaptSched 联合评估当前层放置与下一层预取；CPU 既保存权重，也可以在代价更低时执行冷专家。
+- PDScope 是单机 CPU-GPU 专家调度，不是 P/D 分离、EP、MegaMoE 或 DeepGEMM kernel 优化；它也不减少 KV cache。
 
 ## 下一知识点
 
