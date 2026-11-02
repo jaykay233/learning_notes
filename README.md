@@ -16,6 +16,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`inference-scheduling/`](inference-scheduling/) | vLLM/SGLang/TensorRT-LLM 的 token budget、DP attention、KV 抢占与 EPLB |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口、DFlash 2 候选路径选择 |
+| [`heterogeneous-inference/`](heterogeneous-inference/) | GPU 与 SRAM ASIC 的异构 decode 切分、SQD、跨芯片 KV 预取与性能边界 |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher / make_fx 内部机制 |
 | [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、SP 布局转换与 Vocab Embedding、数据随机性与 SLURM |
 | [`quantization/`](quantization/) | LLM 低比特量化、W4A8KV4、QoQ、KV4 Attention 与 SmoothAttention |
@@ -105,6 +106,7 @@ cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
 inference-scheduling/        # token budget、KV 抢占、DP attention、EPLB
 speculative-decoding/        # 投机解码
+heterogeneous-inference/     # GPU / SRAM ASIC 异构推理与 SQD
 torch_compile/               # Dynamo、AOTAutograd、Dispatcher、make_fx
 training/                     # autograd、初始化、训练并行、数据随机性与 SLURM
 models/                      # DeepSeek / GLM / Kimi / Qwen / MiMo 架构笔记
@@ -177,6 +179,12 @@ speculative-decoding/
 ├── 01-gpu-vs-lpu-sram.md   # verify(K)≪K×decode(1)；大 SRAM/低算力为何吃不满收益
 ├── 02-dflash-cache-window-and-block-visibility.md # SWA 窗口、DFlash cache 和 block 内 query 可见性
 └── 03-dflash2-candidate-path-selection.md # Top-K 候选、相邻边打分与轻量贪心路径选择；非标准 beam search
+```
+
+```
+heterogeneous-inference/
+├── README.md
+└── 01-sqd-subquadratic-disaggregation.md # SQD：quadratic/subquadratic 切分、roofline、常驻容量与跨芯片预取
 ```
 
 ```
@@ -317,6 +325,7 @@ models/
 | KV 抢占 / requester vs victim / FCFS·priority·length·GNE | [inference-scheduling/06](inference-scheduling/06-kv-preemption-requester-vs-victim.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
+| 异构推理 / SQD / quadratic–subquadratic 切分 / top-k KV 预取 | [heterogeneous-inference/01](heterogeneous-inference/01-sqd-subquadratic-disaggregation.md) |
 | 算子开发 / Triton `for` 循环、分块与累加 | [operators/01-triton-for-loops.md](operators/01-triton-for-loops.md)；[算子目录](operators/README.md) |
 | 算子开发 / Triton blocked GEMM 与 K-loop | [operators/02-triton-matmul-blocked-kernel.md](operators/02-triton-matmul-blocked-kernel.md)；[算子目录](operators/README.md) |
 | 算子开发 / Triton low-memory dropout 与 seeded PRNG | [operators/03-triton-low-memory-dropout.md](operators/03-triton-low-memory-dropout.md)；[算子目录](operators/README.md) |
