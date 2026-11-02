@@ -168,6 +168,7 @@ inference-scheduling/
 ├── 07-compositional-inference-cluster-simulator.md # PD、分层 KV、路由策略与离散事件仿真
 ├── 08-pdscope-prefill-decode-moe-offload.md # 单机 MoE 专家 offload、分相预测、跨层调度与异步 I/O
 ├── 09-impress-importance-aware-prefix-kv.md # SSD 前缀 KV、probe head、Jaccard、KV 重排与 score 缓存
+├── 10-mepic-exact-vs-approximate-kv-reuse.md # 位置无关 KV、首 block 重算、共享 tail 与精确性边界
 └── examples/
     ├── vllm_v1_token_budget.py              # CPU 可运行预算模拟
     ├── sglang_dp_prefill_delayer.py         # CPU 可运行 DP attention 调度模拟
@@ -175,7 +176,8 @@ inference-scheduling/
     ├── tensorrt_llm_preemption_ladder.py
     ├── tensorrt_llm_eplb_dispatch.py
     ├── kv_preemption_victim_policy.py       # 六个 victim policy trace
-    └── impress_importance_tiering.py          # IMPRESS 决策与重排 trace
+    ├── impress_importance_tiering.py        # IMPRESS 决策与重排 trace
+    └── mepic_position_independent_kv.py     # MEPIC 精确性边界与 block 占用 trace
 ```
 
 ```
@@ -331,6 +333,7 @@ models/
 | LLM 推理集群 / 分层 KV / PD 仿真 / 1P-1D 标定复用 | [inference-scheduling/07](inference-scheduling/07-compositional-inference-cluster-simulator.md) |
 | MoE 专家 offload / prefill-decode 跷跷板 / PhasePer·AdaptSched / PCIe 异步搬运 | [inference-scheduling/08](inference-scheduling/08-pdscope-prefill-decode-moe-offload.md) |
 | SSD 前缀 KV / probe head / Jaccard 门控 / KV reorder / score cache | [inference-scheduling/09](inference-scheduling/09-impress-importance-aware-prefix-kv.md) |
+| 位置无关 KV / 首 block 重算 / 共享 tail / MEPIC 精确性边界 | [inference-scheduling/10](inference-scheduling/10-mepic-exact-vs-approximate-kv-reuse.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
 | 异构推理 / SQD / quadratic–subquadratic 切分 / top-k KV 预取 | [heterogeneous-inference/01](heterogeneous-inference/01-sqd-subquadratic-disaggregation.md) |

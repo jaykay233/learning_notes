@@ -11,7 +11,7 @@
 小节：分层 KV 与前缀复用
 知识点：probe-head 重要 token 识别、KV 重排与 score 缓存
 上次：PDScope 的单机 MoE 专家卸载与跨层异步 I/O
-下次：把 IMPRESS 与 radix cache、HiSparse 组合时的索引和调度边界
+下次：MEPIC 的位置无关 chunk 复用，以及“首 block 重算”的精确性边界
 PTX：不适用；本节讨论 SSD、CPU、GPU 之间的 KV 数据路径
 ```
 
