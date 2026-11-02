@@ -1,6 +1,6 @@
 # Inference Scheduling
 
-推理框架的 token budget、running/waiting 与 KV 抢占、DP attention 混合 P/D 执行、EPLB、跨 rank 同步、带分层 KV 的集群性能仿真，以及单机 CPU-GPU MoE 专家卸载。
+推理框架的 token budget、running/waiting 与 KV 抢占、DP attention 混合 P/D 执行、EPLB、跨 rank 同步、带分层 KV 的集群性能仿真、SSD 前缀 KV 的重要性加载，以及单机 CPU-GPU MoE 专家卸载。
 
 ## 文档索引
 
@@ -14,12 +14,14 @@
 | [06-kv-preemption-requester-vs-victim.md](06-kv-preemption-requester-vs-victim.md) | 区分 KV requester 与 victim：FCFS、priority、SGLang length retraction、GNE 与 MAX_UTILIZATION |
 | [07-compositional-inference-cluster-simulator.md](07-compositional-inference-cluster-simulator.md) | 组合式离散事件仿真：局部 compute/transfer profile、分层 KV 不变量、P-D handoff、1P-1D 标定复用与策略对比 |
 | [08-pdscope-prefill-decode-moe-offload.md](08-pdscope-prefill-decode-moe-offload.md) | PDScope：单机 MoE 专家 offload、PhasePer 分相预测、AdaptSched 跨层调度与异步 I/O |
+| [09-impress-importance-aware-prefix-kv.md](09-impress-importance-aware-prefix-kv.md) | IMPRESS：probe head 重要性识别、Jaccard 门控、radix node 内 KV 重排与 score 缓存 |
 | [examples/vllm_v1_token_budget.py](examples/vllm_v1_token_budget.py) | 可运行的预算模拟：两个请求、14 个普通 token、6 个 draft slot、20 个输入 slot |
 | [examples/sglang_dp_prefill_delayer.py](examples/sglang_dp_prefill_delayer.py) | 可运行的 DP attention 调度模拟：三个 rank 的 mixed/all 状态与 idle units |
 | [examples/tensorrt_llm_generation_first_budget.py](examples/tensorrt_llm_generation_first_budget.py) | generation-first 与 chunked prefill 两种预算分配 trace |
 | [examples/tensorrt_llm_preemption_ladder.py](examples/tensorrt_llm_preemption_ladder.py) | token budget、suspend、HELD、recompute pause 与 self-evict 决策 trace |
 | [examples/tensorrt_llm_eplb_dispatch.py](examples/tensorrt_llm_eplb_dispatch.py) | logical top-k 经 EPLB 重映射后的 rank/slot、combine 和通信布局数值 trace |
 | [examples/kv_preemption_victim_policy.py](examples/kv_preemption_victim_policy.py) | 六个 CPU trace，对照 requester、victim、self-preempt 与 waiting 的不同结果 |
+| [examples/impress_importance_tiering.py](examples/impress_importance_tiering.py) | Jaccard 门控、共享重要 token、score 缓存、节点内重排与 K/V 向量数的 CPU trace |
 
 ## 当前进度
 
@@ -33,6 +35,7 @@
 - [x] KV allocation 失败时 requester 与 victim 的角色分离，以及跨框架 victim policy
 - [x] LLM 集群的组合式性能建模：局部服务时间、KV 容量预留、资源排队与跨拓扑复用
 - [x] PDScope 的 prefill/decode 分相专家预测、跨层代价模型与静态图异步搬运
+- [x] IMPRESS 的 probe head 识别、相似度回退、KV 重排与重要性感知缓存
 - [ ] TensorRT-LLM 的 ADP router、phase intent 与 dummy request
 
 ## 已经覆盖
@@ -63,10 +66,16 @@
 - PhasePer 分别为 prefill 与 decode 预测下一层专家，预测只决定预取和放置；真实 gate 输出后必须覆盖草稿路由。
 - AdaptSched 联合评估当前层放置与下一层预取；CPU 既保存权重，也可以在代价更低时执行冷专家。
 - PDScope 是单机 CPU-GPU 专家调度，不是 P/D 分离、EP、MegaMoE 或 DeepGEMM kernel 优化；它也不减少 KV cache。
+- IMPRESS 优化共享前缀从 SSD/CPU 到 GPU 的加载，不减少完整 KV 的总容量；完整副本仍保留在磁盘。
+- probe head 只负责估计重要 token 集合；被选 token 的 K/V 仍需从全部 head 读取。
+- probe 相似度低于相对阈值时必须回退到完整加载，否则省 I/O 的代价可能是个别 head 的 attention 失真。
+- KV reorder 只能在 radix node 内进行；chunk 级读取是否受益取决于重要 token 是否被重排到更少的 chunk。
+- score 由访问频率和重要比例共同决定，单纯 LRU/LFU 会把热但低重要比例的 chunk 留在 GPU。
+- IMPRESS 与 HiSparse 正交：前者减少前缀复用时的慢层 I/O，后者选择 decode 每一步访问的 KV block。
 
 ## 下一知识点
 
-转入 TensorRT-LLM：沿 `ADPRouter`、`_balance_adp_requests()`、`_ADPForwardIntent` 和 dummy request 路径，解释 attention DP 如何协商本轮 phase，以及它与 SGLang prefill delayer 的差异。
+比较 IMPRESS、radix cache 与 HiSparse 在请求、共享 prefix 和 decode block 三层的索引边界，以及组合它们时的调度约束。TensorRT-LLM ADP 顺延到后续笔记。
 
 ## 源码快照
 
@@ -76,4 +85,5 @@
 - SGLang（06）：`635430d07378e2b12381353781a23b0704969909`
 - TensorRT-LLM：`0372799d1543ef5920c1318b829cf127800dbcb9`
 - 自适应预算修正：`0914ed2e81`
+- IMPRESS / HyperInfer：`91df7a2fc12581c6780a6485c5b50e7fd9ef9d0e`
 - 依赖：Python 3.10+；示例仅需标准库，不需要 GPU

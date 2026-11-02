@@ -14,7 +14,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
-| [`inference-scheduling/`](inference-scheduling/) | vLLM/SGLang/TensorRT-LLM 的 token budget、DP attention、KV 抢占、EPLB、集群性能仿真与单机 MoE 专家 offload |
+| [`inference-scheduling/`](inference-scheduling/) | vLLM/SGLang/TensorRT-LLM 的 token budget、DP attention、KV 抢占、EPLB、集群性能仿真、前缀 KV I/O 与单机 MoE 专家 offload |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口、DFlash 2 候选路径选择 |
 | [`heterogeneous-inference/`](heterogeneous-inference/) | GPU 资源池与 SRAM ASIC 的异构推理；SQD、AFD/AFlex、动态调频、KV 预取与性能边界 |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher / make_fx 内部机制 |
@@ -104,7 +104,7 @@ quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
-inference-scheduling/        # token budget、KV 抢占、DP attention、EPLB、集群仿真、MoE offload
+inference-scheduling/        # token budget、KV 抢占、DP attention、EPLB、集群仿真、前缀 KV I/O、MoE offload
 speculative-decoding/        # 投机解码
 heterogeneous-inference/     # GPU 资源池 / SRAM ASIC 异构推理、SQD 与 AFlex
 torch_compile/               # Dynamo、AOTAutograd、Dispatcher、make_fx
@@ -167,13 +167,15 @@ inference-scheduling/
 ├── 06-kv-preemption-requester-vs-victim.md   # requester 与 victim 的跨框架策略差异
 ├── 07-compositional-inference-cluster-simulator.md # PD、分层 KV、路由策略与离散事件仿真
 ├── 08-pdscope-prefill-decode-moe-offload.md # 单机 MoE 专家 offload、分相预测、跨层调度与异步 I/O
+├── 09-impress-importance-aware-prefix-kv.md # SSD 前缀 KV、probe head、Jaccard、KV 重排与 score 缓存
 └── examples/
     ├── vllm_v1_token_budget.py              # CPU 可运行预算模拟
     ├── sglang_dp_prefill_delayer.py         # CPU 可运行 DP attention 调度模拟
     ├── tensorrt_llm_generation_first_budget.py
     ├── tensorrt_llm_preemption_ladder.py
     ├── tensorrt_llm_eplb_dispatch.py
-    └── kv_preemption_victim_policy.py       # 六个 victim policy trace
+    ├── kv_preemption_victim_policy.py       # 六个 victim policy trace
+    └── impress_importance_tiering.py          # IMPRESS 决策与重排 trace
 ```
 
 ```
@@ -328,6 +330,7 @@ models/
 | KV 抢占 / requester vs victim / FCFS·priority·length·GNE | [inference-scheduling/06](inference-scheduling/06-kv-preemption-requester-vs-victim.md) |
 | LLM 推理集群 / 分层 KV / PD 仿真 / 1P-1D 标定复用 | [inference-scheduling/07](inference-scheduling/07-compositional-inference-cluster-simulator.md) |
 | MoE 专家 offload / prefill-decode 跷跷板 / PhasePer·AdaptSched / PCIe 异步搬运 | [inference-scheduling/08](inference-scheduling/08-pdscope-prefill-decode-moe-offload.md) |
+| SSD 前缀 KV / probe head / Jaccard 门控 / KV reorder / score cache | [inference-scheduling/09](inference-scheduling/09-impress-importance-aware-prefix-kv.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
 | 异构推理 / SQD / quadratic–subquadratic 切分 / top-k KV 预取 | [heterogeneous-inference/01](heterogeneous-inference/01-sqd-subquadratic-disaggregation.md) |
