@@ -1,6 +1,6 @@
 # Inference Scheduling
 
-推理框架的 token budget、running/waiting 与 KV 抢占、DP attention 混合 P/D 执行、EPLB、跨 rank 同步、带分层 KV 的集群性能仿真、SSD 前缀 KV 的重要性加载、位置无关 KV 复用，以及单机 CPU-GPU MoE 专家卸载。
+推理框架的 token budget、running/waiting 与 KV 抢占、DP attention 混合 P/D 执行、EPLB、跨 rank 同步、带分层 KV 的集群性能仿真、SSD 前缀 KV 的重要性加载、位置无关 KV 复用、多级存储聚合带宽检索，以及单机 CPU-GPU MoE 专家卸载。
 
 ## 文档索引
 
@@ -17,6 +17,7 @@
 | [09-impress-importance-aware-prefix-kv.md](09-impress-importance-aware-prefix-kv.md) | IMPRESS：probe head 重要性识别、Jaccard 门控、radix node 内 KV 重排与 score 缓存 |
 | [10-mepic-exact-vs-approximate-kv-reuse.md](10-mepic-exact-vs-approximate-kv-reuse.md) | MEPIC：位置无关 chunk 复用、首 block 重算、共享 tail 与精确性边界 |
 | [11-pd-resource-allocation-and-simulator.md](11-pd-resource-allocation-and-simulator.md) | P/D 资源分配：有效 Prefill 吞吐、连续实例数、整数配置搜索与 benchmark-calibrated 离散事件仿真 |
+| [12-kvstream-multitier-kv-retrieval.md](12-kvstream-multitier-kv-retrieval.md) | KVStream：step 级 I/O 池、NVMe/PFS 聚合带宽、完成驱动路由、延迟写与 TTFT 边界 |
 | [examples/vllm_v1_token_budget.py](examples/vllm_v1_token_budget.py) | 可运行的预算模拟：两个请求、14 个普通 token、6 个 draft slot、20 个输入 slot |
 | [examples/sglang_dp_prefill_delayer.py](examples/sglang_dp_prefill_delayer.py) | 可运行的 DP attention 调度模拟：三个 rank 的 mixed/all 状态与 idle units |
 | [examples/tensorrt_llm_generation_first_budget.py](examples/tensorrt_llm_generation_first_budget.py) | generation-first 与 chunked prefill 两种预算分配 trace |
@@ -26,6 +27,7 @@
 | [examples/impress_importance_tiering.py](examples/impress_importance_tiering.py) | Jaccard 门控、共享重要 token、score 缓存、节点内重排与 K/V 向量数的 CPU trace |
 | [examples/mepic_position_independent_kv.py](examples/mepic_position_independent_kv.py) | MEPIC 的 block 占用、精确/近似路径与 RoPE、上下文误差来源的 CPU trace |
 | [examples/pd_capacity_simulator.py](examples/pd_capacity_simulator.py) | P/D 容量公式、Prefill/Decode/KV 请求生命周期、P95/P99 与候选配置对比的 CPU 离散事件仿真 |
+| [examples/kvstream_multitier_retrieval.py](examples/kvstream_multitier_retrieval.py) | NVMe/PFS 带宽漂移下固定切分与完成驱动路由的离散事件对比 |
 
 ## 当前进度
 
@@ -42,6 +44,7 @@
 - [x] IMPRESS 的 probe head 识别、相似度回退、KV 重排与重要性感知缓存
 - [x] MEPIC 的位置无关 chunk 复用、首 block 重算与精确性边界
 - [x] P/D 资源数量公式、TTFT 下的有效 Prefill 吞吐、TPOT 下的 Decode batch 与离散事件仿真
+- [x] KVStream 的 step 级多级存储读取池、聚合带宽下界、完成驱动路由与写放大边界
 - [ ] TensorRT-LLM 的 ADP router、phase intent 与 dummy request
 
 ## 已经覆盖
@@ -86,10 +89,16 @@
 - Decode 吞吐必须取满足 TPOT 的 batch 点；连续实例数向上取整后还要重新计算容量，`3P4D` 约为 4.875 MTPM，不能严格覆盖 5 MTPM。
 - 离散事件仿真器把 P 队列、D batch、KV transfer、请求生命周期和 P95/P99 分开记录，适合在解析公式给出的候选范围内搜索整数配置。
 - 仿真的准确性由 P/D profile、KV 传输模型和请求 trace 决定；有限 trace 的吞吐读数包含启动与 drain，不是稳态容量本身。
+- KVStream 的“并行 I/O 队列”是按 chunk 维护的逻辑任务池，底层用 `io_uring` 的 submission/completion queue 实现乱序完成。
+- NVMe 是节点本地 SSD 路径，PFS 是集群共享文件系统；只有两条路径独立时，读带宽才近似满足 `b_NVMe + b_PFS`。
+- 完成驱动路由不需要预测带宽；某一层完成一批就从列表端点继续领取任务，快的层自然承担更多字节。
+- 聚合带宽上界只覆盖 storage-to-host 的读取；端到端收益还要经过 H2D、forward、队列和 SLO 放大。
+- 全层复制把写放大约提高到 2 倍；host cache 足够或复用率降到 4% 时，KVStream 可能没有收益甚至慢于 LMCache。
+- 6.07 倍是 SWE-bench、CV=4、32B、Testbed-2 的平均 TTFT 结果，不是单个 chunk 的读取加速，也不是普遍承诺。
 
 ## 下一知识点
 
-把 P/D simulator 接入真实的 Prefill/Decode/KV profile 与请求 trace，验证模型外推误差。比较 radix cache、IMPRESS、MEPIC 与 HiSparse 在请求、共享 prefix、可复用 chunk 和 decode block 四层的索引与复用边界。TensorRT-LLM ADP 顺延到后续笔记。
+把 KVStream 的 completion-driven 路由接入真实带宽 trace，并比较 KV compression、request reordering 与 P/D disaggregation 如何共同改变存储读取需求 `D_i` 和有效带宽 `b_i`。TensorRT-LLM ADP 顺延到后续笔记。
 
 ## 源码与论文快照
 
@@ -102,4 +111,5 @@
 - IMPRESS / HyperInfer：`91df7a2fc12581c6780a6485c5b50e7fd9ef9d0e`
 - MEPIC：arXiv `2512.16822v1`
 - P/D 资源分配：arXiv `2603.04716v1`；公众号 `LLM软硬协同优化`，2026-09-11
+- KVStream：arXiv `2610.31827v1`；公众号 `LLM软硬协同优化`，2026-10-27
 - 依赖：Python 3.10+；示例仅需标准库，不需要 GPU

@@ -170,6 +170,7 @@ inference-scheduling/
 ├── 09-impress-importance-aware-prefix-kv.md # SSD 前缀 KV、probe head、Jaccard、KV 重排与 score 缓存
 ├── 10-mepic-exact-vs-approximate-kv-reuse.md # 位置无关 KV、首 block 重算、共享 tail 与精确性边界
 ├── 11-pd-resource-allocation-and-simulator.md # P/D 容量公式、有效吞吐、整数配置与离散事件仿真
+├── 12-kvstream-multitier-kv-retrieval.md # NVMe/PFS 聚合带宽、完成驱动 I/O 与 TTFT 边界
 └── examples/
     ├── vllm_v1_token_budget.py              # CPU 可运行预算模拟
     ├── sglang_dp_prefill_delayer.py         # CPU 可运行 DP attention 调度模拟
@@ -179,7 +180,8 @@ inference-scheduling/
     ├── kv_preemption_victim_policy.py       # 六个 victim policy trace
     ├── pd_capacity_simulator.py             # P/D 队列、batch、KV transfer 与 SLO 仿真
     ├── impress_importance_tiering.py        # IMPRESS 决策与重排 trace
-    └── mepic_position_independent_kv.py     # MEPIC 精确性边界与 block 占用 trace
+    ├── mepic_position_independent_kv.py     # MEPIC 精确性边界与 block 占用 trace
+    └── kvstream_multitier_retrieval.py      # 固定切分与完成驱动多级 KV 读取
 ```
 
 ```
@@ -337,6 +339,7 @@ models/
 | SSD 前缀 KV / probe head / Jaccard 门控 / KV reorder / score cache | [inference-scheduling/09](inference-scheduling/09-impress-importance-aware-prefix-kv.md) |
 | 位置无关 KV / 首 block 重算 / 共享 tail / MEPIC 精确性边界 | [inference-scheduling/10](inference-scheduling/10-mepic-exact-vs-approximate-kv-reuse.md) |
 | P/D 资源分配 / 有效 Prefill 吞吐 / 整数配置 / 离散事件仿真 | [inference-scheduling/11](inference-scheduling/11-pd-resource-allocation-and-simulator.md) |
+| KVStream / NVMe+PFS 聚合带宽 / 完成驱动 I/O 池 / 写放大与 TTFT 边界 | [inference-scheduling/12](inference-scheduling/12-kvstream-multitier-kv-retrieval.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
 | 异构推理 / SQD / quadratic–subquadratic 切分 / top-k KV 预取 | [heterogeneous-inference/01](heterogeneous-inference/01-sqd-subquadratic-disaggregation.md) |
