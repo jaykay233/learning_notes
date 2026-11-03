@@ -16,6 +16,7 @@
 | [08-pdscope-prefill-decode-moe-offload.md](08-pdscope-prefill-decode-moe-offload.md) | PDScope：单机 MoE 专家 offload、PhasePer 分相预测、AdaptSched 跨层调度与异步 I/O |
 | [09-impress-importance-aware-prefix-kv.md](09-impress-importance-aware-prefix-kv.md) | IMPRESS：probe head 重要性识别、Jaccard 门控、radix node 内 KV 重排与 score 缓存 |
 | [10-mepic-exact-vs-approximate-kv-reuse.md](10-mepic-exact-vs-approximate-kv-reuse.md) | MEPIC：位置无关 chunk 复用、首 block 重算、共享 tail 与精确性边界 |
+| [11-pd-resource-allocation-and-simulator.md](11-pd-resource-allocation-and-simulator.md) | P/D 资源分配：有效 Prefill 吞吐、连续实例数、整数配置搜索与 benchmark-calibrated 离散事件仿真 |
 | [examples/vllm_v1_token_budget.py](examples/vllm_v1_token_budget.py) | 可运行的预算模拟：两个请求、14 个普通 token、6 个 draft slot、20 个输入 slot |
 | [examples/sglang_dp_prefill_delayer.py](examples/sglang_dp_prefill_delayer.py) | 可运行的 DP attention 调度模拟：三个 rank 的 mixed/all 状态与 idle units |
 | [examples/tensorrt_llm_generation_first_budget.py](examples/tensorrt_llm_generation_first_budget.py) | generation-first 与 chunked prefill 两种预算分配 trace |
@@ -24,6 +25,7 @@
 | [examples/kv_preemption_victim_policy.py](examples/kv_preemption_victim_policy.py) | 六个 CPU trace，对照 requester、victim、self-preempt 与 waiting 的不同结果 |
 | [examples/impress_importance_tiering.py](examples/impress_importance_tiering.py) | Jaccard 门控、共享重要 token、score 缓存、节点内重排与 K/V 向量数的 CPU trace |
 | [examples/mepic_position_independent_kv.py](examples/mepic_position_independent_kv.py) | MEPIC 的 block 占用、精确/近似路径与 RoPE、上下文误差来源的 CPU trace |
+| [examples/pd_capacity_simulator.py](examples/pd_capacity_simulator.py) | P/D 容量公式、Prefill/Decode/KV 请求生命周期、P95/P99 与候选配置对比的 CPU 离散事件仿真 |
 
 ## 当前进度
 
@@ -39,6 +41,7 @@
 - [x] PDScope 的 prefill/decode 分相专家预测、跨层代价模型与静态图异步搬运
 - [x] IMPRESS 的 probe head 识别、相似度回退、KV 重排与重要性感知缓存
 - [x] MEPIC 的位置无关 chunk 复用、首 block 重算与精确性边界
+- [x] P/D 资源数量公式、TTFT 下的有效 Prefill 吞吐、TPOT 下的 Decode batch 与离散事件仿真
 - [ ] TensorRT-LLM 的 ADP router、phase intent 与 dummy request
 
 ## 已经覆盖
@@ -78,10 +81,15 @@
 - MEPIC 首次完整计算 chunk 时等价于普通 prefill；正常复用只重算每个 chunk 的第一个 block，因此是近似路径。
 - fused RoPE 可以精确调整缓存 K 的绝对位置，但不能恢复左侧上下文变化导致的 raw K/V 差异。
 - 若业务要求逐 token 数值等价，需要重算完整 chunk，或在近似路径外增加误差检测与回退。
+- `TP_total` 统计输入和输出 token 的总量；P/D 比例由 `L_in/L_out` 乘上 `TP_D/TP_P,eff` 得到。
+- TTFT 通过 M/M/1 的服务率 `μ=TP_P,max/L_in` 进入模型，目标延迟越严格，有效 Prefill 吞吐越低。
+- Decode 吞吐必须取满足 TPOT 的 batch 点；连续实例数向上取整后还要重新计算容量，`3P4D` 约为 4.875 MTPM，不能严格覆盖 5 MTPM。
+- 离散事件仿真器把 P 队列、D batch、KV transfer、请求生命周期和 P95/P99 分开记录，适合在解析公式给出的候选范围内搜索整数配置。
+- 仿真的准确性由 P/D profile、KV 传输模型和请求 trace 决定；有限 trace 的吞吐读数包含启动与 drain，不是稳态容量本身。
 
 ## 下一知识点
 
-比较 radix cache、IMPRESS、MEPIC 与 HiSparse 在请求、共享 prefix、可复用 chunk 和 decode block 四层的索引与复用边界。TensorRT-LLM ADP 顺延到后续笔记。
+把 P/D simulator 接入真实的 Prefill/Decode/KV profile 与请求 trace，验证模型外推误差。比较 radix cache、IMPRESS、MEPIC 与 HiSparse 在请求、共享 prefix、可复用 chunk 和 decode block 四层的索引与复用边界。TensorRT-LLM ADP 顺延到后续笔记。
 
 ## 源码与论文快照
 
@@ -93,4 +101,5 @@
 - 自适应预算修正：`0914ed2e81`
 - IMPRESS / HyperInfer：`91df7a2fc12581c6780a6485c5b50e7fd9ef9d0e`
 - MEPIC：arXiv `2512.16822v1`
+- P/D 资源分配：arXiv `2603.04716v1`；公众号 `LLM软硬协同优化`，2026-09-11
 - 依赖：Python 3.10+；示例仅需标准库，不需要 GPU
