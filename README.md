@@ -15,7 +15,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
 | [`inference-scheduling/`](inference-scheduling/) | vLLM/SGLang/TensorRT-LLM 的 token budget、DP attention、KV 抢占、EPLB、集群性能仿真、前缀 KV I/O 与单机 MoE 专家 offload |
-| [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash 的 SWA cache 窗口、DFlash 2 候选路径选择 |
+| [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash/DFlash 2 cache 与候选路径、Adaptive DHiSparse 的 draft KV 和 verification staging |
 | [`heterogeneous-inference/`](heterogeneous-inference/) | GPU 资源池与 SRAM ASIC 的异构推理；SQD、AFD/AFlex、动态调频、KV 预取与性能边界 |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher / make_fx 内部机制 |
 | [`training/`](training/) | PyTorch 自动微分、fan-in/fan-out、训练并行、SP 布局转换与 Vocab Embedding、数据随机性与 SLURM |
@@ -188,7 +188,8 @@ inference-scheduling/
 speculative-decoding/
 ├── 01-gpu-vs-lpu-sram.md   # verify(K)≪K×decode(1)；大 SRAM/低算力为何吃不满收益
 ├── 02-dflash-cache-window-and-block-visibility.md # SWA 窗口、DFlash cache 和 block 内 query 可见性
-└── 03-dflash2-candidate-path-selection.md # Top-K 候选、相邻边打分与轻量贪心路径选择；非标准 beam search
+├── 03-dflash2-candidate-path-selection.md # Top-K 候选、相邻边打分与轻量贪心路径选择；非标准 beam search
+└── 04-dhisparse-draft-kv-and-verification-staging.md # draft KV ring、target tail、hot cache 与验证 overflow arena
 ```
 
 ```
@@ -342,6 +343,8 @@ models/
 | KVStream / NVMe+PFS 聚合带宽 / 完成驱动 I/O 池 / 写放大与 TTFT 边界 | [inference-scheduling/12](inference-scheduling/12-kvstream-multitier-kv-retrieval.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
+| DFlash 2 候选路径选择、相邻边打分与轻量贪心 | [speculative-decoding/03](speculative-decoding/03-dflash2-candidate-path-selection.md) |
+| Adaptive DHiSparse / draft KV ring / verification staging | [speculative-decoding/04](speculative-decoding/04-dhisparse-draft-kv-and-verification-staging.md) |
 | 异构推理 / SQD / quadratic–subquadratic 切分 / top-k KV 预取 | [heterogeneous-inference/01](heterogeneous-inference/01-sqd-subquadratic-disaggregation.md) |
 | 异构推理 / AFD / AFlex / 独立频率域 / 分级 DVFS / 每 token 能耗 | [heterogeneous-inference/02](heterogeneous-inference/02-aflex-disaggregated-frequency-scaling.md) |
 | 算子开发 / Triton `for` 循环、分块与累加 | [operators/01-triton-for-loops.md](operators/01-triton-for-loops.md)；[算子目录](operators/README.md) |
