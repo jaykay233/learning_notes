@@ -162,7 +162,9 @@ communication/
 ├── 35-rdma-congestion-control-loop.md         # 拥塞控制闭环：ECN/CNP/alpha、quanta、headroom 与 400G 代价
 ├── 35_congestion_control_loop.py              # 可运行：DCQCN 闭环模拟 + PFC 量化
 ├── 36-rdma-troubleshooting-decision-tree.md   # 排障判定树：三层证据 / 计数器增量 / wc.status 因果 / pause 占比
-└── 36_diagnose.py                             # 可运行：观测 -> 排序假设 + 下一步命令
+├── 36_diagnose.py                             # 可运行：观测 -> 排序假设 + 下一步命令
+├── 37-rdma-gpudirect-degradation.md           # GPUDirect：两条权限 / 四条路径 / 退化判定与代价
+└── 37_gpudirect_path.py                       # 可运行：P2P 判定 + 带宽与延迟账本
 ```
 
 ```
@@ -325,6 +327,7 @@ models/
 | RDMA 连接状态账本 / RC·SRQ·XRC·DC / ICM 与片上 cache / N* 拐点 | [communication/34](communication/34-rdma-connection-state-ledger.md) |
 | RDMA 拥塞控制闭环 / ECN·CNP·alpha / PFC quanta 与 headroom | [communication/35](communication/35-rdma-congestion-control-loop.md) |
 | RDMA 排障判定树 / 三层证据 / wc.status 因果 / pause 占比 | [communication/36](communication/36-rdma-troubleshooting-decision-tree.md) |
+| GPUDirect 退化 / 两条 P2P 权限 / ACS 与 bounce 代价 | [communication/37](communication/37-rdma-gpudirect-degradation.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
