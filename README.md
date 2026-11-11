@@ -168,9 +168,11 @@ communication/
 ├── 38-verbs-program-walkthrough.md            # verbs 程序走读：资源树 / 三个 modify_qp / RNR 与 flush 序列
 ├── 38_minimal_rc.c                            # 完整 RC 收发程序（Linux + rdma-core）
 ├── 38_verbs_emulator.py                       # 可运行：QP 状态机 + 四种事故序列
-└── 38_stub/                                   # 编译检查桩头文件（不可链接）
-    ├── infiniband/verbs.h
-    └── rdma/rdma_cma.h
+├── 38_stub/                                   # 编译检查桩头文件（不可链接）
+│   ├── infiniband/verbs.h
+│   └── rdma/rdma_cma.h
+├── 39-rdma-memory-registration-cost.md        # 注册成本账本：带宽税 vs 延迟税 / FRWR 交叉点 / key 池深度
+└── 39_memory_registration_cost.py             # 可运行：reg_mr·FRWR·MW 成本与带宽上限
 ```
 
 ```
@@ -335,6 +337,7 @@ models/
 | RDMA 排障判定树 / 三层证据 / wc.status 因果 / pause 占比 | [communication/36](communication/36-rdma-troubleshooting-decision-tree.md) |
 | GPUDirect 退化 / 两条 P2P 权限 / ACS 与 bounce 代价 | [communication/37](communication/37-rdma-gpudirect-degradation.md) |
 | verbs 程序走读 / 资源树 / modify_qp / RNR 与 flush | [communication/38](communication/38-verbs-program-walkthrough.md) |
+| 注册成本 / 带宽税 / FRWR 与 MW / key 池深度 | [communication/39](communication/39-rdma-memory-registration-cost.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
