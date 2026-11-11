@@ -36,6 +36,7 @@ CHAPTERS = [
     "44-rdma-flow-control-backpressure.md",
     "45-rdma-vs-dpdk-and-routing.md",
     "46-rdma-performance-capacity-planning.md",
+    "47-rdma-rpc-kv-design.md",
 ]
 
 # 每一项：(显示名, 候选关键词列表)。命中任一即算通过 —— 允许同义写法。
@@ -94,7 +95,7 @@ def main():
     scripts_checked = {}
 
     print("=" * 78)
-    print("RDMA 系列验收（33-46）")
+    print("RDMA 系列验收（33-47）")
     print("=" * 78)
     print(f"\n{'章节':<44}{'小节':>6}{'链接':>6}{'脚本':>6}{'提交':>6}")
     print("-" * 78)

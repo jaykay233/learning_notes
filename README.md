@@ -187,7 +187,9 @@ communication/
 ├── 45_rdma_vs_dpdk_and_routing.py             # 可运行：cycles 账本 + ECMP 泊松 + 乱序率 + 放大
 ├── 46-rdma-performance-capacity-planning.md   # 性能建模：四个上限取最小 / 延迟拆解 / 深度反推
 ├── 46_perf_capacity_planner.py                # 可运行：有效带宽曲线 + 消息率提升 + 瓶颈判定
-└── verify_rdma_series.py                      # 验收：33-46 小节齐备 + 链接有效 + 脚本可跑 + 有提交
+├── 47-rdma-rpc-kv-design.md                   # 端到端设计：RPC 并发 / 单边 READ / rkey 窗口 / credit
+├── 47_rpc_kv_design_sim.py                    # 可运行：M/M/W 排队 + 三条路径账本 + 隔离内存
+└── verify_rdma_series.py                      # 验收：33-47 小节齐备 + 链接有效 + 脚本可跑 + 有提交
 ```
 
 ```
@@ -360,6 +362,7 @@ models/
 | 流控与背压 / WRITE 覆盖 / 缓冲 vs 限速 / 四层分工 | [communication/44](communication/44-rdma-flow-control-backpressure.md) |
 | RDMA vs DPDK / ECMP 热点 / 按包喷洒的乱序代价 | [communication/45](communication/45-rdma-vs-dpdk-and-routing.md) |
 | 性能建模 / 四个上限 / 延迟拆解 / 深度反推 | [communication/46](communication/46-rdma-performance-capacity-planning.md) |
+| 端到端设计 / RPC 并发 / 单边 READ / rkey 窗口 / PUT credit | [communication/47](communication/47-rdma-rpc-kv-design.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |

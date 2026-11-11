@@ -128,7 +128,7 @@ RDMA 把三件事挪走了：
 
 ## 用真实数字算一遍
 
-`communication/33_rdma_cost_model.py` 把这一节的四张表都算出来，纯算术，不需要 RDMA 硬件：
+[`33_rdma_cost_model.py`](./33_rdma_cost_model.py) 把这一节的四张表都算出来，纯算术，不需要 RDMA 硬件：
 
 ```bash
 cd ~/Downloads/learning_notes
@@ -856,6 +856,6 @@ NIC 的 context cache。四条出路：DC、XRC/SRQ、控制面走 UD、分层�
 第四遍：做自测。答不出的题，回到对应层的正文，而不是回 32 章题库。
 ```
 
-`communication/33_rdma_cost_model.py` 可以改参数再跑：
+[`33_rdma_cost_model.py`](./33_rdma_cost_model.py) 可以改参数再跑：
 把 `FIXED_NS` 调到 800 看乐观情况，把 `LINKS` 加上 `"25G"` 看低带宽下的拐点，
 都能帮你在面试里现场估算，而不是背结论。
