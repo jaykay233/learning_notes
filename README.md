@@ -182,7 +182,9 @@ communication/
 ├── 43-rdma-l2-remaining-semantics.md          # L2 剩余语义：MTU/inline/imm/atomic/UD/fence 各买什么
 ├── 43_l2_semantics_cost.py                    # 可运行：MTU 瓶颈切换 + inline/imm/atomic 成本对比
 ├── 44-rdma-flow-control-backpressure.md       # 流控与背压：WRITE 零背压 = 正确性问题 / 四层分工
-└── 44_flow_control_backpressure.py            # 可运行：无流控覆盖量 + 缓冲需求 + credit 限速
+├── 44_flow_control_backpressure.py            # 可运行：无流控覆盖量 + 缓冲需求 + credit 限速
+├── 45-rdma-vs-dpdk-and-routing.md             # 选型对比：CPU 花在谁身上 / ECMP 热点 / 喷洒乱序
+└── 45_rdma_vs_dpdk_and_routing.py             # 可运行：cycles 账本 + ECMP 泊松 + 乱序率 + 放大
 ```
 
 ```
@@ -353,6 +355,7 @@ models/
 | 可靠性定量 / go-back-N 放大 / ack timeout / RNR 上界 | [communication/42](communication/42-rdma-reliability-psn-window.md) |
 | L2 剩余语义 / MTU 与 pps / inline / imm / atomic / UD | [communication/43](communication/43-rdma-l2-remaining-semantics.md) |
 | 流控与背压 / WRITE 覆盖 / 缓冲 vs 限速 / 四层分工 | [communication/44](communication/44-rdma-flow-control-backpressure.md) |
+| RDMA vs DPDK / ECMP 热点 / 按包喷洒的乱序代价 | [communication/45](communication/45-rdma-vs-dpdk-and-routing.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
