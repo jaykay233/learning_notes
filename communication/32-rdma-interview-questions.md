@@ -5,9 +5,14 @@
 > 相关轮次，以及 [RDMA-tutorial](https://github.com/StarryVae/RDMA-tutorial)
 > 里的面经汇总），答案要点按“面试官想听的那一句”整理，不追求教科书式完整。
 >
-> 关联笔记：[21 · GPU-initiated RDMA 提交路径](./21-gpu-initiated-rdma-submission-dc-qp-sharing.md)、
+> 关联笔记：[33 · 六层主线](./33-rdma-six-layer-spine.md)（把本章 54 题串成一条可推导的路径，
+> 并修正了 Q12 / Q18 / Q40 三处表述）、
+> [21 · GPU-initiated RDMA 提交路径](./21-gpu-initiated-rdma-submission-dc-qp-sharing.md)、
 > [22 · GPU-initiated 通信成本模型](./22-gpu-initiated-communication-performance-cost-model.md)、
 > [03 · 低延迟 collective](./03-low-latency-collectives-and-synchronization.md)。
+>
+> 读法：先看 33 章的六层图建立坐标系，再用本章逐题自测；答不出"代价/边界"的题，
+> 回到 33 章对应层。
 
 ```text
 本次讲解位置
