@@ -183,9 +183,11 @@ attr.dest_qp_num        = id->qp->qp_num;
 attr.rq_psn             = 0;
 attr.max_dest_rd_atomic = 8;
 attr.min_rnr_timer      = 12;
-attr.ah_attr.is_global  = 1;
+attr.ah_attr.is_global  = 1;              /* RoCE 必须 1；IB 有 LID 时可以为 0 */
 attr.ah_attr.port_num   = id->port_num;
-attr.ah_attr.grh.hop_limit = 1;
+attr.ah_attr.grh.hop_limit  = 1;
+attr.ah_attr.grh.sgid_index = 1;          /* 本端源 GID 的「表行号」，不是地址 */
+attr.ah_attr.grh.dgid       = peer_gid;   /* 对端目的 GID（16B，由 CM/带外交换得到） */
 ibv_modify_qp(res->qp, &attr, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
                               IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
                               IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
@@ -216,6 +218,94 @@ retry_cnt = 7 / rnr_retry = 7  →  规范里 7 表示无限
 生产里 `rnr_retry = 7`（无限）通常**不该用**：对端 recv WR 永远不投的时候，
 发送端会永久挂着而不是报错，故障表现为"卡住"而不是"失败"，更难发现。
 本程序为了演示贪方便设成 7，正文这里明确标出这个取舍。
+
+### 第三段补：GID 表和 `sgid_index` 到底是什么
+
+RTR 那一步最容易出错的三行是 `grh`。很多人以为 `sgid_index` 是"地址"，其实它是**行号**。
+
+**GID（Global Identifier）= 128 位地址**，三种填法：
+
+```text
+IB       subnet_prefix(64) + GUID(64)          例: fe80::...:0001
+RoCEv1   MAC 封装成的 link-local 地址           fe80::MAC 变形
+RoCEv2   IPv4/IPv6 地址                        ::ffff:192.168.1.10
+```
+
+**而 `sgid_index` 是这张表的行号**，不是地址本身。每个（设备，端口）有一张
+定长的 GID 表，长度是 `port_attr.gid_tbl_len`（mlx5 常见 128），每行除了 16 字节 GID，
+还带一个**类型**和一张**网卡**：
+
+```text
+$ show_gids
+DEV     PORT  INDEX  GID                                   IPv4           VER  DEV
+mlx5_0  1     0      fe80:0000:...:0001                    fe80::1        v1   eth0
+mlx5_0  1     1      fe80:0000:...:0001                    fe80::1        v2   eth0
+mlx5_0  1     2      0000:0000:...:0001                    192.168.1.10   v1   eth0
+mlx5_0  1     3      0000:0000:...:0001                    192.168.1.10   v2   eth0
+```
+
+同一个 IP 出现两次（v1 一次、v2 一次），`index 0` 还是 link-local。
+所以 **`sgid_index` 有两个致命性质**：
+
+```text
+1) 它是本机局部的，不可移植
+   你机器上的 index 3 是 192.168.1.10，对端机器上的 index 3 可能是别的网卡。
+   写死 0 或 3 的代码，换一台机器就 EINVAL 或连错网。
+
+2) 它同时决定了「源地址」和「从哪张网卡出去」
+   GID 表每一行绑一个 netdev。多 rail 机器上，选错 index 等于选错 rail，
+   流量会从错误的物理口发出去（40 章的 rail 对齐就是这么被破坏的）。
+```
+
+**为什么 API 不直接收地址？** 因为 `ibv_ah_attr` 是定长的硬件结构
+（网卡要把它整块塞进 AV cache，按索引查比解析变长地址快），
+而且一个 QP 绑一个**本端**源 GID——这是本地决策，不是对端能替你决定的。
+
+#### 它为什么表现为 RTR 的 EINVAL
+
+校验发生在 `ibv_modify_qp(RTR)`，**包还没发出去**，所以对端计数器全是 0：
+
+```text
+sgid_index >= gid_tbl_len            -> EINVAL（越界）
+该行是空条目（全零）/ 类型被禁用      -> EINVAL（解析不出 AV）
+is_global=1 但没填 sgid_index 或 dgid -> EINVAL（缺字段）
+dgid 与对端实际监听的 GID 不一致      -> 不报错，但包发出后对端丢弃（更隐蔽）
+```
+
+这也是 Q43 那四类原因里最"不像故障"的一类：**全是字段与状态/环境不匹配，
+不是网卡坏了**。
+
+#### 正确做法：枚举后匹配，不要写死
+
+```c
+/* 从本端口 GID 表里挑 RoCEv2 的那一行；rdma-core ≥ 34 提供批量查询 */
+static int pick_roce_v2_gid(struct ibv_context *ctx, uint8_t port)
+{
+    struct ibv_gid_entry entries[64];
+    int n = ibv_query_gid_table(ctx, entries, 64, 0);
+    if (n < 0) { perror("ibv_query_gid_table"); return -1; }
+    for (int i = 0; i < n; i++)
+        if (entries[i].port_num == port &&
+            entries[i].gid_type == IBV_GID_TYPE_ROCE_V2)
+            return (int)entries[i].gid_index;
+    return -1;                      /* 没有 v2 条目：驱动没开 v2，先修配置 */
+}
+```
+
+老接口是 `ibv_query_gid(ctx, port, index, &gid)` 逐项读（`index` 从 0 到
+`gid_tbl_len-1`），配合 `ibv_query_port` 拿表长；它拿不到类型，所以判断 v1/v2
+要靠 GID 的形态（link-local vs IPv4-mapped），不如新接口可靠。
+
+#### 三条排查命令
+
+```bash
+show_gids                                    # 表内容 + VER + netdev，最快
+ibv_devinfo -v | grep -A20 GID              # 同一张表，不用装 mlnx 工具
+cat /sys/class/infiniband/mlx5_0/ports/1/gids/3   # 第 3 行到底是谁
+```
+
+> **一句话**：`sgid_index` 是"本机端口 GID 表的行号"。
+> 行号是局部的、会变的、而且决定出口网卡——所以只能查，不能写。
 
 ### 第四段：投递与轮询
 
@@ -382,6 +472,9 @@ SYNTAX OK
 | MR 注册在 A 的 PD、QP 在 B 的 PD | `LOC_PROT_ERR`，报错指向 MR 但其实不是 MR 的问题 |
 | 多线程共用一个 QP 却不加锁 | WR 顺序错乱，`wr_id` 与数据错配，偶发 |
 | `sq_sig_all=0` 忘记 SIGNALED | 应用 hang，网卡/连接全正常（场景 E） |
+| 把 `sgid_index` 写死成 0 | RoCE 下指向 link-local v1：RTR `EINVAL`，或静默连错网卡 |
+| `is_global=1` 但不填 `dgid` | 同上 `EINVAL`；若填错则包能发但对端丢弃，最隐蔽 |
+| 以为 `sgid_index` 是地址 | 换机器/换网卡后行为变化，排查方向全错 |
 
 倒数第四条（跨 PD）特别值得记：报错是 `LOC_PROT_ERR`，字面意思是"本地保护错误"，
 很容易去查 MR 的 access flag，但真正的原因是 **QP 和 MR 不在同一个 PD**。
@@ -410,6 +503,7 @@ SYNTAX OK
 5. `attr_mask` 的作用是什么？mask 与字段不一致会怎样？
 6. 为什么 `rnr_retry=7` 在生产里不该用？
 7. 只看 `ibv_poll_cq` 返回值不看 `wc.status`，会导致什么现象？
+8. `sgid_index` 是地址还是别的东西？为什么不能写死？它在 RoCE 下误填会报什么？
 
 <details>
 <summary>答案</summary>
@@ -427,6 +521,9 @@ SYNTAX OK
    故障表现成"卡住"而不是"失败"，排查成本高得多。应设有限值快速失败。
 7. 所有错误完成被当成成功忽略。表现为"数据不对但不报错"、或 `wr_id` 与数据错配，
    排查时会误以为是内存/协议问题。
+8. 它是**本机端口 GID 表的行号**，不是地址。表里同一个 IP 会有 v1/v2 两行，
+   `index 0` 常是 link-local v1；而且每行绑一个 netdev，所以它同时决定源地址与出口网卡。
+   行号是局部的、不可移植的，只能枚举匹配（`ibv_query_gid_table` / `show_gids`），不能写死。
 
 </details>
 
@@ -451,6 +548,14 @@ SYNTAX OK
 超时换算:
   timeout = 4.096us << value      value=14 -> 67.1 ms
   retry_cnt / rnr_retry = 7 表示无限（生产慎用）
+
+GID 与 sgid_index（RoCE 的 RTR 必填）:
+  GID = 128 位地址：IB 是 prefix+GUID，RoCEv1 是 link-local，RoCEv2 是 IP
+  sgid_index = 本机端口 GID 表的「行号」，不是地址
+    表长 gid_tbl_len；同一 IP 有 v1/v2 两行；index 0 常是 link-local v1
+    每行绑一个 netdev -> index 同时决定源地址和出口网卡（多 rail 会选错）
+    行号局部、不可移植 -> 必须枚举匹配，不能写死
+  is_global=1 时 sgid_index 与 dgid 缺一个 -> modify_qp(RTR) 返回 EINVAL
 
 完成语义:
   SEND        2 条 CQE（发送 + 接收）

@@ -156,7 +156,17 @@ static void build_resources(struct rdma_cm_id *id, struct resources *res)
 	attr.min_rnr_timer         = 12;
 	attr.ah_attr.is_global     = 1;
 	attr.ah_attr.port_num      = id->port_num;
-	/* RoCE 场景要填 grh，这里给出最简形式 */
+	/*
+	 * 注意：RoCE 上下面这样填是**不完整**的。
+	 * is_global=1 之后还必须填 grh 的两个字段，缺一个就 EINVAL：
+	 *   sgid_index  本端源 GID —— 本机端口 GID 表的「行号」，不是地址。
+	 *               同一 IP 在表里有 v1/v2 两行，index 0 常是 link-local v1；
+	 *               每行还绑一个 netdev，所以它也决定从哪个口发出去。
+	 *               不要写死，用 ibv_query_gid_table() 按类型匹配。
+	 *   dgid        对端 GID —— RoCEv2 下是 IPv4-mapped IPv6（::ffff:a.b.c.d）。
+	 * 本示例走 IB 路径（有 LID），所以 GRH 只写最简形式；完整填法见
+	 * 38 章正文「第三段补：GID 表和 sgid_index」。
+	 */
 	attr.ah_attr.grh.hop_limit = 1;
 	rc = ibv_modify_qp(res->qp, &attr,
 			   IBV_QP_STATE | IBV_QP_AV |
