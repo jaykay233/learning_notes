@@ -176,7 +176,9 @@ communication/
 ├── 40-rdma-collective-topology.md             # 集合通信与拓扑：量与步两轴 / SHARP 不省带宽 / EP 两难
 ├── 40_collective_topology_model.py            # 可运行：AllReduce 三实现 + rail 对齐概率 + MoE 数据量
 ├── 41-rdma-kubernetes-multitenancy.md         # K8s RDMA：VF/PD/P_Key 三层边界、memlock、GID、八项检查
-└── 41_k8s_rdma_validator.py                   # 可运行：配置 -> 检查项 + 故障症状
+├── 41_k8s_rdma_validator.py                   # 可运行：配置 -> 检查项 + 故障症状
+├── 42-rdma-reliability-psn-window.md          # L3 定量：go-back-N 放大、ack timeout、RNR 上界
+└── 42_psn_window_sim.py                       # 可运行：丢包 trace + 放大系数 + 超时取舍
 ```
 
 ```
@@ -344,6 +346,7 @@ models/
 | 注册成本 / 带宽税 / FRWR 与 MW / key 池深度 | [communication/39](communication/39-rdma-memory-registration-cost.md) |
 | 集合通信 / SHARP 不省带宽 / rail 对齐 / EP 两难 | [communication/40](communication/40-rdma-collective-topology.md) |
 | K8s 多租户 / VF·PD·P_Key 三层边界 / memlock 与 GID | [communication/41](communication/41-rdma-kubernetes-multitenancy.md) |
+| 可靠性定量 / go-back-N 放大 / ack timeout / RNR 上界 | [communication/42](communication/42-rdma-reliability-psn-window.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
