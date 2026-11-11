@@ -797,6 +797,31 @@ NIC 的 context cache。四条出路：DC、XRC/SRQ、控制面走 UD、分层�
 
 ---
 
+## 题目 → 章节对照
+
+上面的定位表解决"挂在哪一层"，这张表解决"去读哪一章"：
+
+| 题号 | 章节 | 主题 |
+| --- | --- | --- |
+| Q1–Q3 | [33](./33-rdma-six-layer-spine.md) | 六段路径与固定成本主线 |
+| Q4、Q19 | [39](./39-rdma-memory-registration-cost.md) | 内存注册成本、FRWR / MW |
+| Q5、Q6、Q7、Q29–Q31、Q34 | [34](./34-rdma-connection-state-ledger.md)、[38](./38-verbs-program-walkthrough.md) | 对象树、状态机、verbs 实操 |
+| Q8–Q10、Q14–Q17、Q32 | [43](./43-rdma-l2-remaining-semantics.md) | 双边/单边、inline、imm、atomic、UD、fence |
+| Q11–Q13、Q18、Q28、Q33、Q35 | [42](./42-rdma-reliability-psn-window.md) | PSN、ACK、go-back-N、flush、假成功 |
+| Q20–Q25 | [35](./35-rdma-congestion-control-loop.md)、[45](./45-rdma-vs-dpdk-and-routing.md) | PFC、ECN/DCQCN、标记、路由 |
+| Q26、Q27 | [40](./40-rdma-collective-topology.md) | 集合通信与拓扑映射 |
+| Q36–Q39 | [46](./46-rdma-performance-capacity-planning.md) | 有效带宽、消息率、延迟、深度 |
+| Q40、Q41 | [37](./37-rdma-gpudirect-degradation.md) | GPUDirect 路径与退化 |
+| Q42–Q48 | [36](./36-rdma-troubleshooting-decision-tree.md) | 分层排障与判定树 |
+| Q49、Q50、Q53 | [47](./47-rdma-rpc-kv-design.md)、[44](./44-rdma-flow-control-backpressure.md) | RPC/KV 设计、背压与 credit |
+| Q51、Q25 | [45](./45-rdma-vs-dpdk-and-routing.md) | RDMA vs DPDK、自适应路由 |
+| Q52、Q54 | [41](./41-rdma-kubernetes-multitenancy.md) | K8s、多租户隔离边界 |
+
+反查方法：`python3 communication/verify_rdma_series.py` 会检查每一章的小节、
+脚本可执行性与链接有效性 —— 这张表里任何一个链接失效都会报错。
+
+---
+
 ## 常见错法：六层之间最容易串的十件事
 
 这一章的价值一半在"把 54 题挂上路径"，另一半在"把容易混淆的跨层概念分开"：
