@@ -164,7 +164,13 @@ communication/
 ├── 36-rdma-troubleshooting-decision-tree.md   # 排障判定树：三层证据 / 计数器增量 / wc.status 因果 / pause 占比
 ├── 36_diagnose.py                             # 可运行：观测 -> 排序假设 + 下一步命令
 ├── 37-rdma-gpudirect-degradation.md           # GPUDirect：两条权限 / 四条路径 / 退化判定与代价
-└── 37_gpudirect_path.py                       # 可运行：P2P 判定 + 带宽与延迟账本
+├── 37_gpudirect_path.py                       # 可运行：P2P 判定 + 带宽与延迟账本
+├── 38-verbs-program-walkthrough.md            # verbs 程序走读：资源树 / 三个 modify_qp / RNR 与 flush 序列
+├── 38_minimal_rc.c                            # 完整 RC 收发程序（Linux + rdma-core）
+├── 38_verbs_emulator.py                       # 可运行：QP 状态机 + 四种事故序列
+└── 38_stub/                                   # 编译检查桩头文件（不可链接）
+    ├── infiniband/verbs.h
+    └── rdma/rdma_cma.h
 ```
 
 ```
@@ -328,6 +334,7 @@ models/
 | RDMA 拥塞控制闭环 / ECN·CNP·alpha / PFC quanta 与 headroom | [communication/35](communication/35-rdma-congestion-control-loop.md) |
 | RDMA 排障判定树 / 三层证据 / wc.status 因果 / pause 占比 | [communication/36](communication/36-rdma-troubleshooting-decision-tree.md) |
 | GPUDirect 退化 / 两条 P2P 权限 / ACS 与 bounce 代价 | [communication/37](communication/37-rdma-gpudirect-degradation.md) |
+| verbs 程序走读 / 资源树 / modify_qp / RNR 与 flush | [communication/38](communication/38-verbs-program-walkthrough.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
