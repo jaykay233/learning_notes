@@ -6,7 +6,7 @@
 小节：连接状态的账本（承接 21 的 DCI/DCT/AV 与 22 的实测代价）
 知识点：连接状态的四段组成、ICM 与 context cache 的两级存储、N* 交叉点、burst 摊销
 上次：DC 把 destination 从 QP context 搬进 WQE 的 AV（21），DC/RC 的实测代价（22）
-下次：DCQCN 参数闭环，或 DeepEP 里 DC 的实际用法
+下次：35 · 拥塞控制的参数闭环（PFC 与 DCQCN 的两级保险）
 ```
 
 ## 为什么现在讲这个
