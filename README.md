@@ -172,7 +172,9 @@ communication/
 │   ├── infiniband/verbs.h
 │   └── rdma/rdma_cma.h
 ├── 39-rdma-memory-registration-cost.md        # 注册成本账本：带宽税 vs 延迟税 / FRWR 交叉点 / key 池深度
-└── 39_memory_registration_cost.py             # 可运行：reg_mr·FRWR·MW 成本与带宽上限
+├── 39_memory_registration_cost.py             # 可运行：reg_mr·FRWR·MW 成本与带宽上限
+├── 40-rdma-collective-topology.md             # 集合通信与拓扑：量与步两轴 / SHARP 不省带宽 / EP 两难
+└── 40_collective_topology_model.py            # 可运行：AllReduce 三实现 + rail 对齐概率 + MoE 数据量
 ```
 
 ```
@@ -338,6 +340,7 @@ models/
 | GPUDirect 退化 / 两条 P2P 权限 / ACS 与 bounce 代价 | [communication/37](communication/37-rdma-gpudirect-degradation.md) |
 | verbs 程序走读 / 资源树 / modify_qp / RNR 与 flush | [communication/38](communication/38-verbs-program-walkthrough.md) |
 | 注册成本 / 带宽税 / FRWR 与 MW / key 池深度 | [communication/39](communication/39-rdma-memory-registration-cost.md) |
+| 集合通信 / SHARP 不省带宽 / rail 对齐 / EP 两难 | [communication/40](communication/40-rdma-collective-topology.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
