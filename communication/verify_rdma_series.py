@@ -35,6 +35,7 @@ CHAPTERS = [
     "43-rdma-l2-remaining-semantics.md",
     "44-rdma-flow-control-backpressure.md",
     "45-rdma-vs-dpdk-and-routing.md",
+    "46-rdma-performance-capacity-planning.md",
 ]
 
 # 每一项：(显示名, 候选关键词列表)。命中任一即算通过 —— 允许同义写法。
@@ -93,7 +94,7 @@ def main():
     scripts_checked = {}
 
     print("=" * 78)
-    print("RDMA 系列验收（33-45）")
+    print("RDMA 系列验收（33-46）")
     print("=" * 78)
     print(f"\n{'章节':<44}{'小节':>6}{'链接':>6}{'脚本':>6}{'提交':>6}")
     print("-" * 78)
@@ -162,7 +163,7 @@ def main():
         for p in problems:
             print(f"  - {p}")
         return 1
-    print("验收通过：13 章齐备，脚本可执行，链接有效，均有提交记录。")
+    print(f"验收通过：{len(CHAPTERS)} 章齐备，脚本可执行，链接有效，均有提交记录。")
     return 0
 
 
