@@ -184,7 +184,8 @@ communication/
 ├── 44-rdma-flow-control-backpressure.md       # 流控与背压：WRITE 零背压 = 正确性问题 / 四层分工
 ├── 44_flow_control_backpressure.py            # 可运行：无流控覆盖量 + 缓冲需求 + credit 限速
 ├── 45-rdma-vs-dpdk-and-routing.md             # 选型对比：CPU 花在谁身上 / ECMP 热点 / 喷洒乱序
-└── 45_rdma_vs_dpdk_and_routing.py             # 可运行：cycles 账本 + ECMP 泊松 + 乱序率 + 放大
+├── 45_rdma_vs_dpdk_and_routing.py             # 可运行：cycles 账本 + ECMP 泊松 + 乱序率 + 放大
+└── verify_rdma_series.py                      # 验收：33-45 小节齐备 + 链接有效 + 12 个脚本可跑 + 有提交
 ```
 
 ```
