@@ -156,7 +156,9 @@ communication/
 ├── 31-mok-dispatch-combine-direction.md       # MoK：谁发起 / pull vs push / 无冲突原因
 ├── 32-rdma-interview-questions.md             # RDMA 面试题库：基础 / 可靠性 / RoCE / verbs / 调优 / 排障
 ├── 33-rdma-six-layer-spine.md                 # RDMA 六层主线：L0 路径→L1 对象→L2 语义→L3 可靠→L4 网络→L5 工程
-└── 33_rdma_cost_model.py                      # 可运行：线上时间 / 消息率上限 / Little's law / BDP / go-back-N 放大
+├── 33_rdma_cost_model.py                      # 可运行：线上时间 / 消息率上限 / Little's law / BDP / go-back-N 放大
+├── 34-rdma-connection-state-ledger.md         # 连接状态账本：四段状态 / ICM vs 片上 cache / N* 拐点 / DC 切换摊销
+└── 34_connection_state_ledger.py              # 可运行：RC·SRQ·XRC·DC 字节账本与交叉点
 ```
 
 ```
@@ -316,6 +318,7 @@ models/
 | MoK dispatch·combine 方向 / pull vs push / 写冲突消除 | [communication/31](communication/31-mok-dispatch-combine-direction.md) |
 | RDMA 面试题 / kernel bypass·MR·QP 状态机·PFC·DCQCN·排障 | [communication/32](communication/32-rdma-interview-questions.md) |
 | RDMA 六层主线 / 路径→对象→语义→可靠性→网络→工程 / 54 题定位 | [communication/33](communication/33-rdma-six-layer-spine.md) |
+| RDMA 连接状态账本 / RC·SRQ·XRC·DC / ICM 与片上 cache / N* 拐点 | [communication/34](communication/34-rdma-connection-state-ledger.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |

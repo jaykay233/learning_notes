@@ -7,6 +7,8 @@
 >
 > 关联笔记：[33 · 六层主线](./33-rdma-six-layer-spine.md)（把本章 54 题串成一条可推导的路径，
 > 并修正了 Q12 / Q18 / Q40 三处表述）、
+> [34 · 连接状态账本](./34-rdma-connection-state-ledger.md)（Q6 / Q50 的定量版：
+> 四段状态、两级存储、N* 拐点）、
 > [21 · GPU-initiated RDMA 提交路径](./21-gpu-initiated-rdma-submission-dc-qp-sharing.md)、
 > [22 · GPU-initiated 通信成本模型](./22-gpu-initiated-communication-performance-cost-model.md)、
 > [03 · 低延迟 collective](./03-low-latency-collectives-and-synchronization.md)。
