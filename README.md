@@ -160,7 +160,9 @@ communication/
 ├── 34-rdma-connection-state-ledger.md         # 连接状态账本：四段状态 / ICM vs 片上 cache / N* 拐点 / DC 切换摊销
 ├── 34_connection_state_ledger.py              # 可运行：RC·SRQ·XRC·DC 字节账本与交叉点
 ├── 35-rdma-congestion-control-loop.md         # 拥塞控制闭环：ECN/CNP/alpha、quanta、headroom 与 400G 代价
-└── 35_congestion_control_loop.py              # 可运行：DCQCN 闭环模拟 + PFC 量化
+├── 35_congestion_control_loop.py              # 可运行：DCQCN 闭环模拟 + PFC 量化
+├── 36-rdma-troubleshooting-decision-tree.md   # 排障判定树：三层证据 / 计数器增量 / wc.status 因果 / pause 占比
+└── 36_diagnose.py                             # 可运行：观测 -> 排序假设 + 下一步命令
 ```
 
 ```
@@ -322,6 +324,7 @@ models/
 | RDMA 六层主线 / 路径→对象→语义→可靠性→网络→工程 / 54 题定位 | [communication/33](communication/33-rdma-six-layer-spine.md) |
 | RDMA 连接状态账本 / RC·SRQ·XRC·DC / ICM 与片上 cache / N* 拐点 | [communication/34](communication/34-rdma-connection-state-ledger.md) |
 | RDMA 拥塞控制闭环 / ECN·CNP·alpha / PFC quanta 与 headroom | [communication/35](communication/35-rdma-congestion-control-loop.md) |
+| RDMA 排障判定树 / 三层证据 / wc.status 因果 / pause 占比 | [communication/36](communication/36-rdma-troubleshooting-decision-tree.md) |
 | 小消息 collective / Sentinel / credit / SHARP / LL128 | [communication/03](communication/03-low-latency-collectives-and-synchronization.md) |
 | DeepEP V1 normal / MoE EP dispatch / combine | [communication/04](communication/04-deepep-v1-normal-dataflow.md) |
 | DeepEP V1 low-latency / expert-major dispatch / weighted combine | [communication/05](communication/05-deepep-v1-low-latency-dataflow.md) |
