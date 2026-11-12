@@ -18,7 +18,7 @@
 | [10-mepic-exact-vs-approximate-kv-reuse.md](10-mepic-exact-vs-approximate-kv-reuse.md) | MEPIC：位置无关 chunk 复用、首 block 重算、共享 tail 与精确性边界 |
 | [11-pd-resource-allocation-and-simulator.md](11-pd-resource-allocation-and-simulator.md) | P/D 资源分配：有效 Prefill 吞吐、连续实例数、整数配置搜索与 benchmark-calibrated 离散事件仿真 |
 | [12-kvstream-multitier-kv-retrieval.md](12-kvstream-multitier-kv-retrieval.md) | KVStream：step 级 I/O 池、NVMe/PFS 聚合带宽、完成驱动路由、延迟写与 TTFT 边界 |
-| [13-attention-backend-kv-layout-map.md](13-attention-backend-kv-layout-map.md) | attention backend 全景：NHD/HND/LHBNC 的 stride 与分段数、roofline 强度判据、spec-decode 的 `reorder_batch_threshold` 分派、XQA/trtllm-gen/aiter/hpc 对照 |
+| [13-attention-backend-kv-layout-map.md](13-attention-backend-kv-layout-map.md) | attention backend 全景：NHD/HND/LHBNC 的 stride 与分段数、roofline 强度判据、spec-decode 的 `reorder_batch_threshold` 分派、XQA/trtllm-gen/aiter/hpc 对照，以及布局与 block size 的推荐配置 |
 | [examples/vllm_v1_token_budget.py](examples/vllm_v1_token_budget.py) | 可运行的预算模拟：两个请求、14 个普通 token、6 个 draft slot、20 个输入 slot |
 | [examples/sglang_dp_prefill_delayer.py](examples/sglang_dp_prefill_delayer.py) | 可运行的 DP attention 调度模拟：三个 rank 的 mixed/all 状态与 idle units |
 | [examples/tensorrt_llm_generation_first_budget.py](examples/tensorrt_llm_generation_first_budget.py) | generation-first 与 chunked prefill 两种预算分配 trace |
@@ -110,6 +110,12 @@
 - 布局由 kernel 内层循环决定，不由 spec-decode 决定：trtllm-gen 强制 HND，hpc 有 MTP kernel 却用 NHD。
 - XQA 原生 HND，但用 TMA 描述符另开了 NHD 路径；FA3/FA4 不声明布局偏好，读 stride。
 - 布局全局唯一；PD 两侧必须一致，否则整行搬运被 NIXL 拒绝，而不是自动转置。
+- 手动设 `VLLM_KV_CACHE_LAYOUT` 几乎没有收益：解析链末端就是 backend 候选首位，NVIDIA 现代栈上本来就是 HND。
+- 所有 KV connector 都主动索要 `LBHNC`（NIXL、Mooncake、Offloading），只有 MLA 返回 `None`。
+- PD 两侧 TP 不等时 NHD 是**数据错位**而非变慢：NIXL 按 `len // tp_ratio` 等分连续字节取 head 切片，只有 `[H,N,C]` 连续（HND）才成立。
+- `LHBNC` 一个 head 历史连续但整页搬运碎成 8 段，所以它只适合 aiter 那种按 head 寻址的 asm kernel。
+- `page_size >= 128` 会强制走 trtllm-gen，因此也就强制 HND；这是「大页导致 HND」，不是「HND 需要大页」。
+- `block_size` 保持默认 16；FA 系要求 `MultipleOf(16)`，FlashInfer 非 SM100-GQA 场景上限 64，hpc 固定 64。
 
 ## 下一知识点
 

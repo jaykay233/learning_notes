@@ -415,7 +415,134 @@ print(k.shape, k.stride())
 # NHD: 倒数第二维 stride == num_kv_heads*head_dim*2
 ```
 
-## 10. 常见错误与症状
+## 10. 推荐配置：别自己选，但要知道什么时候被迫选
+
+### 10.1 结论先行
+
+**留空 `VLLM_KV_CACHE_LAYOUT`。** 解析顺序是固定的：`cache_config` 已有值 → 环境变量 → connector 要求 → backend 候选列表第一个（`utils.py:329-349`）。在 NVIDIA 现代栈上，这条路最终给出的就是 **HND（`LBHNC`）**，而且这恰好是最优值——不是巧合，是下面三条硬约束共同锁定的。
+
+只有在**被迫**的时候才手设：候选集里没有你想要的、或两侧候选不一致。手设的动机几乎永远是「否则报错」，不是「设了更快」。
+
+### 10.2 三条硬约束，逐条看源码
+
+**约束一：kernel 要求。** `trtllm-gen` 在 SM100 上对 decode **和** prefill 都 `assert HND`（`flashinfer.py:2290`、`flashinfer.py:2478-2481`）；XQA 原生 HND。反过来 `hpc`（`LBNHC`）、`turboquant`（`LBNHC`）、`flex_attention`（`LBNHC`）只支持 NHD。这是二选一的，没有中间地带。
+
+**约束二：connector 要求。** 所有 KV connector 都主动索要 HND，而不是「都行」：
+
+| connector | 返回值 | 理由（源码注释原文） |
+|---|---|---|
+| NIXL | `LBHNC`（MLA 返回 `None`） | `for better xfer performance` |
+| Mooncake | `LBHNC`（MLA 返回 `None`） | `heterogeneous TP-safe KV transfer` |
+| Offloading | `LBHNC`（HiSparse 为 `BLHNC`） | — |
+| 示例 hidden-states | `LBNHC` | 按 token 打包 hidden state，与 KV 语义不同 |
+
+**约束三：hetero-TP 的字节级前提。** 这一条最硬，也最能说明问题。NIXL 做 head 重分片时是这样切自己那一份的（`nixl/base_worker.py:332-340`）：
+
+```python
+for p_idx, p_rank in enumerate(plan.all_source_ranks):
+    fa_slot = plan.rank_to_attention_slot.get(p_rank, 0)
+    handle = src_blocks_data.copy()
+    handle[fa_split, 1] //= fa_num_splits          # 每块的字节数等分
+    handle[fa_split, 0] += fa_slot * handle[fa_split, 1]   # 取第 fa_slot 份
+```
+
+**它把「一整页的字节」等分成 `tp_ratio` 份，取自己那一份。** 这只有在「一个 rank 的 head 切片 = 页内一段连续字节」时才成立——也就是 `H` 必须在 `N` 外面：
+
+```text
+HND  一页 = [H][N][C]   head 切片 h0..h3 = 连续 4·N·C 字节 → 等分成立
+NHD  一页 = [N][H][C]   head 切片 = N 段 4·C 字节、步长 H·C → 等分取到的是「前 N/4 个 token 的全部 head」
+```
+
+于是 vLLM 直接立了一道门（`nixl/base_worker.py:2713-2729`）：
+
+```text
+# Heterogeneous TP requires head-splitting, which only works with
+# block-contiguous layouts (e.g. LBHNC). MLA and replicated-KV cases
+# don't split on heads. Mamba doesn't support heterogeneous TP.
+if (abs(tp_ratio) != 1 and not self.use_mla
+        and not self.transfer_topo.is_kv_replicated(remote_engine_id)
+        and not KVCacheLayout[kv_cache_layout].is_block_contiguous
+        and not self.enable_permute_local_kv):
+    raise RuntimeError(
+        "Heterogeneous TP head-dimension splitting requires contiguous heads. "
+        "Use a block-contiguous layout (e.g. LBHNC) on the prefill side.")
+```
+
+`is_block_contiguous` 的定义就是 `[H, N, C]` 在块内连续（`kv_cache_layout.py:45-48`）。
+
+**这条推翻了「NHD 只是慢一点」的想法**：在 P/D 两侧 TP 不等的部署里，NHD 不是性能问题，而是数据错位。而 `tp_ratio == 1`（两侧 TP 相同）时不需要重分片，NHD 完全正常——所以「PD 必须 HND」的准确条件是 **`abs(tp_ratio) != 1` 且非 MLA**。
+
+### 10.3 `N`（block size）怎么选
+
+`N` 决定两件事：页内段长 `N·C·e`，以及前缀复用的粒度。
+
+| `N` | 页大小（H=8,C=128,fp16） | NHD 段长 | 适用 |
+|---|---|---|---|
+| 8 | 16 KiB | 128 B | 不建议，段已不足 1.5 个 L2 line |
+| **16** | 32 KiB | 256 B | **默认**，`CacheConfig.DEFAULT_BLOCK_SIZE` |
+| 32 | 64 KiB | 512 B | 长上下文、前缀复用粒度可放宽时 |
+| 64 | 128 KiB | 1024 B | hpc 固定要求 64；FA 系 `MultipleOf(16)` 内可接受 |
+| 128+ | 256 KiB+ | — | **仅 SM100 trtllm-gen GQA**；`page_size >= 128` 会强制走 trtllm（`flashinfer.py:1429-1431`），也就强制 HND |
+
+三条硬边界：FA 系要求 `MultipleOf(16)`（`flash_attn.py:354-364`）；FlashInfer 在非 SM100-GQA 场景 `page_size <= 64`（`flashinfer.py:874-880`）；hpc 固定 64、head_dim 固定 128。
+
+`N` 变大的代价不在 attention，而在**前缀缓存**：block 是复用粒度，`N` 越大，末尾不足一块的部分越浪费，跨请求的 partial hit 也越难命中。所以除了 trtllm-gen 的大页路径，没有理由主动调大。
+
+### 10.4 场景决策表
+
+| 场景 | backend | layout | `N` | 谁决定的 |
+|---|---|---|---|---|
+| 单机、无 PD、H100/H200 | FlashInfer + XQA | **HND** | 16 | XQA 原生 + 默认候选首位 |
+| 单机、无 PD、B200 | FlashInfer + trtllm-gen | **HND** | 16 或 128 | `assert HND` |
+| 单机、只有 FA3 | FLASH_ATTN | NHD（默认） | 16 | 未声明布局 → 候选首位 |
+| PD，两侧 TP 相同 | NIXL / Mooncake | **HND** | 两侧一致 | connector 索要 |
+| PD，两侧 TP 不同 | NIXL / Mooncake | **HND（必须）** | 两侧一致 | `is_block_contiguous` 硬门 |
+| PD，MLA（DeepSeek 类） | NIXL | 任意（connector 返回 `None`） | 两侧一致 | KV 在 TP 上复制，不切 head |
+| PD，用了 hpc / turboquant | 只能 NHD | NHD | — | backend 只支持 `LBNHC`；**此时不能 hetero-TP** |
+| KV offload 到 CPU/SSD | — | **HND** | — | Offloading connector 索要 |
+| 混合 page size + HMA | 任意 | 必须 block-compact（`BLHNC`/`BLHNC`） | — | `resolve_kv_cache_layout` 收窄候选 |
+| DCP + 复制 draft + 混合 page size | 任意 | 必须 block-outermost（`BLHNC`） | — | `is_block_outermost` 收窄候选 |
+
+### 10.5 什么时候真的需要手设
+
+只有四种情况，且四种都是「不设就报错」：
+
+1. **两侧 backend 不同导致候选集不同**。一侧只有 `LBNHC`、另一侧只有 `LBHNC` 时，必须显式统一，否则握手阶段直接 `RuntimeError`。
+2. **HMA 混合 page size**。报错原文会告诉你换成 block-outermost。
+3. **想让 NHD 设备侧配 hetero-TP PD**。只能开 `enable_permute_local_kv=True`——它让 host buffer 用 `LBHNC` 并在搬运时做 permute，属于 experimental，代价是每页一次重排。
+4. **被 backend 锁死**。见 10.4 的 hpc/turboquant 行。
+
+三种**不要做**：
+
+```text
+不要在 PD 两侧只设一边。    握手会拒绝，且报错在启动阶段，不在首包。
+不要为了 decode 手设 HND。  本来就解析成 HND，除非你用的是只支持 NHD 的 backend。
+不要把 N 调到 128 来"配合" HND。  那是倒因为果：128 是大页路径的结果，不是 HND 的原因。
+```
+
+### 10.6 一次完整验证
+
+```bash
+# 1. 看最终解析成什么（启动日志里有）
+#    INFO ... Using LBHNC KV cache layout.
+#    INFO:NixlConnector setting KV cache layout to LBHNC for better xfer performance.
+
+# 2. 看候选集（报错时会全部列出）
+#    VLLM_KV_CACHE_LAYOUT=NHD does not satisfy every supported set;
+#    valid layouts: LBHNC, BLHNC.
+
+# 3. 看实际 stride，终极判据
+python3 -c "
+import torch
+H,N,C=8,16,128
+p=torch.empty(H*N*C,dtype=torch.float16).view(H,N,C)   # HND
+q=torch.empty(N*H*C,dtype=torch.float16).view(N,H,C)   # NHD
+print('HND strides', p.stride(), '-> H 的 stride =', p.stride(0))
+print('NHD strides', q.stride(), '-> N 的 stride =', q.stride(0))
+"
+```
+
+## 11. 常见错误与症状
 
 | 错误 | 症状 | 原因 |
 |---|---|---|
@@ -428,8 +555,17 @@ print(k.shape, k.stride())
 | 在 `N=4` 的 page 上期待 NHD 够用 | 有效带宽接近腰斩 | 每段只有 64 B，不足半个 cache line |
 | 在 SM100 上关掉 trtllm-gen 想用 NHD | `assert ... == "HND"` 直接失败 | trtllm-gen 的 prefill 也要求 HND |
 | 假设自建 build 一定有 kernel | 报「requires a fused context FMHA kernel, and this build has none」 | `--cuda_architectures` 漏了当前 SM，cubin 表被编空 |
+| PD 两侧 TP 不同却用 NHD | `Heterogeneous TP head-dimension splitting requires contiguous heads` | 等分连续字节取 head 切片只在 HND 下成立，NHD 会读到别的 head |
+| 以为 NHD 只是「慢一点」 | 在 hetero-TP PD 上是数据错位，不是性能差 | `handle[:,1] //= fa_num_splits` 假设页内 head 连续 |
+| 为了「配合 HND」把 `N` 调到 128 | 启动后反而被强制走 trtllm-gen，且前缀复用变粗 | `page_size >= 128` 是强制 trtllm 的**原因**，不是结果 |
+| 用 hpc/turboquant 还想 hetero-TP PD | 直接 `RuntimeError`，或被迫开 `enable_permute_local_kv` | 这两个 backend 只支持 `LBNHC` |
+| 手动设 `VLLM_KV_CACHE_LAYOUT` 求「更快」 | 解析结果与默认相同，纯属无效操作 | 默认候选首位本来就是 HND |
 
-## 11. 自检
+## 12. 自检
+
+**Q0：应该把 `VLLM_KV_CACHE_LAYOUT` 设成什么？**
+
+什么都不设。解析顺序是「已解析值 → 环境变量 → connector 要求 → backend 候选首位」，NVIDIA 现代栈上落到 HND。只有当候选集里没有你需要的、或两侧候选不一致时才手设，而那些场景的动机都是「否则启动报错」。
 
 **Q1：`N` 是什么？为什么不是 num_heads？**
 
@@ -451,7 +587,7 @@ trtllm-gen 是编译期特化的 cubin 表，地址计算和内层循环在生�
 
 因为它把 `H` 放到了 `B` 外面：一个 head 的整段历史连续（1 段 16384 B），但「搬一整页」变成 8 段 4096 B。PD 分离、KV offload、prefix cache 拷贝都按页搬，代价太高。`LHBNC` 只在 kernel 真的按 head 连续寻址时（aiter 的 asm decode）才划得来。
 
-## 12. 一页速查
+## 13. 一页速查
 
 ```text
 逻辑形状恒为 [L, B, H, N, C]
@@ -480,6 +616,15 @@ MI300     → aiter      SM90+腾讯  → hpc（NHD，mtp<=3）
 trtllm-gen 强制 HND（prefill 也是）；XQA/FA 两种都行（TMA/stride-aware）
 
 布局全局唯一；PD 两侧必须一致；改 block_size 可能触发 kernel block 切分报错
+
+推荐（按顺序）
+  1. VLLM_KV_CACHE_LAYOUT 留空。解析链：已解析值 → 环境变量 → connector → 候选首位
+  2. NVIDIA 现代栈的默认结果就是 HND；只有 hpc/turboquant/flex 锁死 NHD
+  3. block_size 用 16（默认）。32/64 可以；128+ 只在 SM100 trtllm-gen GQA
+  4. PD 两侧 TP 不等 → 必须 HND；这是 is_block_contiguous 的硬门，不是优化
+
+手设的唯一动机是「否则报错」：候选不一致、HMA 混合 page size、
+想 NHD + hetero-TP（需 enable_permute_local_kv，experimental）、backend 锁死
 ```
 
 ## 附录：完整脚本

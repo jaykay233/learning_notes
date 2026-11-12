@@ -395,7 +395,7 @@ models/
 | 位置无关 KV / 首 block 重算 / 共享 tail / MEPIC 精确性边界 | [inference-scheduling/10](inference-scheduling/10-mepic-exact-vs-approximate-kv-reuse.md) |
 | P/D 资源分配 / 有效 Prefill 吞吐 / 整数配置 / 离散事件仿真 | [inference-scheduling/11](inference-scheduling/11-pd-resource-allocation-and-simulator.md) |
 | KVStream / NVMe+PFS 聚合带宽 / 完成驱动 I/O 池 / 写放大与 TTFT 边界 | [inference-scheduling/12](inference-scheduling/12-kvstream-multitier-kv-retrieval.md) |
-| KV 布局 NHD·HND·LHBNC / stride 分段 / roofline / spec-decode 分派 / XQA·trtllm-gen·aiter·hpc | [inference-scheduling/13](inference-scheduling/13-attention-backend-kv-layout-map.md) |
+| KV 布局 NHD·HND·LHBNC / stride 分段 / roofline / spec-decode 分派 / XQA·trtllm-gen·aiter·hpc / 推荐配置 | [inference-scheduling/13](inference-scheduling/13-attention-backend-kv-layout-map.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
 | DFlash 2 候选路径选择、相邻边打分与轻量贪心 | [speculative-decoding/03](speculative-decoding/03-dflash2-candidate-path-selection.md) |
