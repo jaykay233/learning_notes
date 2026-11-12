@@ -1,6 +1,6 @@
 # Inference Scheduling
 
-推理框架的 token budget、running/waiting 与 KV 抢占、DP attention 混合 P/D 执行、EPLB、跨 rank 同步、带分层 KV 的集群性能仿真、SSD 前缀 KV 的重要性加载、位置无关 KV 复用、多级存储聚合带宽检索，以及单机 CPU-GPU MoE 专家卸载。
+推理框架的 token budget、running/waiting 与 KV 抢占、DP attention 混合 P/D 执行、EPLB、跨 rank 同步、带分层 KV 的集群性能仿真、SSD 前缀 KV 的重要性加载、位置无关 KV 复用、多级存储聚合带宽检索、attention backend 的 KV 布局与 kernel 分派，以及单机 CPU-GPU MoE 专家卸载。
 
 ## 文档索引
 
@@ -18,6 +18,7 @@
 | [10-mepic-exact-vs-approximate-kv-reuse.md](10-mepic-exact-vs-approximate-kv-reuse.md) | MEPIC：位置无关 chunk 复用、首 block 重算、共享 tail 与精确性边界 |
 | [11-pd-resource-allocation-and-simulator.md](11-pd-resource-allocation-and-simulator.md) | P/D 资源分配：有效 Prefill 吞吐、连续实例数、整数配置搜索与 benchmark-calibrated 离散事件仿真 |
 | [12-kvstream-multitier-kv-retrieval.md](12-kvstream-multitier-kv-retrieval.md) | KVStream：step 级 I/O 池、NVMe/PFS 聚合带宽、完成驱动路由、延迟写与 TTFT 边界 |
+| [13-attention-backend-kv-layout-map.md](13-attention-backend-kv-layout-map.md) | attention backend 全景：NHD/HND/LHBNC 的 stride 与分段数、roofline 强度判据、spec-decode 的 `reorder_batch_threshold` 分派、XQA/trtllm-gen/aiter/hpc 对照 |
 | [examples/vllm_v1_token_budget.py](examples/vllm_v1_token_budget.py) | 可运行的预算模拟：两个请求、14 个普通 token、6 个 draft slot、20 个输入 slot |
 | [examples/sglang_dp_prefill_delayer.py](examples/sglang_dp_prefill_delayer.py) | 可运行的 DP attention 调度模拟：三个 rank 的 mixed/all 状态与 idle units |
 | [examples/tensorrt_llm_generation_first_budget.py](examples/tensorrt_llm_generation_first_budget.py) | generation-first 与 chunked prefill 两种预算分配 trace |
@@ -28,6 +29,7 @@
 | [examples/mepic_position_independent_kv.py](examples/mepic_position_independent_kv.py) | MEPIC 的 block 占用、精确/近似路径与 RoPE、上下文误差来源的 CPU trace |
 | [examples/pd_capacity_simulator.py](examples/pd_capacity_simulator.py) | P/D 容量公式、Prefill/Decode/KV 请求生命周期、P95/P99 与候选配置对比的 CPU 离散事件仿真 |
 | [examples/kvstream_multitier_retrieval.py](examples/kvstream_multitier_retrieval.py) | NVMe/PFS 带宽漂移下固定切分与完成驱动路由的离散事件对比 |
+| [examples/attention_backend_layout_map.py](examples/attention_backend_layout_map.py) | 三种 KV 布局的 stride 与子块分段数、算术强度与 ridge、backend 对照表；`--scan <vllm>` 从源码现场抽取布局声明 |
 
 ## 当前进度
 
@@ -45,6 +47,7 @@
 - [x] MEPIC 的位置无关 chunk 复用、首 block 重算与精确性边界
 - [x] P/D 资源数量公式、TTFT 下的有效 Prefill 吞吐、TPOT 下的 Decode batch 与离散事件仿真
 - [x] KVStream 的 step 级多级存储读取池、聚合带宽下界、完成驱动路由与写放大边界
+- [x] attention backend 的 KV 布局（NHD/HND/LHBNC）、roofline 判据与 spec-decode 分派
 - [ ] TensorRT-LLM 的 ADP router、phase intent 与 dummy request
 
 ## 已经覆盖
@@ -95,10 +98,22 @@
 - 聚合带宽上界只覆盖 storage-to-host 的读取；端到端收益还要经过 H2D、forward、队列和 SLO 放大。
 - 全层复制把写放大约提高到 2 倍；host cache 足够或复用率降到 4% 时，KVStream 可能没有收益甚至慢于 LMCache。
 - 6.07 倍是 SWE-bench、CV=4、32B、Testbed-2 的平均 TTFT 结果，不是单个 chunk 的读取加速，也不是普遍承诺。
+- 逻辑形状恒为 `[L, B, H, N, C]`；`N` 是每个 page 的 token 数（= `block_size`），不是 head 数，判据看 stride 而不看字母。
+- `NHD`=`LBNHC`、`HND`=`LBHNC` 只是页内二维的别名；`LHBNC` 把 `H` 放到 `B` 外面，一个 head 的整段历史连续。
+- 三种布局的物理字节数完全相同（`H=8,N=16,C=128,fp16` 时都是 32 KiB）；差别只在取子块时碎成几段。
+- decode 单页取 1 个 head：NHD 16 段 × 256 B，HND 1 段 × 4096 B；跨 4 页时 NHD 64 段、HND 4 段、LHBNC 1 段 × 16384 B。
+- `LHBNC` 的代价在整页搬运：8 段 × 4096 B，所以不利于 PD 传输和 KV offload。
+- 算术强度是 `2LG/e` FLOP/B（fp16 即 `LG`），不是 `2LG`：K 和 V 各占一份字节。H100 的 ridge 是 295 FLOP/B。
+- `G=8` 时 `L=1` 的强度只有 8，低于 ridge 约 37 倍；投机解码把 `L` 抬到 `γ+1` 仍跨不过 ridge。
+- 投机解码不改变每个 KV 字节的 DRAM 访问次数；它只改 `L`，以及「这一步进不进 decode kernel」。
+- `reorder_batch_threshold = 1+γ` 时 verify 步留在 decode 路径；保持 1 时被划进 prefill 组，改用 prefill kernel 的布局。
+- 布局由 kernel 内层循环决定，不由 spec-decode 决定：trtllm-gen 强制 HND，hpc 有 MTP kernel 却用 NHD。
+- XQA 原生 HND，但用 TMA 描述符另开了 NHD 路径；FA3/FA4 不声明布局偏好，读 stride。
+- 布局全局唯一；PD 两侧必须一致，否则整行搬运被 NIXL 拒绝，而不是自动转置。
 
 ## 下一知识点
 
-把 KVStream 的 completion-driven 路由接入真实带宽 trace，并比较 KV compression、request reordering 与 P/D disaggregation 如何共同改变存储读取需求 `D_i` 和有效带宽 `b_i`。TensorRT-LLM ADP 顺延到后续笔记。
+把布局约束接到 PD 分离的工程边界上：两侧 `VLLM_KV_CACHE_LAYOUT` 一致、attention TP 与按 head 分片的耦合、`LHBNC` 与整页传输的冲突，以及跨实例 KV 搬运时的行打包格式。TensorRT-LLM ADP 顺延到后续笔记。
 
 ## 源码与论文快照
 
@@ -112,4 +127,5 @@
 - MEPIC：arXiv `2512.16822v1`
 - P/D 资源分配：arXiv `2603.04716v1`；公众号 `LLM软硬协同优化`，2026-09-11
 - KVStream：arXiv `2610.31827v1`；公众号 `LLM软硬协同优化`，2026-10-27
+- vLLM（13）：`c1dc2e9cf992995953548c392f8c67db7283495b`；TensorRT-LLM（13）：`0372799d1543ef5920c1318b829cf127800dbcb9`
 - 依赖：Python 3.10+；示例仅需标准库，不需要 GPU

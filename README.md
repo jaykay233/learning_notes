@@ -14,7 +14,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 | [`DeepGEMM/`](DeepGEMM/) | DeepGEMM / CUTLASS 边界、MegaMoE dispatch/pull、FP8 scale 与 UTCCP 布局、L1/L2 epilogue |
 | [`cuda-graph/`](cuda-graph/) | 推理 CUDA Graph、memory-saver、SGLang vs Inductor Trees |
 | [`communication/`](communication/) | GPU 通信提交、GPU-initiated RDMA、Proxy / GDAKI / GPI、MoK 调度，以及低延迟 collective |
-| [`inference-scheduling/`](inference-scheduling/) | vLLM/SGLang/TensorRT-LLM 的 token budget、DP attention、KV 抢占、EPLB、集群性能仿真、前缀 KV I/O 与单机 MoE 专家 offload |
+| [`inference-scheduling/`](inference-scheduling/) | vLLM/SGLang/TensorRT-LLM 的 token budget、DP attention、KV 抢占、EPLB、集群性能仿真、前缀 KV I/O、attention backend 的 KV 布局与 kernel 分派，以及单机 MoE 专家 offload |
 | [`speculative-decoding/`](speculative-decoding/) | 投机解码收益（GPU vs LPU）、DFlash/DFlash 2 cache 与候选路径、Adaptive DHiSparse 的 draft KV 和 verification staging |
 | [`heterogeneous-inference/`](heterogeneous-inference/) | GPU 资源池与 SRAM ASIC 的异构推理；SQD、AFD/AFlex、动态调频、KV 预取与性能边界 |
 | [`torch_compile/`](torch_compile/) | `torch.compile` / Dynamo / FX / AOTAutograd / Dispatcher / make_fx 内部机制 |
@@ -104,7 +104,7 @@ quantization/                # LLM 低比特量化与推理系统
 └── 01-qoq-w4a8kv4.md       # QoQ / QServe：W4A8KV4、重排与 SmoothAttention
 cuda-graph/                  # CUDA Graph 基础、SGLang 与 VMM
 communication/               # Proxy、GDAKI/GPI、MoK、collective
-inference-scheduling/        # token budget、KV 抢占、DP attention、EPLB、集群仿真、前缀 KV I/O、MoE offload
+inference-scheduling/        # token budget、KV 抢占、DP attention、EPLB、集群仿真、前缀 KV I/O、KV 布局、MoE offload
 speculative-decoding/        # 投机解码
 heterogeneous-inference/     # GPU 资源池 / SRAM ASIC 异构推理、SQD 与 AFlex
 torch_compile/               # Dynamo、AOTAutograd、Dispatcher、make_fx
@@ -207,6 +207,7 @@ inference-scheduling/
 ├── 10-mepic-exact-vs-approximate-kv-reuse.md # 位置无关 KV、首 block 重算、共享 tail 与精确性边界
 ├── 11-pd-resource-allocation-and-simulator.md # P/D 容量公式、有效吞吐、整数配置与离散事件仿真
 ├── 12-kvstream-multitier-kv-retrieval.md # NVMe/PFS 聚合带宽、完成驱动 I/O 与 TTFT 边界
+├── 13-attention-backend-kv-layout-map.md # NHD/HND/LHBNC、roofline 判据、spec-decode 分派与四家 kernel
 └── examples/
     ├── vllm_v1_token_budget.py              # CPU 可运行预算模拟
     ├── sglang_dp_prefill_delayer.py         # CPU 可运行 DP attention 调度模拟
@@ -217,7 +218,8 @@ inference-scheduling/
     ├── pd_capacity_simulator.py             # P/D 队列、batch、KV transfer 与 SLO 仿真
     ├── impress_importance_tiering.py        # IMPRESS 决策与重排 trace
     ├── mepic_position_independent_kv.py     # MEPIC 精确性边界与 block 占用 trace
-    └── kvstream_multitier_retrieval.py      # 固定切分与完成驱动多级 KV 读取
+    ├── kvstream_multitier_retrieval.py      # 固定切分与完成驱动多级 KV 读取
+    └── attention_backend_layout_map.py      # 布局 stride/分段数、强度与 ridge、backend 对照 + --scan
 ```
 
 ```
@@ -393,6 +395,7 @@ models/
 | 位置无关 KV / 首 block 重算 / 共享 tail / MEPIC 精确性边界 | [inference-scheduling/10](inference-scheduling/10-mepic-exact-vs-approximate-kv-reuse.md) |
 | P/D 资源分配 / 有效 Prefill 吞吐 / 整数配置 / 离散事件仿真 | [inference-scheduling/11](inference-scheduling/11-pd-resource-allocation-and-simulator.md) |
 | KVStream / NVMe+PFS 聚合带宽 / 完成驱动 I/O 池 / 写放大与 TTFT 边界 | [inference-scheduling/12](inference-scheduling/12-kvstream-multitier-kv-retrieval.md) |
+| KV 布局 NHD·HND·LHBNC / stride 分段 / roofline / spec-decode 分派 / XQA·trtllm-gen·aiter·hpc | [inference-scheduling/13](inference-scheduling/13-attention-backend-kv-layout-map.md) |
 | 投机解码（GPU vs LPU） | [speculative-decoding/01](speculative-decoding/01-gpu-vs-lpu-sram.md) |
 | DFlash cache 窗口、draft block query 数与因果可见性 | [speculative-decoding/02](speculative-decoding/02-dflash-cache-window-and-block-visibility.md) |
 | DFlash 2 候选路径选择、相邻边打分与轻量贪心 | [speculative-decoding/03](speculative-decoding/03-dflash2-candidate-path-selection.md) |
