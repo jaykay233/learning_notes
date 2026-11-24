@@ -4,7 +4,7 @@ AI 编译器、GPU 编程、推理系统与模型架构的学习笔记，按主�
 
 | 目录 | 侧重 |
 |---|---|
-| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo HySparse / Hunyuan Hy4 …） |
+| [`models/`](models/) | 模型架构（DeepSeek / GLM / Kimi / Qwen / MiMo HySparse / Hunyuan Hy4 / Inkling 2 Mini（looped）…） |
 | [`ascend-ai-compiler/`](ascend-ai-compiler/) | 昇腾版 AI 编译器 / 部署讲义（CANN、ATC、GE、om） |
 | [`ascendc/`](ascendc/) | AscendC 算子：**CPU 孪生**环境 + `add_custom`（macOS 用 Colima） |
 | [`operators/`](operators/) | 算子开发：从建模、正确性到性能与交付；含 Triton/Gluon、FlashMLA/FlashKDA、官方 FlashAttention varlen/paged KV，以及 DeepSelect 阈值式精确 TopK 读码 |
@@ -278,8 +278,12 @@ models/
 ├── mimo-hysparse/
 │   ├── block-sparse-attention.md # HySparse：Q'、Top-K KV block、SWA 双分支与 causal mask
 │   └── block_gather_trace.py     # block gather、mask 与 SWA 交集的可运行 trace
-└── hy4-preview/
-    └── architecture.md   # Hunyuan Hy4 Preview：Gated DSA + IndexCache、MoE、iHC
+├── hy4-preview/
+│   └── architecture.md   # Hunyuan Hy4 Preview：Gated DSA + IndexCache、MoE、iHC
+└── inkling-2-mini/
+    ├── architecture.md   # Inkling 2 Mini 26.4B：6/12×3/6、24 份权重 48 次应用
+    ├── looped-transformer.md # looped transformer 机制：族谱、设计空间、稳定器、成本模型
+    └── code/mini_looped.py   # 可运行 numpy 骨架：distinct / applications / weight touches 三本账
 ```
 
 ## 昇腾 AI 编译器讲义
@@ -327,6 +331,7 @@ models/
 | `qwen3.8-flash-next/` | Qwen3.8-Flash-Next | **GDN + QSA** | **HC 4 路 + PLE ~51B** | `qwen4_exp`；≠ 旧 Qwen3-Next-80B |
 | `mimo-v2.6-flash/` | MiMo-V2.6-Flash | **SWA + GA** | Sparse MoE，309B / 15B active | 原生文本、图像、视频、音频；带 MTP |
 | `hy4-preview/` | Hunyuan Hy4 Preview | **Gated DSA + IndexCache** | **iHC 4 路** | 770B / 49B active；256 routed + 1 shared；带 MTP |
+| `inkling-2-mini/` | Inkling 2 Mini | **GQA 24:8，local:global = 5:1** | **深度残差 AttnRes + 跨 pass 门控** | 26.4B / 3.4B active；**24 份权重跑 48 次应用**；1M 上下文 |
 
 易混：
 
@@ -336,6 +341,7 @@ models/
 - **MiMo 的 GA/SWA 与 GQA 是不同概念**：前两者描述注意力范围，GQA 描述 Q/KV 头分组；两种注意力都使用 GQA。
 - **Hy4 的 `num_key_value_heads=8` 不表示普通 GQA**：MLA 会把 KV latent 展开到 64 个 attention heads；实际复用方式以 `HYV4Config.__post_init__` 和模型实现为准。
 - **Hy4 的 iHC 不等于 mHC**：iHC 固定 \(H_{\text{res}}=I_4\)，删除 mHC 的动态 `comb` 与 Sinkhorn。
+- **Inkling 2 Mini 的「48 层」不是 48 层网络**：24 份权重，中间 12 层跑 3 遍（6 + 12×3 + 6 = 48 次应用）；省参数、不省算力、也不省 KV。
 
 ## 专题索引
 
@@ -435,7 +441,8 @@ models/
 | QSA（block 粗选 → token 展开） | [qwen3.8-flash-next/qsa.md](models/qwen3.8-flash-next/qsa.md) |
 | Linear / gated delta（KDA / GDN / Radix） | [glm-5.3-flash/radix_linear_attention.md](models/glm-5.3-flash/radix_linear_attention.md)、[qwen-3.8/architecture.md](models/qwen-3.8/architecture.md)、[kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
 | mHC / HC / Gated Residual | [deepseek_v4/mhc.md](models/deepseek_v4/mhc.md)、[qwen3.8-flash-next/architecture.md](models/qwen3.8-flash-next/architecture.md)（HC；无 Sinkhorn） |
-| AttnRes | [kimi-k3/architecture.md](models/kimi-k3/architecture.md) |
+| AttnRes | [kimi-k3/architecture.md](models/kimi-k3/architecture.md)、[inkling-2-mini/architecture.md](models/inkling-2-mini/architecture.md)（深度残差：4 block × 6 层，读 token emb + earlier block sums） |
+| Looped / 层复用 / 循环深度 | [inkling-2-mini/looped-transformer.md](models/inkling-2-mini/looped-transformer.md)（UT·DEQ·ALBERT·Ouro 对照、设计四问、稳定器清单、成本模型） |
 | PLE / N-gram embedding | [qwen3.8-flash-next/ple.md](models/qwen3.8-flash-next/ple.md) |
 | MQA / CSA / HCA | [deepseek_v4/mqa.md](models/deepseek_v4/mqa.md)、[deepseek_v4/architecture.md](models/deepseek_v4/architecture.md) |
 | MiMo-V2.6-Flash / SWA / GA / MTP | [mimo-v2.6-flash/architecture.md](models/mimo-v2.6-flash/architecture.md) |
@@ -770,6 +777,26 @@ Qwen4 架构预览（`qwen4_exp`）：GDN + **QSA**，**Gated Residual（HC×4�
 
 - **QSA**：先 top-k **block** → `expand_blocks` 成 token index → 读**原始** K/V；未满 4-token 尾巴强制并入。
 - **PLE**：预训练学好的查表（非 token emb 拷贝）；推理冻结，可放 host；hash = 乘数 + XOR + 素数模。
+
+---
+
+## Inkling 2 Mini（26.4B，looped 主干）
+
+**24 份权重、48 次层应用**：prelude 1–6 + core 7–18（跑 3 遍）+ coda 19–24。中间 12 层的参数只存一份，靠跨 pass 门控 + 深度残差把它「循环」起来。
+
+| 文档 | 内容 |
+|---|---|
+| [architecture.md](models/inkling-2-mini/architecture.md) | 分段预算（24 vs 48）、尺寸常量、前向骨架、core 一层拆解（门控消息 / AttnRes / GQA / MoE）、参数账反推、推理侧后果 |
+| [looped-transformer.md](models/inkling-2-mini/looped-transformer.md) | looped 机制本体：族谱对照、设计四问（循环哪段 / 共享什么 / 轮间耦合 / 怎么不发散）、稳定器清单、成本模型、七句检查清单 |
+| [code/mini_looped.py](models/inkling-2-mini/code/mini_looped.py) | 可运行 numpy 骨架（无第三方依赖）：打印 distinct / applications / active / weight touches 四本账，并复算 26.4B–3.4B 的参数分解 |
+
+要点备忘：
+
+- **三个 pass 同一起点**：prelude 输出同时喂三个 pass，不是串联的深网络；第 2、3 个 pass 靠 `gate(h, prev[i])` 注入上一轮的块输出。
+- **门控回注是 looped 的灵魂**：去掉它，12 层套 3 遍就等于一个 12 层网络前向三次，深度没有真正变深。
+- **MoE 大概率铺满 24 层（推断）**：单专家 \(3\times2304\times1152\approx7.96\text{M}\)，24 层 × 128 专家 ≈ 24.5B（93%）；反解稠密 ≈ 1.9B，活跃 = 1.9 + 1.53 ≈ 3.47B ≈ 图上 3.4B。图上把 MoE 只画在 core 只是放大展示。
+- **省参数、费算力、不省 KV**：prefill 按 48 层付，KV cache 按 24 层存但中间 12 层每轮重算；1M 上下文的 KV 显存几乎全在 4 层 global 上（≈12GB fp16）。
+- **那一堆 clip / softcap 不是表达力来源，是可收敛性来源**：QK L2 clip、V norm、RMSNorm、logit softcap 30、门控残差、SwiGLU gate softcap，作用是给每一轮的增益加上界。
 
 ---
 
