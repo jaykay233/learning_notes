@@ -173,6 +173,8 @@ h \leftarrow h + \mathrm{softmax}_j\big(w(h)_j\big)\sum_j \alpha_j\, s_j ,\qquad
 
 对循环结构来说这是**必需件**而不是装饰：core 每转一圈表示都会漂移，如果没有一条随时能回看原始 embedding 和早期 block 的通路，几轮之后早期信息就被残差稀释掉了。它相当于给循环网络留了一条「回到起点再问一次」的查询通道。
 
+实现的三条路线（无 query / 带 query / per-stream）、Kimi-K3 的 bank + `prefix_sum` 记账（把快照写放大压到 `L/12`，Inkling 的 `4 blocks × 6 layers` 是同一手法）、以及「为什么它是梯度高速公路」都在 [looped-transformer.md §6](looped-transformer.md) 展开，可运行验证见 [code/attn_res_demo.py](code/attn_res_demo.py)。
+
 ### 5.3 注意力子层
 
 - **GQA** 24 Q heads / 8 KV heads，head_dim 96；L2 clip 作用在 q、k 的范数上，V 额外做 norm。

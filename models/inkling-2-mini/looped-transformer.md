@@ -103,7 +103,87 @@ h \leftarrow h + \sigma(W[h;\ m])\odot m,\qquad m = h^{(p-1)}_i
 
 一个推论：looped 模型天然适合「参数预算卡死」的场合（端侧、单卡、显存受限的 serving），不适合「算力卡死」的场合。
 
-## 6. 最小实现骨架与消融顺序
+## 6. AttnRes：把残差从「累加」改成「按深度选择」
+
+普通残差 \(h_i = h_{i-1} + f_i(h_{i-1})\) 是**加法累积**：信息只能沿深度一层层往前挤，深度越深，早期信号被稀释得越狠。循环结构把这个缺陷放大 K 倍——每转一圈再稀释一遍。
+
+AttnRes 的做法：维护一个深度源的集合 `srcs`（token embedding + 每个 block 的输出），每层在**深度轴**上做一次 softmax，自己决定从哪些源读回多少。
+
+\[
+\alpha_j = \operatorname{softmax}_j\big(\mathrm{score}(h, s_j)\big),\qquad
+\mathrm{out} = \sum_j \alpha_j\, s_j
+\]
+
+可运行验证见 [code/attn_res_demo.py](code/attn_res_demo.py)（三种打分方式 + bank 记账 + 凸组合范数验证）。
+
+### 6.1 三种打分方式
+
+| 变体 | score | 参数量 | 用在哪 |
+|---|---|---|---|
+| **A 无 query** | \(w^\top\mathrm{RMSNorm}(s_j)\)，只依赖源自己 | \(H\) | **Kimi-K3**（`score_proj: H→1` + `score_norm`） |
+| **B 带 query** | \(\langle hW_q,\ s_j\rangle/\sqrt{H}\)，当前 hidden 做 query | \(H\times H\) | 直觉版；`mini_looped.py` 用的是简化形 |
+| **C per-stream** | 每个 stream（Q/K/V / 每 head）一套 \(w\) | \(n_{\text{stream}}\times H\) | **global 层**，对应图上 `Global layers mix Q, K, and V inputs separately` |
+
+A 与 B 的差别值得记一句：**B 能表达「我这一层现在想找什么」，A 只能表达「哪个源本身更值得读」**。A 参数少一个数量级，且 score 侧可压成一次点积（`cw = score_norm.weight ⊙ score_proj.weight`），推理更便宜——Kimi-K3 选 A 是工程取舍。
+
+`mini_looped.py` 里最短的实现（B 的简化形，query 是每 token 一个标量）：
+
+```python
+def attn_res(h, srcs, p):
+    S = h @ p["ar_w"]                                   # (T,1) 每 token 一个标量
+    s = np.concatenate(srcs, axis=0).reshape(len(srcs), *h.shape)
+    scores = np.einsum("std,t->st", s, S[:, 0])         # (S,T)：每个源对每个 token 的分
+    scores -= scores.max(0, keepdims=True)
+    a = np.exp(scores); a /= a.sum(0, keepdims=True)    # 沿深度轴 softmax
+    return np.einsum("st,std->td", a, s)                # 凸组合
+```
+
+四个要点：
+
+1. **softmax 沿深度轴做，不是沿 token 轴。** 它不在时间上混合，在层与层之间混合；每个 token 独立算自己的 \(\alpha\)。这和 self-attention 正好互补。
+2. **输出是源的凸组合**，\(\alpha_j \ge 0,\ \sum_j \alpha_j = 1\)，所以 \(\|\mathrm{out}\| \le \max_j \|s_j\|\)。范数不会随深度放大——这是它能在循环结构里稳住的原因之一（demo 里两项都验证了）。
+3. **反传多了一条「深度高速公路」。** \(\partial\,\mathrm{out}/\partial s_j = \alpha_j > 0\)，梯度直接落到任意历史源，不必穿过中间几十层。**AttnRes 买的主要不是表达力，是深度方向的梯度路径。**
+4. **`srcs` 的存储不能省**，每层 append 一次是 \(O(L\cdot T\cdot H)\)。Kimi-K3 用 bank 把这份开销压到 \(O(\frac{L}{12}\cdot T\cdot H)\)，见下。
+
+### 6.2 Kimi-K3 的 bank 记账（怎么把写放大压到 1/12）
+
+朴素做法每层都要存一份 `[T,H]` 快照，24 层就是 24 份。Kimi-K3 的 `AttnResidual` 改成：
+
+| 量 | 形状 | 含义 |
+|---|---|---|
+| `bank` | `[T, NB, H]` | 冻结的 snapshot，**每 12 层才写一行** |
+| `nvb` | scalar | 已写入行数（softmax 只在 `[:nvb]` 上做） |
+| `prefix_sum` | `[T,H]` 或 `None` | 当前 block 内还没入 bank 的 running prefix |
+
+```python
+def aggregate(prefix, bank, nvb, w):
+    if nvb == 0:
+        return prefix, None                      # 第 0 层：bank 还空，直通
+    rows = cat(bank[:, :nvb, :], prefix[:, None, :], dim=1)   # bank 行 + 当前 prefix 一起竞争
+    a = softmax(rms_norm(rows) @ w, dim=1)        # 沿 bank 行轴
+    return (a[:, :, None] * rows).sum(1), a
+```
+
+关键设计有两条：
+
+- **当前 `prefix` 也参与 softmax**，与冻结的 bank 行竞争。否则 block 中间的那些层就"看不见"自己了。
+- **只有在 `layer_idx % block_size == 0` 时才写 bank**，其余层的读取发生在 `prefix` 上，不新增快照。`mini_looped`（玩具）里把 12 压成 3，跑出来是：
+
+```
+layer  0: 写入 bank 第 0 行，nvb=1，alpha 形状 (退化为直通)
+layer  3: 写入 bank 第 1 行，nvb=2，alpha 形状 (2, 3)
+layer  6: 写入 bank 第 2 行，nvb=3，alpha 形状 (3, 3)
+layer  9: 写入 bank 第 3 行，nvb=4，alpha 形状 (4, 3)
+```
+
+Inkling 图上写 `4 AttnRes blocks, 6 layers per block`，就是同一手法：24 层 / 6 = 4 行 bank。
+
+### 6.3 两个必须做对的细节
+
+- **`srcs` 必须含 token embedding。** 不含的话模型断了「回到输入」的通道，循环几轮后原始 token 信息就彻底没了。图上左侧 `Depth sources` 第一项正是 `Token embeddings`。
+- **打分前要归一（RMSNorm 或减 max）。** 深度源的量级差异很大（embedding 和深层 hidden 不是一个尺度）。demo 里量化过：不做 norm 时 \(\alpha\) 的熵会掉到 0.29（几乎只读一个源，退化成普通残差），做了之后回到 1.19——softmax 不再饱和。Kimi-K3 挂 `score_norm` 就是为这个。
+
+## 7. 最小实现骨架与消融顺序
 
 可运行的玩具实现见 [code/mini_looped.py](code/mini_looped.py)（numpy，无依赖，打印 distinct / applications / 参数量三本账）。
 
@@ -135,7 +215,7 @@ def forward(x):
 3. 只加 `srcs` 深度残差（先退化成加权求和，不做到 softmax），看长依赖任务的变化；
 4. 最后加 MoE 与 GQA——它们与 looped 正交，是「同一骨架上的效率插件」，可以独立评估。
 
-## 7. 检查清单（读别人的 looped 模型时问这七句）
+## 8. 检查清单（读别人的 looped 模型时问这七句）
 
 1. 首/中/尾各几层，中间段跑几轮？→ 算出 24 / 48 这类数
 2. 中间段权重在哪几轮共享？norm / 位置编码是否也共享？
@@ -145,7 +225,7 @@ def forward(x):
 6. 稳定器有哪几个？缺哪个最可能炸？
 7. 轮数固定还是可调？固定轮数时，test-time compute 的旋钮是关着的
 
-## 8. 参考
+## 9. 参考
 
 - Universal Transformer（Dehghani et al., 2018）：ACT 动态深度
 - Deep Equilibrium Models（Bai et al., 2019）：不动点 + 隐式微分

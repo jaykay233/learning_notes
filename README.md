@@ -282,8 +282,9 @@ models/
 │   └── architecture.md   # Hunyuan Hy4 Preview：Gated DSA + IndexCache、MoE、iHC
 └── inkling-2-mini/
     ├── architecture.md   # Inkling 2 Mini 26.4B：6/12×3/6、24 份权重 48 次应用
-    ├── looped-transformer.md # looped transformer 机制：族谱、设计空间、稳定器、成本模型
-    └── code/mini_looped.py   # 可运行 numpy 骨架：distinct / applications / weight touches 三本账
+    ├── looped-transformer.md # looped transformer 机制：族谱、设计空间、稳定器、AttnRes、成本模型
+    ├── code/mini_looped.py   # 可运行 numpy 骨架：distinct / applications / weight touches 三本账
+    └── code/attn_res_demo.py # 可运行：AttnRes 三种打分 + bank/prefix 记账 + 凸组合范数验证
 ```
 
 ## 昇腾 AI 编译器讲义
@@ -787,8 +788,9 @@ Qwen4 架构预览（`qwen4_exp`）：GDN + **QSA**，**Gated Residual（HC×4�
 | 文档 | 内容 |
 |---|---|
 | [architecture.md](models/inkling-2-mini/architecture.md) | 分段预算（24 vs 48）、尺寸常量、前向骨架、core 一层拆解（门控消息 / AttnRes / GQA / MoE）、参数账反推、推理侧后果 |
-| [looped-transformer.md](models/inkling-2-mini/looped-transformer.md) | looped 机制本体：族谱对照、设计四问（循环哪段 / 共享什么 / 轮间耦合 / 怎么不发散）、稳定器清单、成本模型、七句检查清单 |
+| [looped-transformer.md](models/inkling-2-mini/looped-transformer.md) | looped 机制本体：族谱对照、设计四问（循环哪段 / 共享什么 / 轮间耦合 / 怎么不发散）、稳定器清单、**AttnRes 三种打分 + bank 记账**、成本模型、七句检查清单 |
 | [code/mini_looped.py](models/inkling-2-mini/code/mini_looped.py) | 可运行 numpy 骨架（无第三方依赖）：打印 distinct / applications / active / weight touches 四本账，并复算 26.4B–3.4B 的参数分解 |
+| [code/attn_res_demo.py](models/inkling-2-mini/code/attn_res_demo.py) | 可运行（numpy）：无 query / 带 query / per-stream 三种打分、Kimi-K3 bank+prefix 记账、凸组合不放大范数与 softmax 饱和的量化对比 |
 
 要点备忘：
 
@@ -797,6 +799,7 @@ Qwen4 架构预览（`qwen4_exp`）：GDN + **QSA**，**Gated Residual（HC×4�
 - **MoE 大概率铺满 24 层（推断）**：单专家 \(3\times2304\times1152\approx7.96\text{M}\)，24 层 × 128 专家 ≈ 24.5B（93%）；反解稠密 ≈ 1.9B，活跃 = 1.9 + 1.53 ≈ 3.47B ≈ 图上 3.4B。图上把 MoE 只画在 core 只是放大展示。
 - **省参数、费算力、不省 KV**：prefill 按 48 层付，KV cache 按 24 层存但中间 12 层每轮重算；1M 上下文的 KV 显存几乎全在 4 层 global 上（≈12GB fp16）。
 - **那一堆 clip / softcap 不是表达力来源，是可收敛性来源**：QK L2 clip、V norm、RMSNorm、logit softcap 30、门控残差、SwiGLU gate softcap，作用是给每一轮的增益加上界。
+- **AttnRes 买的是梯度通路，不是表达力**：\(\partial\,\mathrm{out}/\partial s_j=\alpha_j>0\)，梯度直达任意历史源、不必穿过中间层；代价是 `srcs` 存储 \(O(LTH)\)，Kimi-K3/Inkling 用 bank（每 block 写一行）压到 1/6～1/12。
 
 ---
 
